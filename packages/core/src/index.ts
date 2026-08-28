@@ -23,6 +23,18 @@ export interface RuntimeMessage {
   toolName?: string;
 }
 
+export type AgentTurnStatus = "running" | "completed" | "failed" | "interrupted";
+
+export interface AgentTurn {
+  id: string;
+  status: AgentTurnStatus;
+  input: string;
+  response?: RuntimeMessage;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 interface EventBase {
   sessionId: string;
   timestamp: string;
@@ -47,6 +59,10 @@ export interface AgentRuntime {
   start(config?: AgentStartConfig): Promise<AgentSession>;
   /** Send input to an idle session and resolve after the resulting run settles. */
   send(sessionId: string, input: string): Promise<void>;
+  /** Idempotently start or recover a turn identified by a caller-stable id. */
+  startTurn(sessionId: string, turnId: string, input: string): Promise<AgentTurn>;
+  /** Read a previously accepted turn. */
+  turn(sessionId: string, turnId: string): Promise<AgentTurn | undefined>;
   /** Adjust an active run at the harness's next safe model boundary. */
   steer(sessionId: string, input: string): Promise<void>;
   /** Abort the active run. This does not undo tool side effects. */

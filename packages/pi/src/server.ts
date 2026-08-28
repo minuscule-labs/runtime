@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { AgentEvent, AgentStatus, RuntimeMessage } from "@minu/runtime-core";
+import type { AgentEvent, AgentStatus, AgentTurn, RuntimeMessage } from "@minu/runtime-core";
 
 const MAX_INPUT_BYTES = 1024 * 1024;
 
@@ -43,6 +43,37 @@ function json(response: ServerResponse, status: number, body: unknown): void {
 
 export async function createPiBridgeServer(options: PiBridgeServerOptions): Promise<PiBridgeServer> {
   const streams = new Set<ServerResponse>();
+  const turns = new Map<string, AgentTurn>();
+  let activeTurnId: string | undefined;
+
+  const copyTurn = (turn: AgentTurn): AgentTurn => ({
+    ...turn,
+    response: turn.response ? { ...turn.response } : undefined,
+  });
+
+  const runTurn = async (turn: AgentTurn): Promise<void> => {
+    try {
+      const before = await options.getMessages?.() ?? [];
+      await options.send(turn.input, turn.id);
+      if (turn.status === "interrupted") return;
+      const after = await options.getMessages?.() ?? [];
+      const responseMessage = after
+        .slice(before.length)
+        .reverse()
+        .find((message) => message.role === "assistant");
+      if (!responseMessage) throw new Error("Agent turn produced no assistant response");
+      turn.status = "completed";
+      turn.response = { ...responseMessage };
+      turn.updatedAt = new Date().toISOString();
+    } catch (error) {
+      if (turn.status === "interrupted") return;
+      turn.status = "failed";
+      turn.error = error instanceof Error ? error.message : String(error);
+      turn.updatedAt = new Date().toISOString();
+    } finally {
+      if (activeTurnId === turn.id) activeTurnId = undefined;
+    }
+  };
 
   const publish = (event: AgentEvent): void => {
     const frame = `data: ${JSON.stringify(event)}\n\n`;
@@ -102,6 +133,51 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
         return;
       }
 
+      const turnMatch = url.pathname.match(/^\/turns\/(.+)$/);
+      if (request.method === "GET" && turnMatch) {
+        const turnId = decodeURIComponent(turnMatch[1]!);
+        const turn = turns.get(turnId);
+        json(response, 200, { turn: turn ? copyTurn(turn) : null });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/turns") {
+        const body = (await readJson(request)) as { turnId?: unknown; input?: unknown };
+        if (typeof body.turnId !== "string" || !body.turnId.trim() || body.turnId.length > 512) {
+          json(response, 400, { error: "turnId must be a non-empty string of at most 512 characters" });
+          return;
+        }
+        if (typeof body.input !== "string" || body.input.trim().length === 0) {
+          json(response, 400, { error: "input must be a non-empty string" });
+          return;
+        }
+        const existing = turns.get(body.turnId);
+        if (existing) {
+          if (existing.input !== body.input) {
+            json(response, 409, { error: "turnId is already associated with different input" });
+            return;
+          }
+          json(response, 200, { turn: copyTurn(existing) });
+          return;
+        }
+        if (options.getStatus() !== "idle" || activeTurnId) {
+          throw new SessionBusyError("Pi session is working");
+        }
+        const timestamp = new Date().toISOString();
+        const turn: AgentTurn = {
+          id: body.turnId,
+          status: "running",
+          input: body.input,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        };
+        turns.set(turn.id, turn);
+        activeTurnId = turn.id;
+        void runTurn(turn);
+        json(response, 202, { turn: copyTurn(turn) });
+        return;
+      }
+
       if (request.method === "POST" && url.pathname === "/interrupt") {
         if (!options.interrupt) {
           json(response, 405, { error: "This Runtime adapter does not support interruption" });
@@ -111,12 +187,21 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           throw new SessionBusyError("Pi session must be working to interrupt it");
         }
         await options.interrupt();
+        if (activeTurnId) {
+          const turn = turns.get(activeTurnId);
+          if (turn) {
+            turn.status = "interrupted";
+            turn.updatedAt = new Date().toISOString();
+          }
+        }
         json(response, 202, { status: "interrupting" });
         return;
       }
 
       if (request.method === "POST" && url.pathname === "/send") {
-        if (options.getStatus() !== "idle") throw new SessionBusyError("Pi session is working");
+        if (options.getStatus() !== "idle" || activeTurnId) {
+          throw new SessionBusyError("Pi session is working");
+        }
         const body = (await readJson(request)) as { input?: unknown };
         if (typeof body.input !== "string" || body.input.trim().length === 0) {
           json(response, 400, { error: "input must be a non-empty string" });

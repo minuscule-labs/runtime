@@ -15,6 +15,8 @@ Runtime does not provide shared communication, durable session analytics, remote
 interface AgentRuntime {
   start(config?: AgentStartConfig): Promise<AgentSession>;
   send(sessionId: string, input: string): Promise<void>;
+  startTurn(sessionId: string, turnId: string, input: string): Promise<AgentTurn>;
+  turn(sessionId: string, turnId: string): Promise<AgentTurn | undefined>;
   steer(sessionId: string, input: string): Promise<void>;
   interrupt(sessionId: string): Promise<void>;
   status(sessionId: string): Promise<AgentStatus>;
@@ -25,6 +27,8 @@ interface AgentRuntime {
 ```
 
 Runtime-owned sessions are preferred for agents created by applications. Attached sessions allow an existing native TUI to opt into Runtime through a minimal harness adapter.
+
+`startTurn` accepts a caller-stable turn id and returns an existing running or terminal turn when retried. `turn` lets a caller recover completion and the assistant response after its own process reconnects. Turn records live with the active Runtime bridge, so they survive a Channels/Relay restart while the Runtime session remains alive; they do not survive termination of that Runtime session.
 
 ## Personas
 

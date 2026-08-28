@@ -9,6 +9,7 @@ import type {
   AgentSession,
   AgentStartConfig,
   AgentStatus,
+  AgentTurn,
   RuntimeMessage,
 } from "@minu/runtime-core";
 import { readRegistration, registryDirectory } from "./registry.js";
@@ -103,6 +104,21 @@ export class PiAgentRuntime implements AgentRuntime {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ input }),
     });
+  }
+
+  async startTurn(sessionId: string, turnId: string, input: string): Promise<AgentTurn> {
+    const response = await checkedFetch(sessionId, "/turns", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ turnId, input }),
+    });
+    return ((await response.json()) as { turn: AgentTurn }).turn;
+  }
+
+  async turn(sessionId: string, turnId: string): Promise<AgentTurn | undefined> {
+    const response = await checkedFetch(sessionId, `/turns/${encodeURIComponent(turnId)}`);
+    const body = (await response.json()) as { turn: AgentTurn | null };
+    return body.turn ?? undefined;
   }
 
   async steer(sessionId: string, input: string): Promise<void> {

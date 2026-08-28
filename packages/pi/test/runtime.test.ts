@@ -15,6 +15,7 @@ async function fixture(initialStatus: AgentStatus = "idle") {
   const token = "test-token";
   let status = initialStatus;
   const received: string[] = [];
+  const transcript = [{ role: "assistant" as const, content: "Finished the review" }];
   const steered: string[] = [];
   let interruptions = 0;
   const bridge = await createPiBridgeServer({
@@ -25,6 +26,7 @@ async function fixture(initialStatus: AgentStatus = "idle") {
       received.push(input);
       status = "working";
       await new Promise((resolve) => setTimeout(resolve, 20));
+      transcript.push({ role: "assistant", content: `Response to ${input}` });
       status = "idle";
     },
     async steer(input) {
@@ -35,7 +37,7 @@ async function fixture(initialStatus: AgentStatus = "idle") {
       status = "idle";
     },
     async getMessages() {
-      return [{ role: "assistant", content: "Finished the review" }];
+      return [...transcript];
     },
   });
   await writeRegistration({
@@ -73,6 +75,34 @@ test("send wakes an idle bridge and resolves after it returns idle", async () =>
     await runtime.send(server.sessionId, "Review README.md");
     assert.deepEqual(server.received, ["Review README.md"]);
     assert.equal(await runtime.status(server.sessionId), "idle");
+  } finally {
+    await server.close();
+  }
+});
+
+test("stable turn ids recover running and completed work without rerunning it", async () => {
+  const server = await fixture();
+  try {
+    const runtime = new PiAgentRuntime();
+    const accepted = await runtime.startTurn(server.sessionId, "channel:agent:trigger-1", "Implement once");
+    assert.equal(accepted.status, "running");
+    const duplicate = await runtime.startTurn(server.sessionId, "channel:agent:trigger-1", "Implement once");
+    assert.equal(duplicate.id, accepted.id);
+    assert.deepEqual(server.received, ["Implement once"]);
+
+    let recovered = await runtime.turn(server.sessionId, accepted.id);
+    for (let attempt = 0; recovered?.status === "running" && attempt < 20; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      recovered = await runtime.turn(server.sessionId, accepted.id);
+    }
+    assert.equal(recovered?.status, "completed");
+    assert.equal(recovered?.response?.content, "Response to Implement once");
+    assert.deepEqual(server.received, ["Implement once"]);
+    await assert.rejects(
+      runtime.startTurn(server.sessionId, accepted.id, "Different input"),
+      /different input/,
+    );
+    assert.equal(await runtime.turn(server.sessionId, "missing"), undefined);
   } finally {
     await server.close();
   }
@@ -231,6 +261,23 @@ process.on("SIGTERM", () => process.exit(0));
     assert.deepEqual(
       (await runtime.messages(session.id)).map((message) => [message.role, message.content]),
       [["user", "hello"], ["assistant", "READY"]],
+    );
+    const accepted = await runtime.startTurn(session.id, "owned-turn-1", "recoverable");
+    let recovered = accepted;
+    for (let attempt = 0; recovered.status === "running" && attempt < 20; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      recovered = (await runtime.turn(session.id, accepted.id))!;
+    }
+    assert.equal(recovered.status, "completed");
+    assert.equal(recovered.response?.content, "READY");
+    assert.deepEqual(
+      (await runtime.messages(session.id)).map((message) => [message.role, message.content]),
+      [
+        ["user", "hello"],
+        ["assistant", "READY"],
+        ["user", "recoverable"],
+        ["assistant", "READY"],
+      ],
     );
     await runtime.stop(session.id);
     sessionId = undefined;
