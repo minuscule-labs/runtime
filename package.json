@@ -1,0 +1,19 @@
+{
+  "name": "@minu/runtime-workspace",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@8.15.5",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "build": "tsc -b",
+    "check": "tsc -b --pretty false",
+    "test": "pnpm build && node --test packages/*/dist/test/*.test.js",
+    "runtime": "node packages/pi/dist/src/cli.js"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.3",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

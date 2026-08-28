@@ -1,0 +1,22 @@
+{
+  "name": "@minu/runtime-pi",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/src/index.js",
+    "./cli": "./dist/src/cli.js",
+    "./extension": "./dist/src/extension.js"
+  },
+  "types": "./dist/src/index.d.ts",
+  "bin": {
+    "minu-runtime": "./dist/src/cli.js"
+  },
+  "dependencies": {
+    "@minu/runtime-core": "workspace:*",
+    "commander": "^15.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.82.1"
+  }
+}
