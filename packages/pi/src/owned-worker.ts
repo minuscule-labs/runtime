@@ -2,7 +2,7 @@
 import { randomBytes } from "node:crypto";
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { AgentStatus } from "@minu/runtime-core";
+import type { AgentReasoningLevel, AgentStatus } from "@minu/runtime-core";
 import { normalizePiMessages } from "./messages.js";
 import { PiRpcProcess, type RpcEvent } from "./pi-rpc.js";
 import { removeRegistration, writeRegistration } from "./registry.js";
@@ -30,6 +30,18 @@ const readyFile = argument("--ready-file");
 const logFile = argument("--log-file");
 const systemPromptFile = optionalArgument("--system-prompt-file");
 const appendSystemPromptFile = optionalArgument("--append-system-prompt-file");
+const modelProvider = optionalArgument("--model-provider");
+const modelId = optionalArgument("--model-id");
+const reasoningLevel = optionalArgument("--reasoning-level") as AgentReasoningLevel | undefined;
+const reasoningLevels: readonly AgentReasoningLevel[] = [
+  "off", "minimal", "low", "medium", "high", "xhigh", "max",
+];
+if (Boolean(modelProvider) !== Boolean(modelId)) {
+  throw new Error("Model provider and id must be supplied together");
+}
+if (reasoningLevel && !reasoningLevels.includes(reasoningLevel)) {
+  throw new Error(`Unsupported reasoning level: ${reasoningLevel}`);
+}
 let rpc: PiRpcProcess | undefined;
 let bridge: PiBridgeServer | undefined;
 let sessionId: string | undefined;
@@ -148,6 +160,24 @@ async function main(): Promise<void> {
   rpc.onExit((_code, _signal) => {
     if (!shuttingDown) void shutdown(1);
   });
+
+  if (modelProvider && modelId) {
+    const available = (await rpc.request("get_available_models")) as {
+      models?: Array<{ provider?: unknown; id?: unknown }>;
+    };
+    const exists = available.models?.some(
+      (model) => model.provider === modelProvider && model.id === modelId,
+    );
+    if (!exists) throw new Error(`Pi model is not available: ${modelProvider}/${modelId}`);
+    await rpc.request("set_model", { provider: modelProvider, modelId });
+  }
+  if (reasoningLevel) {
+    const available = (await rpc.request("get_available_thinking_levels")) as { levels?: unknown[] };
+    if (!available.levels?.includes(reasoningLevel)) {
+      throw new Error(`Pi reasoning level is not available for the selected model: ${reasoningLevel}`);
+    }
+    await rpc.request("set_thinking_level", { level: reasoningLevel });
+  }
 
   const state = (await rpc.request("get_state")) as Record<string, unknown>;
   if (typeof state.sessionId !== "string") throw new Error("Pi RPC did not return a session id");

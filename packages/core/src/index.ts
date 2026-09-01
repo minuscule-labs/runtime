@@ -8,12 +8,35 @@ export interface AgentSession {
   cwd: string;
 }
 
+export type AgentReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+export interface AgentModelSelection {
+  provider: string;
+  id: string;
+}
+
 export interface AgentStartConfig {
   cwd?: string;
   /** Replace the harness's default system prompt. Prefer appendSystemPrompt for personas. */
   systemPrompt?: string;
   /** Add persistent role/persona instructions while preserving the harness defaults. */
   appendSystemPrompt?: string;
+  /** Select one adapter-supported model for the new session. */
+  model?: AgentModelSelection;
+  /** Select an adapter-supported reasoning level for the new session. */
+  reasoningLevel?: AgentReasoningLevel;
+}
+
+export interface RuntimeModelCapability {
+  provider: string;
+  id: string;
+  name: string;
+  reasoning: boolean;
+}
+
+export interface RuntimeLaunchCapabilities {
+  models: RuntimeModelCapability[];
+  reasoningLevels: AgentReasoningLevel[];
 }
 
 export interface RuntimeMessage {
@@ -57,6 +80,8 @@ export type AgentEvent =
 export interface AgentRuntime {
   /** Launch and own a new agent process. */
   start(config?: AgentStartConfig): Promise<AgentSession>;
+  /** Discover adapter launch options without exposing provider credentials. */
+  capabilities?(config?: Pick<AgentStartConfig, "cwd">): Promise<RuntimeLaunchCapabilities>;
   /** Send input to an idle session and resolve after the resulting run settles. */
   send(sessionId: string, input: string): Promise<void>;
   /** Idempotently start or recover a turn identified by a caller-stable id. */

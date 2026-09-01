@@ -206,10 +206,10 @@ test("runtime can own a prompted Pi RPC process through start, send, messages, a
 import { readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const promptFlag = args.indexOf("--append-system-prompt");
-writeFileSync(process.env.PI_ARGS_FILE, JSON.stringify({
-  args,
-  prompt: promptFlag >= 0 ? readFileSync(args[promptFlag + 1], "utf8") : undefined,
-}));
+const prompt = promptFlag >= 0 ? readFileSync(args[promptFlag + 1], "utf8") : undefined;
+const requests = [];
+const save = () => writeFileSync(process.env.PI_ARGS_FILE, JSON.stringify({ args, prompt, requests }));
+save();
 let buffer = "";
 const messages = [];
 process.stdin.on("data", (chunk) => {
@@ -220,8 +220,13 @@ process.stdin.on("data", (chunk) => {
     buffer = buffer.slice(index + 1);
     if (!line) continue;
     const request = JSON.parse(line);
+    requests.push(request);
+    save();
     const respond = (data) => console.log(JSON.stringify({ id: request.id, type: "response", command: request.type, success: true, data }));
-    if (request.type === "get_state") respond({ sessionId: "fake-owned-session", isStreaming: false });
+    if (request.type === "get_available_models") respond({ models: [{ provider: "openai", id: "gpt-test", reasoning: true }] });
+    else if (request.type === "get_available_thinking_levels") respond({ levels: ["off", "medium", "high"] });
+    else if (request.type === "set_model" || request.type === "set_thinking_level") respond(undefined);
+    else if (request.type === "get_state") respond({ sessionId: "fake-owned-session", isStreaming: false });
     else if (request.type === "get_messages") respond({ messages });
     else if (request.type === "prompt") {
       messages.push({ role: "user", content: request.message, timestamp: Date.now() });
@@ -243,19 +248,36 @@ process.on("SIGTERM", () => process.exit(0));
   const runtime = new PiAgentRuntime();
   let sessionId: string | undefined;
   try {
+    assert.deepEqual(await runtime.capabilities({ cwd: directory }), {
+      models: [{ provider: "openai", id: "gpt-test", name: "gpt-test", reasoning: true }],
+      reasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    });
     const session = await runtime.start({
       cwd: directory,
       appendSystemPrompt: "You are the reviewer persona.",
+      model: { provider: "openai", id: "gpt-test" },
+      reasoningLevel: "high",
     });
     sessionId = session.id;
     assert.equal(session.ownership, "owned");
     const launch = JSON.parse(await readFile(argsFile, "utf8")) as {
       args: string[];
       prompt?: string;
+      requests: Array<Record<string, unknown>>;
     };
-    assert.equal(launch.args.at(-2), "--append-system-prompt");
-    assert.match(launch.args.at(-1)!, /\.prompt$/);
+    const promptIndex = launch.args.indexOf("--append-system-prompt");
+    assert.match(launch.args[promptIndex + 1]!, /\.prompt$/);
     assert.equal(launch.prompt, "You are the reviewer persona.");
+    assert.deepEqual(
+      launch.requests.slice(0, 5).map(({ type, provider, modelId, level }) => ({ type, provider, modelId, level })),
+      [
+        { type: "get_available_models", provider: undefined, modelId: undefined, level: undefined },
+        { type: "set_model", provider: "openai", modelId: "gpt-test", level: undefined },
+        { type: "get_available_thinking_levels", provider: undefined, modelId: undefined, level: undefined },
+        { type: "set_thinking_level", provider: undefined, modelId: undefined, level: "high" },
+        { type: "get_state", provider: undefined, modelId: undefined, level: undefined },
+      ],
+    );
     assert.equal(await runtime.status(session.id), "idle");
     await runtime.send(session.id, "hello");
     assert.deepEqual(
@@ -282,6 +304,10 @@ process.on("SIGTERM", () => process.exit(0));
     await runtime.stop(session.id);
     sessionId = undefined;
     assert.equal(await runtime.status(session.id), "offline");
+    await assert.rejects(
+      runtime.start({ cwd: directory, model: { provider: "openai", id: "missing-model" } }),
+      /Pi model is not available/,
+    );
   } finally {
     if (sessionId) await runtime.stop(sessionId).catch(() => {});
     await rm(directory, { recursive: true, force: true });

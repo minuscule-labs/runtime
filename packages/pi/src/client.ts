@@ -10,8 +10,10 @@ import type {
   AgentStartConfig,
   AgentStatus,
   AgentTurn,
+  RuntimeLaunchCapabilities,
   RuntimeMessage,
 } from "@minu/runtime-core";
+import { PiRpcProcess } from "./pi-rpc.js";
 import { readRegistration, registryDirectory } from "./registry.js";
 
 export class SessionOfflineError extends Error {}
@@ -48,9 +50,39 @@ async function delay(milliseconds: number): Promise<void> {
 }
 
 export class PiAgentRuntime implements AgentRuntime {
+  async capabilities(config: Pick<AgentStartConfig, "cwd"> = {}): Promise<RuntimeLaunchCapabilities> {
+    const rpc = new PiRpcProcess(resolve(config.cwd ?? process.cwd()), () => {});
+    try {
+      const available = (await rpc.request("get_available_models")) as { models?: unknown[] };
+      const models = (available.models ?? []).flatMap((value) => {
+        if (!value || typeof value !== "object") return [];
+        const model = value as Record<string, unknown>;
+        if (typeof model.provider !== "string" || typeof model.id !== "string") return [];
+        return [{
+          provider: model.provider,
+          id: model.id,
+          name: typeof model.name === "string" ? model.name : model.id,
+          reasoning: model.reasoning === true,
+        }];
+      });
+      return {
+        models,
+        reasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+      };
+    } finally {
+      await rpc.stop();
+    }
+  }
+
   async start(config: AgentStartConfig = {}): Promise<AgentSession> {
     if (config.systemPrompt !== undefined && config.appendSystemPrompt !== undefined) {
       throw new Error("systemPrompt and appendSystemPrompt cannot both be set");
+    }
+    if (config.model && (!config.model.provider.trim() || !config.model.id.trim())) {
+      throw new Error("model provider and id must be non-empty");
+    }
+    if (config.model && (config.model.provider.length > 100 || config.model.id.length > 300)) {
+      throw new Error("model provider or id is too large");
     }
     const cwd = resolve(config.cwd ?? process.cwd());
     const launchId = randomUUID();
@@ -69,6 +101,10 @@ export class PiAgentRuntime implements AgentRuntime {
       await writeFile(promptFile, config.appendSystemPrompt, { mode: 0o600 });
       workerArgs.push("--append-system-prompt-file", promptFile);
     }
+    if (config.model) {
+      workerArgs.push("--model-provider", config.model.provider.trim(), "--model-id", config.model.id.trim());
+    }
+    if (config.reasoningLevel) workerArgs.push("--reasoning-level", config.reasoningLevel);
     const child = spawn(process.execPath, workerArgs, {
       detached: true,
       stdio: "ignore",

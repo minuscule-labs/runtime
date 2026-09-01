@@ -14,6 +14,7 @@ Runtime does not provide shared communication, durable session analytics, remote
 ```ts
 interface AgentRuntime {
   start(config?: AgentStartConfig): Promise<AgentSession>;
+  capabilities?(config?: Pick<AgentStartConfig, "cwd">): Promise<RuntimeLaunchCapabilities>;
   send(sessionId: string, input: string): Promise<void>;
   startTurn(sessionId: string, turnId: string, input: string): Promise<AgentTurn>;
   turn(sessionId: string, turnId: string): Promise<AgentTurn | undefined>;
@@ -42,6 +43,21 @@ await runtime.start({
 ```
 
 Full system-prompt replacement is also available, but the append and replacement modes are mutually exclusive.
+
+## Models and reasoning
+
+Adapters may advertise launch capabilities and accept a structured model plus reasoning level for a new session:
+
+```ts
+const capabilities = await runtime.capabilities?.({ cwd: process.cwd() });
+const session = await runtime.start({
+  cwd: process.cwd(),
+  model: { provider: "openai", id: "gpt-5.6-codex" },
+  reasoningLevel: "high",
+});
+```
+
+The Pi adapter discovers configured models through Pi RPC. At startup it verifies the exact provider/model, selects it, checks the model's available thinking levels, and then applies the requested reasoning level. Unsupported selections fail before the session is registered; they never silently fall back to Pi defaults. Launch selection is immutable for that session.
 
 ## Development
 
