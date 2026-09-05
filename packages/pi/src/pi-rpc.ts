@@ -7,6 +7,8 @@ export type RpcEvent = Record<string, unknown>;
 export interface PiRpcProcessOptions {
   systemPromptFile?: string;
   appendSystemPromptFile?: string;
+  disableSkillDiscovery?: boolean;
+  skillPaths?: string[];
   command?: string;
 }
 
@@ -34,6 +36,8 @@ export class PiRpcProcess {
     if (options.appendSystemPromptFile !== undefined) {
       args.push("--append-system-prompt", options.appendSystemPromptFile);
     }
+    if (options.disableSkillDiscovery) args.push("--no-skills");
+    for (const skillPath of options.skillPaths ?? []) args.push("--skill", skillPath);
     this.child = spawn(options.command ?? process.env.PI_COMMAND ?? "pi", args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],

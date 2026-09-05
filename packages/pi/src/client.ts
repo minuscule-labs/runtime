@@ -12,6 +12,7 @@ import type {
   AgentTurn,
   RuntimeLaunchCapabilities,
   RuntimeMessage,
+  RuntimeSkillCapability,
 } from "@minu/runtime-core";
 import { PiRpcProcess } from "./pi-rpc.js";
 import { readRegistration, registryDirectory } from "./registry.js";
@@ -49,6 +50,28 @@ async function delay(milliseconds: number): Promise<void> {
   await new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
+interface DiscoveredPiSkill extends RuntimeSkillCapability {
+  path: string;
+}
+
+async function discoverSkills(rpc: PiRpcProcess): Promise<DiscoveredPiSkill[]> {
+  const available = (await rpc.request("get_commands")) as { commands?: unknown[] };
+  const seen = new Set<string>();
+  return (available.commands ?? []).flatMap((value) => {
+    if (!value || typeof value !== "object") return [];
+    const command = value as Record<string, unknown>;
+    if (command.source !== "skill" || typeof command.name !== "string"
+      || typeof command.path !== "string" || seen.has(command.name)) return [];
+    seen.add(command.name);
+    return [{
+      id: command.name,
+      name: command.name.startsWith("skill:") ? command.name.slice(6) : command.name,
+      description: typeof command.description === "string" ? command.description : "",
+      path: command.path,
+    }];
+  });
+}
+
 export class PiAgentRuntime implements AgentRuntime {
   async capabilities(config: Pick<AgentStartConfig, "cwd"> = {}): Promise<RuntimeLaunchCapabilities> {
     const rpc = new PiRpcProcess(resolve(config.cwd ?? process.cwd()), () => {});
@@ -65,9 +88,11 @@ export class PiAgentRuntime implements AgentRuntime {
           reasoning: model.reasoning === true,
         }];
       });
+      const skills = (await discoverSkills(rpc)).map(({ path: _path, ...skill }) => skill);
       return {
         models,
         reasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        skills,
       };
     } finally {
       await rpc.stop();
@@ -84,7 +109,28 @@ export class PiAgentRuntime implements AgentRuntime {
     if (config.model && (config.model.provider.length > 100 || config.model.id.length > 300)) {
       throw new Error("model provider or id is too large");
     }
+    if (config.skillIds !== undefined && (!Array.isArray(config.skillIds)
+      || config.skillIds.length > 100
+      || config.skillIds.some((id) => typeof id !== "string" || !id.trim() || id !== id.trim() || id.length > 200)
+      || new Set(config.skillIds).size !== config.skillIds.length)) {
+      throw new Error("skillIds must contain at most 100 unique, non-empty skill ids");
+    }
     const cwd = resolve(config.cwd ?? process.cwd());
+    let skillPaths: string[] | undefined;
+    if (config.skillIds !== undefined) {
+      const discovery = new PiRpcProcess(cwd, () => {});
+      try {
+        const skills = await discoverSkills(discovery);
+        const byId = new Map(skills.map((skill) => [skill.id, skill.path]));
+        skillPaths = config.skillIds.map((id) => {
+          const path = byId.get(id);
+          if (!path) throw new Error(`Pi skill is not available: ${id}`);
+          return path;
+        });
+      } finally {
+        await discovery.stop();
+      }
+    }
     const launchId = randomUUID();
     const directory = registryDirectory();
     await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -105,6 +151,10 @@ export class PiAgentRuntime implements AgentRuntime {
       workerArgs.push("--model-provider", config.model.provider.trim(), "--model-id", config.model.id.trim());
     }
     if (config.reasoningLevel) workerArgs.push("--reasoning-level", config.reasoningLevel);
+    if (skillPaths !== undefined) {
+      workerArgs.push("--disable-skill-discovery");
+      for (const path of skillPaths) workerArgs.push("--skill-path", path);
+    }
     const child = spawn(process.execPath, workerArgs, {
       detached: true,
       stdio: "ignore",

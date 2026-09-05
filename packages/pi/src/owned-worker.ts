@@ -19,6 +19,12 @@ function optionalArgument(name: string): string | undefined {
   return index >= 0 ? process.argv[index + 1] : undefined;
 }
 
+function argumentsFor(name: string): string[] {
+  return process.argv.flatMap((value, index) => value === name && process.argv[index + 1]
+    ? [process.argv[index + 1]!]
+    : []);
+}
+
 function argument(name: string): string {
   const value = optionalArgument(name);
   if (!value) throw new Error(`Missing ${name}`);
@@ -33,6 +39,8 @@ const appendSystemPromptFile = optionalArgument("--append-system-prompt-file");
 const modelProvider = optionalArgument("--model-provider");
 const modelId = optionalArgument("--model-id");
 const reasoningLevel = optionalArgument("--reasoning-level") as AgentReasoningLevel | undefined;
+const disableSkillDiscovery = process.argv.includes("--disable-skill-discovery");
+const skillPaths = argumentsFor("--skill-path");
 const reasoningLevels: readonly AgentReasoningLevel[] = [
   "off", "minimal", "low", "medium", "high", "xhigh", "max",
 ];
@@ -155,6 +163,8 @@ async function main(): Promise<void> {
   rpc = new PiRpcProcess(cwd, (text) => void log(text), {
     systemPromptFile,
     appendSystemPromptFile,
+    disableSkillDiscovery,
+    skillPaths,
   });
   rpc.onEvent(handleEvent);
   rpc.onExit((_code, _signal) => {
