@@ -59,6 +59,20 @@ const session = await runtime.start({
 
 The Pi adapter discovers configured models through Pi RPC. At startup it verifies the exact provider/model, selects it, checks the model's available thinking levels, and then applies the requested reasoning level. Unsupported selections fail before the session is registered; they never silently fall back to Pi defaults. Launch selection is immutable for that session.
 
+## Skills
+
+Adapters may advertise sanitized skill metadata and accept adapter-scoped skill ids when starting a session:
+
+```ts
+const capabilities = await runtime.capabilities?.({ cwd: process.cwd() });
+const session = await runtime.start({
+  cwd: process.cwd(),
+  skillIds: capabilities?.skills.filter(({ id }) => id === "skill:code-review").map(({ id }) => id),
+});
+```
+
+Omitting `skillIds` preserves the harness's default skill behavior. Supplying an empty array explicitly disables discovered skills for adapters that support selection. The Pi adapter discovers skills from its available-command RPC response, keeps native paths private, revalidates selected ids before launch, and starts the owned process with only those skills. Skill changes require a new session.
+
 ## Development
 
 ```bash

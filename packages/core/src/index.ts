@@ -25,6 +25,8 @@ export interface AgentStartConfig {
   model?: AgentModelSelection;
   /** Select an adapter-supported reasoning level for the new session. */
   reasoningLevel?: AgentReasoningLevel;
+  /** Restrict the session to these adapter-discovered skills. Omit to preserve harness defaults. */
+  skillIds?: string[];
 }
 
 export interface RuntimeModelCapability {
@@ -34,9 +36,17 @@ export interface RuntimeModelCapability {
   reasoning: boolean;
 }
 
+export interface RuntimeSkillCapability {
+  /** Stable within this Runtime adapter; callers scope it by adapter identity. */
+  id: string;
+  name: string;
+  description: string;
+}
+
 export interface RuntimeLaunchCapabilities {
   models: RuntimeModelCapability[];
   reasoningLevels: AgentReasoningLevel[];
+  skills: RuntimeSkillCapability[];
 }
 
 export interface RuntimeMessage {

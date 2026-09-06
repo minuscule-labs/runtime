@@ -224,6 +224,7 @@ process.stdin.on("data", (chunk) => {
     save();
     const respond = (data) => console.log(JSON.stringify({ id: request.id, type: "response", command: request.type, success: true, data }));
     if (request.type === "get_available_models") respond({ models: [{ provider: "openai", id: "gpt-test", reasoning: true }] });
+    else if (request.type === "get_commands") respond({ commands: [{ name: "skill:reviewer", description: "Review changes", source: "skill", path: "/skills/reviewer/SKILL.md" }] });
     else if (request.type === "get_available_thinking_levels") respond({ levels: ["off", "medium", "high"] });
     else if (request.type === "set_model" || request.type === "set_thinking_level") respond(undefined);
     else if (request.type === "get_state") respond({ sessionId: "fake-owned-session", isStreaming: false });
@@ -251,12 +252,18 @@ process.on("SIGTERM", () => process.exit(0));
     assert.deepEqual(await runtime.capabilities({ cwd: directory }), {
       models: [{ provider: "openai", id: "gpt-test", name: "gpt-test", reasoning: true }],
       reasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+      skills: [{ id: "skill:reviewer", name: "reviewer", description: "Review changes" }],
     });
+    await assert.rejects(
+      runtime.start({ cwd: directory, skillIds: ["skill:missing"] }),
+      /Pi skill is not available: skill:missing/,
+    );
     const session = await runtime.start({
       cwd: directory,
       appendSystemPrompt: "You are the reviewer persona.",
       model: { provider: "openai", id: "gpt-test" },
       reasoningLevel: "high",
+      skillIds: ["skill:reviewer"],
     });
     sessionId = session.id;
     assert.equal(session.ownership, "owned");
@@ -268,6 +275,9 @@ process.on("SIGTERM", () => process.exit(0));
     const promptIndex = launch.args.indexOf("--append-system-prompt");
     assert.match(launch.args[promptIndex + 1]!, /\.prompt$/);
     assert.equal(launch.prompt, "You are the reviewer persona.");
+    assert.ok(launch.args.includes("--no-skills"));
+    const skillIndex = launch.args.indexOf("--skill");
+    assert.equal(launch.args[skillIndex + 1], "/skills/reviewer/SKILL.md");
     assert.deepEqual(
       launch.requests.slice(0, 5).map(({ type, provider, modelId, level }) => ({ type, provider, modelId, level })),
       [
