@@ -224,7 +224,7 @@ process.stdin.on("data", (chunk) => {
     save();
     const respond = (data) => console.log(JSON.stringify({ id: request.id, type: "response", command: request.type, success: true, data }));
     if (request.type === "get_available_models") respond({ models: [{ provider: "openai", id: "gpt-test", reasoning: true }] });
-    else if (request.type === "get_commands") respond({ commands: [{ name: "skill:reviewer", description: "Review changes", source: "skill", path: "/skills/reviewer/SKILL.md" }] });
+    else if (request.type === "get_commands") respond({ commands: [{ name: "skill:reviewer", description: "Review changes", source: "skill", sourceInfo: { path: "/skills/reviewer/SKILL.md", source: "auto", scope: "user" } }] });
     else if (request.type === "get_available_thinking_levels") respond({ levels: ["off", "medium", "high"] });
     else if (request.type === "set_model" || request.type === "set_thinking_level") respond(undefined);
     else if (request.type === "get_state") respond({ sessionId: "fake-owned-session", isStreaming: false });
