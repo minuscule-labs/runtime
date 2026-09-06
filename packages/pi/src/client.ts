@@ -60,14 +60,17 @@ async function discoverSkills(rpc: PiRpcProcess): Promise<DiscoveredPiSkill[]> {
   return (available.commands ?? []).flatMap((value) => {
     if (!value || typeof value !== "object") return [];
     const command = value as Record<string, unknown>;
+    const sourceInfo = command.sourceInfo;
     if (command.source !== "skill" || typeof command.name !== "string"
-      || typeof command.path !== "string" || seen.has(command.name)) return [];
+      || !sourceInfo || typeof sourceInfo !== "object"
+      || typeof (sourceInfo as Record<string, unknown>).path !== "string"
+      || seen.has(command.name)) return [];
     seen.add(command.name);
     return [{
       id: command.name,
       name: command.name.startsWith("skill:") ? command.name.slice(6) : command.name,
       description: typeof command.description === "string" ? command.description : "",
-      path: command.path,
+      path: (sourceInfo as Record<string, unknown>).path as string,
     }];
   });
 }
