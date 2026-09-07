@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import type { AgentEvent, AgentStatus, AgentTurn, RuntimeMessage } from "@minu/runtime-core";
 
 const MAX_INPUT_BYTES = 1024 * 1024;
+const DEFAULT_TURN_RETENTION_LIMIT = 1_000;
 
 export class SessionBusyError extends Error {}
 
@@ -16,6 +17,8 @@ export interface PiBridgeServerOptions {
   interrupt?(): Promise<void>;
   getMessages?(): Promise<RuntimeMessage[]>;
   stop?(): Promise<void> | void;
+  /** Completed turn ids remain idempotent within this bounded, insertion-ordered window. */
+  turnRetentionLimit?: number;
 }
 
 export interface PiBridgeServer {
@@ -44,6 +47,10 @@ function json(response: ServerResponse, status: number, body: unknown): void {
 export async function createPiBridgeServer(options: PiBridgeServerOptions): Promise<PiBridgeServer> {
   const streams = new Set<ServerResponse>();
   const turns = new Map<string, AgentTurn>();
+  const turnRetentionLimit = options.turnRetentionLimit ?? DEFAULT_TURN_RETENTION_LIMIT;
+  if (!Number.isSafeInteger(turnRetentionLimit) || turnRetentionLimit < 1) {
+    throw new Error("turnRetentionLimit must be a positive integer");
+  }
   let activeTurnId: string | undefined;
 
   const copyTurn = (turn: AgentTurn): AgentTurn => ({
@@ -51,14 +58,32 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
     response: turn.response ? { ...turn.response } : undefined,
   });
 
+  const pruneTurns = (): void => {
+    if (turns.size <= turnRetentionLimit) return;
+    for (const [id, candidate] of turns) {
+      if (candidate.status === "running") continue;
+      turns.delete(id);
+      if (turns.size <= turnRetentionLimit) return;
+    }
+  };
+
+  const messageEquals = (left: RuntimeMessage, right: RuntimeMessage): boolean =>
+    left.role === right.role
+    && left.content === right.content
+    && left.timestamp === right.timestamp
+    && left.toolName === right.toolName;
+
   const runTurn = async (turn: AgentTurn): Promise<void> => {
     try {
       const before = await options.getMessages?.() ?? [];
       await options.send(turn.input, turn.id);
       if (turn.status === "interrupted") return;
       const after = await options.getMessages?.() ?? [];
+      let sharedPrefix = 0;
+      while (sharedPrefix < before.length && sharedPrefix < after.length
+        && messageEquals(before[sharedPrefix]!, after[sharedPrefix]!)) sharedPrefix += 1;
       const responseMessage = after
-        .slice(before.length)
+        .slice(sharedPrefix)
         .reverse()
         .find((message) => message.role === "assistant");
       if (!responseMessage) throw new Error("Agent turn produced no assistant response");
@@ -72,6 +97,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       turn.updatedAt = new Date().toISOString();
     } finally {
       if (activeTurnId === turn.id) activeTurnId = undefined;
+      pruneTurns();
     }
   };
 

@@ -18,8 +18,10 @@ export function registryDirectory(): string {
   return process.env.MINU_RUNTIME_DIR ?? join(homedir(), ".minu", "runtime-pi", "sessions");
 }
 
+const SESSION_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
 function registrationPath(sessionId: string): string {
-  if (!/^[a-zA-Z0-9_-]+$/.test(sessionId)) throw new Error(`Invalid session id: ${sessionId}`);
+  if (!SESSION_ID_PATTERN.test(sessionId)) throw new Error(`Invalid session id: ${sessionId}`);
   return join(registryDirectory(), `${sessionId}.json`);
 }
 
@@ -68,8 +70,19 @@ export async function listRegistrations(): Promise<PiSessionRegistration[]> {
     throw error;
   }
 
-  const registrations = await Promise.all(
-    names.filter((name) => name.endsWith(".json")).map((name) => readRegistration(name.slice(0, -5))),
-  );
+  const registrationNames = names.filter((name) => {
+    if (!name.endsWith(".json")) return false;
+    return SESSION_ID_PATTERN.test(name.slice(0, -5));
+  });
+  const registrations = await Promise.all(registrationNames.map(async (name) => {
+    const sessionId = name.slice(0, -5);
+    try {
+      return await readRegistration(sessionId);
+    } catch {
+      // One interrupted/corrupt registration must not hide healthy sessions.
+      await removeRegistration(sessionId).catch(() => {});
+      return undefined;
+    }
+  }));
   return registrations.filter((item): item is PiSessionRegistration => item !== undefined);
 }

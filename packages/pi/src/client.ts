@@ -25,18 +25,35 @@ async function registrationFor(sessionId: string) {
   return registration;
 }
 
-async function checkedFetch(sessionId: string, path: string, init?: RequestInit): Promise<Response> {
+const SHORT_REQUEST_TIMEOUT_MS = 10_000;
+const CONTROL_REQUEST_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_START_TIMEOUT_MS = 30_000;
+
+async function checkedFetch(
+  sessionId: string,
+  path: string,
+  init?: RequestInit,
+  timeoutMs?: number,
+): Promise<Response> {
   const registration = await registrationFor(sessionId);
   let response: Response;
+  const timeoutSignal = timeoutMs === undefined ? undefined : AbortSignal.timeout(timeoutMs);
+  const signal = init?.signal && timeoutSignal
+    ? AbortSignal.any([init.signal, timeoutSignal])
+    : init?.signal ?? timeoutSignal;
   try {
     response = await fetch(`${registration.endpoint}${path}`, {
       ...init,
+      signal,
       headers: {
         authorization: `Bearer ${registration.token}`,
         ...init?.headers,
       },
     });
   } catch (error) {
+    if (timeoutSignal?.aborted && !init?.signal?.aborted) {
+      throw new Error(`Pi session request timed out after ${timeoutMs}ms: ${path}`);
+    }
     throw new SessionOfflineError(`Could not reach Pi session ${sessionId}: ${String(error)}`);
   }
   if (!response.ok) {
@@ -48,6 +65,15 @@ async function checkedFetch(sessionId: string, path: string, init?: RequestInit)
 
 async function delay(milliseconds: number): Promise<void> {
   await new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+}
+
+async function terminateChild(child: ReturnType<typeof spawn>): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((resolveExit) => child.once("exit", () => resolveExit()));
+  child.kill("SIGTERM");
+  if (await Promise.race([exited.then(() => true), delay(5_000).then(() => false)])) return;
+  child.kill("SIGKILL");
+  await Promise.race([exited, delay(1_000)]);
 }
 
 interface DiscoveredPiSkill extends RuntimeSkillCapability {
@@ -75,7 +101,26 @@ async function discoverSkills(rpc: PiRpcProcess): Promise<DiscoveredPiSkill[]> {
   });
 }
 
+export interface PiAgentRuntimeOptions {
+  requestTimeoutMs?: number;
+  controlRequestTimeoutMs?: number;
+  startTimeoutMs?: number;
+  workerPath?: string;
+}
+
 export class PiAgentRuntime implements AgentRuntime {
+  constructor(private readonly options: PiAgentRuntimeOptions = {}) {
+    for (const [name, value] of Object.entries({
+      requestTimeoutMs: options.requestTimeoutMs,
+      controlRequestTimeoutMs: options.controlRequestTimeoutMs,
+      startTimeoutMs: options.startTimeoutMs,
+    })) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
+        throw new RangeError(`${name} must be a positive integer`);
+      }
+    }
+  }
+
   async capabilities(config: Pick<AgentStartConfig, "cwd"> = {}): Promise<RuntimeLaunchCapabilities> {
     const rpc = new PiRpcProcess(resolve(config.cwd ?? process.cwd()), () => {});
     try {
@@ -140,7 +185,9 @@ export class PiAgentRuntime implements AgentRuntime {
     const readyFile = resolve(directory, `.launch-${launchId}.json`);
     const logFile = resolve(directory, `.launch-${launchId}.log`);
     const promptFile = resolve(directory, `.launch-${launchId}.prompt`);
-    const worker = fileURLToPath(new URL("./owned-worker.js", import.meta.url));
+    const worker = this.options.workerPath
+      ? resolve(this.options.workerPath)
+      : fileURLToPath(new URL("./owned-worker.js", import.meta.url));
     const workerArgs = [worker, "--cwd", cwd, "--ready-file", readyFile, "--log-file", logFile];
     if (config.systemPrompt !== undefined) {
       await writeFile(promptFile, config.systemPrompt, { mode: 0o600 });
@@ -159,30 +206,58 @@ export class PiAgentRuntime implements AgentRuntime {
       for (const path of skillPaths) workerArgs.push("--skill-path", path);
     }
     const child = spawn(process.execPath, workerArgs, {
-      detached: true,
+      detached: false,
       stdio: "ignore",
       env: process.env,
     });
-    child.unref();
-
+    let cancelled = false;
+    const failed = new Promise<never>((_resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => {
+        setTimeout(async () => {
+          try {
+            const result = JSON.parse(await readFile(readyFile, "utf8")) as { error?: string };
+            if (result.error) {
+              reject(new Error(result.error));
+              return;
+            }
+          } catch {}
+          reject(new Error(`Pi Runtime worker exited before readiness (${signal ?? code ?? "unknown"}). See ${logFile}`));
+        }, 20);
+      });
+    });
+    const timeoutMs = this.options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
+    let started = false;
     try {
-      for (let attempt = 0; attempt < 150; attempt++) {
-        try {
-          const result = JSON.parse(await readFile(readyFile, "utf8")) as {
-            sessionId?: string;
-            error?: string;
-          };
-          if (result.error) throw new Error(result.error);
-          if (result.sessionId) {
-            return { id: result.sessionId, runtime: "pi", ownership: "owned", cwd };
+      const ready = (async () => {
+        const deadline = Date.now() + timeoutMs;
+        while (!cancelled && Date.now() < deadline) {
+          try {
+            const result = JSON.parse(await readFile(readyFile, "utf8")) as {
+              sessionId?: string;
+              error?: string;
+            };
+            if (result.error) throw new Error(result.error);
+            if (result.sessionId) {
+              if (child.exitCode !== null || child.signalCode !== null) {
+                throw new Error(`Pi Runtime worker exited during startup. See ${logFile}`);
+              }
+              return result.sessionId;
+            }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
           }
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          await delay(Math.min(100, Math.max(1, deadline - Date.now())));
         }
-        await delay(100);
-      }
-      throw new Error(`Timed out starting Pi runtime. See ${logFile}`);
+        throw new Error(`Timed out starting Pi runtime after ${timeoutMs}ms. See ${logFile}`);
+      })();
+      const sessionId = await Promise.race([ready, failed]);
+      started = true;
+      child.unref();
+      return { id: sessionId, runtime: "pi", ownership: "owned", cwd };
     } finally {
+      cancelled = true;
+      if (!started) await terminateChild(child);
       await Promise.all([rm(readyFile, { force: true }), rm(promptFile, { force: true })]);
     }
   }
@@ -192,7 +267,7 @@ export class PiAgentRuntime implements AgentRuntime {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ input }),
-    });
+    }, this.options.controlRequestTimeoutMs ?? CONTROL_REQUEST_TIMEOUT_MS);
   }
 
   async startTurn(sessionId: string, turnId: string, input: string): Promise<AgentTurn> {
@@ -200,12 +275,12 @@ export class PiAgentRuntime implements AgentRuntime {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ turnId, input }),
-    });
+    }, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
     return ((await response.json()) as { turn: AgentTurn }).turn;
   }
 
   async turn(sessionId: string, turnId: string): Promise<AgentTurn | undefined> {
-    const response = await checkedFetch(sessionId, `/turns/${encodeURIComponent(turnId)}`);
+    const response = await checkedFetch(sessionId, `/turns/${encodeURIComponent(turnId)}`, undefined, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
     const body = (await response.json()) as { turn: AgentTurn | null };
     return body.turn ?? undefined;
   }
@@ -215,16 +290,16 @@ export class PiAgentRuntime implements AgentRuntime {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ input }),
-    });
+    }, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
   }
 
   async interrupt(sessionId: string): Promise<void> {
-    await checkedFetch(sessionId, "/interrupt", { method: "POST" });
+    await checkedFetch(sessionId, "/interrupt", { method: "POST" }, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
   }
 
   async status(sessionId: string): Promise<AgentStatus> {
     try {
-      const response = await checkedFetch(sessionId, "/status");
+      const response = await checkedFetch(sessionId, "/status", undefined, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
       const body = (await response.json()) as { status: AgentStatus };
       return body.status;
     } catch (error) {
@@ -234,13 +309,13 @@ export class PiAgentRuntime implements AgentRuntime {
   }
 
   async messages(sessionId: string): Promise<RuntimeMessage[]> {
-    const response = await checkedFetch(sessionId, "/messages");
+    const response = await checkedFetch(sessionId, "/messages", undefined, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
     const body = (await response.json()) as { messages: RuntimeMessage[] };
     return body.messages;
   }
 
   async stop(sessionId: string): Promise<void> {
-    await checkedFetch(sessionId, "/stop", { method: "POST" });
+    await checkedFetch(sessionId, "/stop", { method: "POST" }, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
     for (let attempt = 0; attempt < 50; attempt++) {
       if ((await this.status(sessionId)) === "offline") return;
       await delay(100);
