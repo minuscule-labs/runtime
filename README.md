@@ -107,3 +107,7 @@ minu-runtime start --cwd .
 The standalone binary remains available so Runtime can be installed and used without the rest of the Minu stack.
 
 `steer` is accepted only while an agent is working and delivers guidance at the harness's next safe model boundary. `interrupt` aborts active work but cannot undo tool or filesystem side effects. Normal `send` remains an idle-only operation.
+
+## License
+
+MinuRuntime is licensed under the [Apache License 2.0](LICENSE).
