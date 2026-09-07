@@ -29,7 +29,7 @@ interface AgentRuntime {
 
 Runtime-owned sessions are preferred for agents created by applications. Attached sessions allow an existing native TUI to opt into Runtime through a minimal harness adapter.
 
-`startTurn` accepts a caller-stable turn id and returns an existing running or terminal turn when retried. `turn` lets a caller recover completion and the assistant response after its own process reconnects. Turn records live with the active Runtime bridge, so they survive a Channels/Relay restart while the Runtime session remains alive; they do not survive termination of that Runtime session.
+`startTurn` accepts a caller-stable turn id and returns an existing running or terminal turn when retried. `turn` lets a caller recover completion and the assistant response after its own process reconnects. Turn records live with the active Runtime bridge, so they survive a Channels/Relay restart while the Runtime session remains alive; they do not survive termination of that Runtime session. Bridges retain the most recent 1,000 terminal/running turn records by default, defining the in-memory retry-idempotency window without allowing unbounded session growth.
 
 ## Personas
 
@@ -57,7 +57,7 @@ const session = await runtime.start({
 });
 ```
 
-The Pi adapter discovers configured models through Pi RPC. At startup it verifies the exact provider/model, selects it, checks the model's available thinking levels, and then applies the requested reasoning level. Unsupported selections fail before the session is registered; they never silently fall back to Pi defaults. Launch selection is immutable for that session.
+The Pi adapter discovers configured models through Pi RPC. At startup it verifies the exact provider/model, selects it, checks the model's available thinking levels, and then applies the requested reasoning level. Unsupported selections fail before the session is registered; they never silently fall back to Pi defaults. Launch selection is immutable for that session. Owned-worker startup remains supervised until readiness; timeout, setup failure, spawn failure, or early exit terminates and awaits the worker before launch artifacts are removed. Short bridge requests and control operations use bounded deadlines, while event streams remain caller-cancellable and long-lived.
 
 ## Skills
 

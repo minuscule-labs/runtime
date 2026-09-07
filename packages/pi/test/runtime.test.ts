@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentStatus } from "@minu/runtime-core";
+import type { AgentStatus, RuntimeMessage } from "@minu/runtime-core";
 import { PiAgentRuntime } from "../src/client.js";
-import { writeRegistration } from "../src/registry.js";
+import { listRegistrations, writeRegistration } from "../src/registry.js";
 import { createPiBridgeServer } from "../src/server.js";
 
 async function fixture(initialStatus: AgentStatus = "idle") {
@@ -194,6 +196,114 @@ test("start rejects competing system prompt modes", async () => {
     new PiAgentRuntime().start({ systemPrompt: "replace", appendSystemPrompt: "append" }),
     /cannot both be set/,
   );
+});
+
+test("turn response recovery survives transcript replacement and retention is bounded", async () => {
+  let transcript: RuntimeMessage[] = Array.from({ length: 3 }, (_, index) => ({
+    role: "user" as const,
+    content: `old-${index}`,
+  }));
+  const bridge = await createPiBridgeServer({
+    sessionId: "compacted-session",
+    token: "compacted-token",
+    getStatus: () => "idle",
+    async getMessages() { return transcript; },
+    async send(input) { transcript = [{ role: "assistant", content: `new-${input}` }]; },
+    turnRetentionLimit: 2,
+  });
+  try {
+    const headers = { authorization: "Bearer compacted-token", "content-type": "application/json" };
+    for (const turnId of ["first", "second", "third"]) {
+      await fetch(`${bridge.endpoint}/turns`, {
+        method: "POST", headers, body: JSON.stringify({ turnId, input: turnId }),
+      });
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const body = await (await fetch(`${bridge.endpoint}/turns/${turnId}`, { headers })).json() as { turn: { status: string; response?: { content: string } } | null };
+        if (body.turn?.status !== "running") {
+          assert.equal(body.turn?.status, "completed");
+          assert.equal(body.turn?.response?.content, `new-${turnId}`);
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+    assert.deepEqual(await (await fetch(`${bridge.endpoint}/turns/first`, { headers })).json(), { turn: null });
+  } finally { await bridge.close(); }
+});
+
+test("short Runtime requests time out instead of stalling forever", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "minu-runtime-timeout-"));
+  process.env.MINU_RUNTIME_DIR = directory;
+  const stalled = createServer(() => {});
+  await new Promise<void>((resolve) => stalled.listen(0, "127.0.0.1", resolve));
+  const address = stalled.address() as AddressInfo;
+  try {
+    await writeRegistration({
+      sessionId: "stalled", endpoint: `http://127.0.0.1:${address.port}`,
+      token: "token", pid: process.pid, cwd: directory, updatedAt: new Date().toISOString(),
+    });
+    await assert.rejects(new PiAgentRuntime({ requestTimeoutMs: 30 }).messages("stalled"), /timed out/);
+  } finally {
+    await new Promise<void>((resolve, reject) => stalled.close((error) => error ? reject(error) : resolve()));
+    await rm(directory, { recursive: true, force: true });
+    delete process.env.MINU_RUNTIME_DIR;
+  }
+});
+
+test("registry listing ignores launch markers and isolates corrupt registrations", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "minu-runtime-registry-"));
+  process.env.MINU_RUNTIME_DIR = directory;
+  try {
+    await writeFile(join(directory, ".launch-test.json"), "{}\n");
+    await writeFile(join(directory, "corrupt.json"), "not json\n");
+    await writeRegistration({
+      sessionId: "healthy", endpoint: "http://127.0.0.1:1", token: "token",
+      pid: process.pid, cwd: directory, updatedAt: new Date().toISOString(),
+    });
+    assert.deepEqual((await listRegistrations()).map(({ sessionId }) => sessionId), ["healthy"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+    delete process.env.MINU_RUNTIME_DIR;
+  }
+});
+
+test("failed Runtime startup terminates its worker", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "minu-runtime-startup-"));
+  const worker = join(directory, "worker.mjs");
+  const pidFile = join(directory, "pid");
+  await writeFile(worker, `import { writeFileSync } from "node:fs";\nwriteFileSync(process.env.WORKER_PID_FILE, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
+  process.env.MINU_RUNTIME_DIR = join(directory, "registry");
+  process.env.WORKER_PID_FILE = pidFile;
+  try {
+    await assert.rejects(
+      new PiAgentRuntime({ workerPath: worker, startTimeoutMs: 50 }).start({ cwd: directory }),
+      /Timed out starting Pi runtime/,
+    );
+    const pid = Number(await readFile(pidFile, "utf8"));
+    assert.throws(() => process.kill(pid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+    delete process.env.MINU_RUNTIME_DIR;
+    delete process.env.WORKER_PID_FILE;
+  }
+});
+
+test("Runtime startup reports a worker that exits before readiness", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "minu-runtime-early-exit-"));
+  const worker = join(directory, "worker.mjs");
+  await writeFile(worker, "process.exit(7);\n");
+  process.env.MINU_RUNTIME_DIR = join(directory, "registry");
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      new PiAgentRuntime({ workerPath: worker, startTimeoutMs: 5_000 }).start({ cwd: directory }),
+      /exited before readiness \(7\)/,
+    );
+    assert.ok(Date.now() - started < 1_000);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+    delete process.env.MINU_RUNTIME_DIR;
+  }
 });
 
 test("runtime can own a prompted Pi RPC process through start, send, messages, and stop", async () => {
