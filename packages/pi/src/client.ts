@@ -10,6 +10,9 @@ import type {
   AgentStartConfig,
   AgentStatus,
   AgentTurn,
+  RuntimeActivityEvent,
+  RuntimeActivityOptions,
+  RuntimeActivityPhase,
   RuntimeLaunchCapabilities,
   RuntimeMessage,
   RuntimeSkillCapability,
@@ -323,10 +326,11 @@ export class PiAgentRuntime implements AgentRuntime {
     throw new Error(`Timed out stopping Pi session: ${sessionId}`);
   }
 
-  async *events(sessionId: string): AsyncIterable<AgentEvent> {
+  private async *eventStream(sessionId: string, signal?: AbortSignal): AsyncIterable<AgentEvent> {
     const controller = new AbortController();
+    const streamSignal = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal;
     try {
-      const response = await checkedFetch(sessionId, "/events", { signal: controller.signal });
+      const response = await checkedFetch(sessionId, "/events", { signal: streamSignal });
       if (!response.body) throw new Error("Runtime event stream has no body");
       const decoder = new TextDecoder();
       let buffer = "";
@@ -344,6 +348,52 @@ export class PiAgentRuntime implements AgentRuntime {
       }
     } finally {
       controller.abort();
+    }
+  }
+
+  events(sessionId: string): AsyncIterable<AgentEvent> {
+    return this.eventStream(sessionId);
+  }
+
+  async *activityEvents(
+    sessionId: string,
+    options: RuntimeActivityOptions,
+  ): AsyncIterable<RuntimeActivityEvent> {
+    const activeTools = new Set<string>();
+    let currentPhase: RuntimeActivityPhase | undefined;
+    try {
+      for await (const event of this.eventStream(sessionId, options.signal)) {
+        if (typeof event.timestamp !== "string" || !Number.isFinite(Date.parse(event.timestamp))) continue;
+        let nextPhase: RuntimeActivityPhase | undefined;
+        if (event.type === "status") {
+          if (event.status === "working" && activeTools.size === 0) nextPhase = "working";
+          else if (event.status !== "working") {
+            activeTools.clear();
+            currentPhase = undefined;
+          }
+        } else if (event.type === "turn_started") {
+          activeTools.clear();
+          nextPhase = "working";
+        } else if (event.type === "tool_started") {
+          if (typeof event.toolCallId !== "string" || event.toolCallId.length === 0) continue;
+          activeTools.add(event.toolCallId);
+          nextPhase = "using_tools";
+        } else if (event.type === "tool_completed") {
+          if (typeof event.toolCallId !== "string" || !activeTools.delete(event.toolCallId)) continue;
+          nextPhase = activeTools.size > 0 ? "using_tools" : "working";
+        } else if (event.type === "message_delta" && activeTools.size === 0) {
+          nextPhase = "responding";
+        } else if (event.type === "turn_completed") {
+          activeTools.clear();
+          currentPhase = undefined;
+        }
+        if (nextPhase && nextPhase !== currentPhase) {
+          currentPhase = nextPhase;
+          yield { phase: nextPhase, observedAt: event.timestamp };
+        }
+      }
+    } catch (error) {
+      if (!options.signal.aborted) throw error;
     }
   }
 }
