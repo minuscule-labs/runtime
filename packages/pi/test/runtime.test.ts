@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentStatus, RuntimeMessage } from "@minu/runtime-core";
+import type { AgentEvent, AgentStatus, RuntimeMessage } from "@minu/runtime-core";
 import { PiAgentRuntime } from "../src/client.js";
 import { listRegistrations, writeRegistration } from "../src/registry.js";
 import { createPiBridgeServer } from "../src/server.js";
@@ -60,6 +60,9 @@ async function fixture(initialStatus: AgentStatus = "idle") {
     },
     setStatus(next: AgentStatus) {
       status = next;
+    },
+    publish(event: AgentEvent) {
+      bridge.publish(event);
     },
     async close() {
       await bridge.close();
@@ -119,6 +122,105 @@ test("events exposes the current session status", async () => {
       if (event.type === "status") assert.equal(event.status, "idle");
       break;
     }
+  } finally {
+    await server.close();
+  }
+});
+
+test("safe activity events coalesce raw details and honor caller cancellation", async () => {
+  const server = await fixture("working");
+  try {
+    const runtime = new PiAgentRuntime();
+    const controller = new AbortController();
+    const iterator = runtime.activityEvents(server.sessionId, { signal: controller.signal })[Symbol.asyncIterator]();
+    const initial = await iterator.next();
+    assert.equal(initial.done, false);
+    assert.equal(initial.value?.phase, "working");
+    assert.equal(Number.isFinite(Date.parse(initial.value?.observedAt ?? "")), true);
+    assert.doesNotMatch(JSON.stringify(initial), /session/);
+
+    const timestamp = new Date().toISOString();
+    const responding = iterator.next();
+    server.publish({
+      type: "message_delta",
+      sessionId: server.sessionId,
+      delta: "private answer text",
+      timestamp,
+    });
+    assert.deepEqual(await responding, { done: false, value: { phase: "responding", observedAt: timestamp } });
+
+    const usingTools = iterator.next();
+    server.publish({
+      type: "message_delta",
+      sessionId: server.sessionId,
+      delta: "another private token",
+      timestamp,
+    });
+    server.publish({
+      type: "tool_started",
+      sessionId: server.sessionId,
+      toolCallId: "private-call",
+      toolName: "private-tool-name",
+      timestamp,
+    });
+    const safeToolEvent = await usingTools;
+    assert.deepEqual(safeToolEvent, { done: false, value: { phase: "using_tools", observedAt: timestamp } });
+    assert.doesNotMatch(JSON.stringify(safeToolEvent), /session|operation|answer|token|call|tool-name/);
+
+    const backToWorking = iterator.next();
+    server.publish({
+      type: "tool_started",
+      sessionId: server.sessionId,
+      toolCallId: "private-parallel-call",
+      toolName: "another-private-tool",
+      timestamp,
+    });
+    server.publish({
+      type: "tool_completed",
+      sessionId: server.sessionId,
+      toolCallId: "private-call",
+      toolName: "private-tool-name",
+      isError: true,
+      timestamp,
+    });
+    server.publish({
+      type: "tool_completed",
+      sessionId: server.sessionId,
+      toolCallId: "private-parallel-call",
+      toolName: "another-private-tool",
+      isError: false,
+      timestamp,
+    });
+    assert.deepEqual(await backToWorking, { done: false, value: { phase: "working", observedAt: timestamp } });
+
+    const afterIgnoredEvents = iterator.next();
+    server.publish({
+      type: "error",
+      sessionId: server.sessionId,
+      operationId: "private-operation",
+      message: "private raw error",
+      timestamp,
+    });
+    server.publish({
+      type: "message_delta",
+      sessionId: server.sessionId,
+      delta: "private malformed event",
+      timestamp: "not-a-date",
+    });
+    const laterTimestamp = new Date(Date.parse(timestamp) + 1_000).toISOString();
+    server.publish({
+      type: "message_delta",
+      sessionId: server.sessionId,
+      delta: "private final answer",
+      timestamp: laterTimestamp,
+    });
+    const safeResponseEvent = await afterIgnoredEvents;
+    assert.deepEqual(safeResponseEvent, { done: false, value: { phase: "responding", observedAt: laterTimestamp } });
+    assert.doesNotMatch(JSON.stringify(safeResponseEvent), /session|operation|error|malformed|answer/);
+
+    const canceled = iterator.next();
+    controller.abort();
+    assert.deepEqual(await canceled, { done: true, value: undefined });
   } finally {
     await server.close();
   }

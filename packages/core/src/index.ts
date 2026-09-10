@@ -87,6 +87,18 @@ export type AgentEvent =
     })
   | (EventBase & { type: "error"; operationId?: string; message: string });
 
+/** Presentation-safe activity vocabulary. Raw AgentEvent fields must not cross this boundary. */
+export type RuntimeActivityPhase = "working" | "using_tools" | "responding";
+
+export interface RuntimeActivityEvent {
+  phase: RuntimeActivityPhase;
+  observedAt: string;
+}
+
+export interface RuntimeActivityOptions {
+  signal: AbortSignal;
+}
+
 export interface AgentRuntime {
   /** Launch and own a new agent process. */
   start(config?: AgentStartConfig): Promise<AgentSession>;
@@ -104,6 +116,8 @@ export interface AgentRuntime {
   interrupt(sessionId: string): Promise<void>;
   status(sessionId: string): Promise<AgentStatus>;
   events(sessionId: string): AsyncIterable<AgentEvent>;
+  /** Optional sanitized activity stream for presentation layers. */
+  activityEvents?(sessionId: string, options: RuntimeActivityOptions): AsyncIterable<RuntimeActivityEvent>;
   messages(sessionId: string): Promise<RuntimeMessage[]>;
   /** Stop a runtime-owned session. Attached sessions cannot be stopped by Runtime. */
   stop(sessionId: string): Promise<void>;
