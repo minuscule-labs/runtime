@@ -128,6 +128,8 @@ export interface AgentRuntime {
   status(sessionId: string): Promise<AgentStatus>;
   /** Query allowlisted live-session capabilities without exposing adapter internals. */
   sessionCapabilities?(sessionId: string): Promise<RuntimeSessionCapabilities>;
+  /** Open an adapter-owned local diagnostic without returning its path or contents. */
+  openDiagnostic?(sessionId: string): Promise<void>;
   events(sessionId: string): AsyncIterable<AgentEvent>;
   /** Optional sanitized activity stream for presentation layers. */
   activityEvents?(sessionId: string, options: RuntimeActivityOptions): AsyncIterable<RuntimeActivityEvent>;
