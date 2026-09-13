@@ -10,7 +10,7 @@ import { PiAgentRuntime } from "../src/client.js";
 import { listRegistrations, writeRegistration } from "../src/registry.js";
 import { createPiBridgeServer } from "../src/server.js";
 
-async function fixture(initialStatus: AgentStatus = "idle") {
+async function fixture(initialStatus: AgentStatus = "idle", interruptible = true) {
   const directory = await mkdtemp(join(tmpdir(), "minu-runtime-test-"));
   process.env.MINU_RUNTIME_DIR = directory;
   const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -34,10 +34,12 @@ async function fixture(initialStatus: AgentStatus = "idle") {
     async steer(input) {
       steered.push(input);
     },
-    async interrupt() {
-      interruptions += 1;
-      status = "idle";
-    },
+    ...(interruptible ? {
+      async interrupt() {
+        interruptions += 1;
+        status = "idle" as const;
+      },
+    } : {}),
     async getMessages() {
       return [...transcript];
     },
@@ -82,6 +84,33 @@ test("send wakes an idle bridge and resolves after it returns idle", async () =>
     assert.equal(await runtime.status(server.sessionId), "idle");
   } finally {
     await server.close();
+  }
+});
+
+test("live session capabilities are versioned, allowlisted, and session-verified", async () => {
+  const capable = await fixture();
+  try {
+    assert.deepEqual(await new PiAgentRuntime().sessionCapabilities(capable.sessionId), {
+      version: 1,
+      safeActivityEvents: true,
+      interrupt: true,
+      reconnectExisting: true,
+      interactiveAttach: false,
+      openDiagnostic: false,
+      liveSkillVerification: false,
+    });
+  } finally {
+    await capable.close();
+  }
+
+  const limited = await fixture("idle", false);
+  try {
+    assert.equal(
+      (await new PiAgentRuntime().sessionCapabilities(limited.sessionId)).interrupt,
+      false,
+    );
+  } finally {
+    await limited.close();
   }
 });
 

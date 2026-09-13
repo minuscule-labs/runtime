@@ -15,6 +15,7 @@ import type {
   RuntimeActivityPhase,
   RuntimeLaunchCapabilities,
   RuntimeMessage,
+  RuntimeSessionCapabilities,
   RuntimeSkillCapability,
 } from "@minu/runtime-core";
 import { PiRpcProcess } from "./pi-rpc.js";
@@ -309,6 +310,40 @@ export class PiAgentRuntime implements AgentRuntime {
       if (error instanceof SessionOfflineError) return "offline";
       throw error;
     }
+  }
+
+  async sessionCapabilities(sessionId: string): Promise<RuntimeSessionCapabilities> {
+    const response = await checkedFetch(
+      sessionId,
+      "/capabilities",
+      undefined,
+      this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS,
+    );
+    const body = (await response.json()) as { capabilities?: unknown };
+    const value = body.capabilities;
+    if (!value || typeof value !== "object") throw new Error("Invalid Runtime capability response");
+    const candidate = value as Record<string, unknown>;
+    const booleanFields = [
+      "safeActivityEvents",
+      "interrupt",
+      "reconnectExisting",
+      "interactiveAttach",
+      "openDiagnostic",
+      "liveSkillVerification",
+    ] as const;
+    if (candidate.version !== 1
+      || booleanFields.some((field) => typeof candidate[field] !== "boolean")) {
+      throw new Error("Invalid Runtime capability response");
+    }
+    return {
+      version: 1,
+      safeActivityEvents: candidate.safeActivityEvents as boolean,
+      interrupt: candidate.interrupt as boolean,
+      reconnectExisting: candidate.reconnectExisting as boolean,
+      interactiveAttach: candidate.interactiveAttach as boolean,
+      openDiagnostic: candidate.openDiagnostic as boolean,
+      liveSkillVerification: candidate.liveSkillVerification as boolean,
+    };
   }
 
   async messages(sessionId: string): Promise<RuntimeMessage[]> {
