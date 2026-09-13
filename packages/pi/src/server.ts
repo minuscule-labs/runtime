@@ -21,6 +21,7 @@ export interface PiBridgeServerOptions {
   send(input: string, operationId: string): Promise<void>;
   steer?(input: string): Promise<void>;
   interrupt?(): Promise<void>;
+  openDiagnostic?(): Promise<void>;
   getMessages?(): Promise<RuntimeMessage[]>;
   stop?(): Promise<void> | void;
   /** Completed turn ids remain idempotent within this bounded, insertion-ordered window. */
@@ -132,7 +133,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           interrupt: Boolean(options.interrupt),
           reconnectExisting: true,
           interactiveAttach: false,
-          openDiagnostic: false,
+          openDiagnostic: Boolean(options.openDiagnostic),
           liveSkillVerification: false,
         };
         json(response, 200, { capabilities });
@@ -241,6 +242,16 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           }
         }
         json(response, 202, { status: "interrupting" });
+        return;
+      }
+
+      if (request.method === "POST" && url.pathname === "/diagnostic/open") {
+        if (!options.openDiagnostic) {
+          json(response, 405, { error: "This Runtime session has no local diagnostic" });
+          return;
+        }
+        await options.openDiagnostic();
+        json(response, 202, { status: "opened" });
         return;
       }
 

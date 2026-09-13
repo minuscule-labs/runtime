@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { AgentReasoningLevel, AgentStatus } from "@minu/runtime-core";
 import { normalizePiMessages } from "./messages.js";
 import { PiRpcProcess, type RpcEvent } from "./pi-rpc.js";
 import { removeRegistration, writeRegistration } from "./registry.js";
+import { BoundedDiagnosticLog, openLocalDiagnosticFile, resolveLocalDiagnosticOpener } from "./diagnostic.js";
 import { createPiBridgeServer, SessionBusyError, type PiBridgeServer } from "./server.js";
 
 interface PendingTurn {
@@ -56,10 +57,10 @@ let sessionId: string | undefined;
 let status: AgentStatus = "offline";
 let pending: PendingTurn | undefined;
 let shuttingDown = false;
+const diagnosticLog = new BoundedDiagnosticLog(logFile);
 
 async function log(text: string): Promise<void> {
-  await mkdir(dirname(logFile), { recursive: true });
-  await appendFile(logFile, text);
+  await diagnosticLog.append(text);
 }
 
 function publishStatus(next: AgentStatus): void {
@@ -193,6 +194,8 @@ async function main(): Promise<void> {
   if (typeof state.sessionId !== "string") throw new Error("Pi RPC did not return a session id");
   sessionId = state.sessionId;
   status = state.isStreaming === true ? "working" : "idle";
+  await log("");
+  const diagnosticOpener = await resolveLocalDiagnosticOpener();
   const token = randomBytes(32).toString("hex");
   bridge = await createPiBridgeServer({
     sessionId,
@@ -201,6 +204,9 @@ async function main(): Promise<void> {
     send: inject,
     steer,
     interrupt,
+    openDiagnostic: diagnosticOpener
+      ? () => openLocalDiagnosticFile(logFile, diagnosticOpener)
+      : undefined,
     getMessages: async () => {
       const data = (await rpc!.request("get_messages")) as { messages?: unknown[] };
       return normalizePiMessages(data.messages ?? []);

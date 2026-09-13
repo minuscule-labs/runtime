@@ -346,6 +346,15 @@ export class PiAgentRuntime implements AgentRuntime {
     };
   }
 
+  async openDiagnostic(sessionId: string): Promise<void> {
+    await checkedFetch(
+      sessionId,
+      "/diagnostic/open",
+      { method: "POST" },
+      this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS,
+    );
+  }
+
   async messages(sessionId: string): Promise<RuntimeMessage[]> {
     const response = await checkedFetch(sessionId, "/messages", undefined, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
     const body = (await response.json()) as { messages: RuntimeMessage[] };

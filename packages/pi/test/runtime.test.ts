@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -7,10 +7,15 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AgentEvent, AgentStatus, RuntimeMessage } from "@minu/runtime-core";
 import { PiAgentRuntime } from "../src/client.js";
+import { BoundedDiagnosticLog } from "../src/diagnostic.js";
 import { listRegistrations, writeRegistration } from "../src/registry.js";
 import { createPiBridgeServer } from "../src/server.js";
 
-async function fixture(initialStatus: AgentStatus = "idle", interruptible = true) {
+async function fixture(
+  initialStatus: AgentStatus = "idle",
+  interruptible = true,
+  diagnostic = false,
+) {
   const directory = await mkdtemp(join(tmpdir(), "minu-runtime-test-"));
   process.env.MINU_RUNTIME_DIR = directory;
   const sessionId = `session-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -20,6 +25,7 @@ async function fixture(initialStatus: AgentStatus = "idle", interruptible = true
   const transcript = [{ role: "assistant" as const, content: "Finished the review" }];
   const steered: string[] = [];
   let interruptions = 0;
+  let diagnosticOpens = 0;
   const bridge = await createPiBridgeServer({
     sessionId,
     token,
@@ -40,6 +46,11 @@ async function fixture(initialStatus: AgentStatus = "idle", interruptible = true
         status = "idle" as const;
       },
     } : {}),
+    ...(diagnostic ? {
+      async openDiagnostic() {
+        diagnosticOpens += 1;
+      },
+    } : {}),
     async getMessages() {
       return [...transcript];
     },
@@ -55,10 +66,15 @@ async function fixture(initialStatus: AgentStatus = "idle", interruptible = true
   });
   return {
     sessionId,
+    endpoint: bridge.endpoint,
+    token,
     received,
     steered,
     get interruptions() {
       return interruptions;
+    },
+    get diagnosticOpens() {
+      return diagnosticOpens;
     },
     setStatus(next: AgentStatus) {
       status = next;
@@ -111,6 +127,46 @@ test("live session capabilities are versioned, allowlisted, and session-verified
     );
   } finally {
     await limited.close();
+  }
+});
+
+test("opens only an authenticated adapter-owned local diagnostic", async () => {
+  const server = await fixture("idle", true, true);
+  try {
+    const runtime = new PiAgentRuntime();
+    assert.equal((await runtime.sessionCapabilities(server.sessionId)).openDiagnostic, true);
+    await runtime.openDiagnostic(server.sessionId);
+    assert.equal(server.diagnosticOpens, 1);
+
+    const unauthorized = await fetch(`${server.endpoint}/diagnostic/open`, { method: "POST" });
+    assert.equal(unauthorized.status, 401);
+    assert.deepEqual(await unauthorized.json(), { error: "Unauthorized" });
+    const authorized = await fetch(`${server.endpoint}/diagnostic/open`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${server.token}` },
+    });
+    assert.equal(authorized.status, 202);
+    const authorizedBody = await authorized.text();
+    assert.deepEqual(JSON.parse(authorizedBody), { status: "opened" });
+    assert.equal(server.diagnosticOpens, 2);
+    assert.doesNotMatch(authorizedBody, /[/\\]|session/i);
+  } finally {
+    await server.close();
+  }
+});
+
+test("keeps local diagnostic logs private and bounded", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "minu-runtime-diagnostic-"));
+  const file = join(directory, "runtime.log");
+  try {
+    const log = new BoundedDiagnosticLog(file, 8);
+    await Promise.all([log.append("1234"), log.append("5678"), log.append("90")]);
+    assert.equal(await readFile(file, "utf8"), "7890");
+    const metadata = await stat(file);
+    assert.equal(metadata.size, 4);
+    assert.equal(metadata.mode & 0o777, 0o600);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
