@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { AgentEvent, AgentStatus, AgentTurn, RuntimeMessage } from "@minu/runtime-core";
+import type {
+  AgentEvent,
+  AgentStatus,
+  AgentTurn,
+  RuntimeMessage,
+  RuntimeSessionCapabilities,
+} from "@minu/runtime-core";
 
 const MAX_INPUT_BYTES = 1024 * 1024;
 const DEFAULT_TURN_RETENTION_LIMIT = 1_000;
@@ -116,6 +122,20 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       const url = new URL(request.url ?? "/", "http://runtime.local");
       if (request.method === "GET" && url.pathname === "/status") {
         json(response, 200, { sessionId: options.sessionId, status: options.getStatus() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/capabilities") {
+        const capabilities: RuntimeSessionCapabilities = {
+          version: 1,
+          safeActivityEvents: true,
+          interrupt: Boolean(options.interrupt),
+          reconnectExisting: true,
+          interactiveAttach: false,
+          openDiagnostic: false,
+          liveSkillVerification: false,
+        };
+        json(response, 200, { capabilities });
         return;
       }
 

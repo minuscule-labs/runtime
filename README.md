@@ -21,6 +21,7 @@ interface AgentRuntime {
   steer(sessionId: string, input: string): Promise<void>;
   interrupt(sessionId: string): Promise<void>;
   status(sessionId: string): Promise<AgentStatus>;
+  sessionCapabilities?(sessionId: string): Promise<RuntimeSessionCapabilities>;
   events(sessionId: string): AsyncIterable<AgentEvent>;
   activityEvents?(
     sessionId: string,
@@ -34,6 +35,8 @@ interface AgentRuntime {
 Runtime-owned sessions are preferred for agents created by applications. Attached sessions allow an existing native TUI to opt into Runtime through a minimal harness adapter.
 
 `events` is the adapter-level stream and may contain message deltas, tool names, errors, operation IDs, and session IDs. Presentation layers must not consume it directly. Adapters may instead expose `activityEvents`, an optional sanitized stream containing only `working`, `using_tools`, or `responding` plus an observation timestamp. The Pi adapter coalesces repeated raw events, discards all private fields before yielding, and stops when the caller aborts.
+
+`sessionCapabilities` is an optional live-session query, distinct from launch-time `capabilities`. Version 1 returns only booleans for safe activity events, interruption, reconnecting an existing live session, interactive attachment, diagnostic opening, and live skill verification. Consumers must treat an absent or failed query as **not verified**, not as proof that a capability is unsupported. The Pi bridge computes this response from the currently reachable session and never includes session IDs, endpoints, paths, commands, tools, providers, or credentials.
 
 `startTurn` accepts a caller-stable turn id and returns an existing running or terminal turn when retried. `turn` lets a caller recover completion and the assistant response after its own process reconnects. Turn records live with the active Runtime bridge, so they survive a Channels/Relay restart while the Runtime session remains alive; they do not survive termination of that Runtime session. Bridges retain the most recent 1,000 terminal/running turn records by default, defining the in-memory retry-idempotency window without allowing unbounded session growth.
 

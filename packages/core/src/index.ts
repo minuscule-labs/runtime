@@ -99,6 +99,17 @@ export interface RuntimeActivityOptions {
   signal: AbortSignal;
 }
 
+/** Sanitized capabilities verified for one currently reachable Runtime session. */
+export interface RuntimeSessionCapabilities {
+  version: 1;
+  safeActivityEvents: boolean;
+  interrupt: boolean;
+  reconnectExisting: boolean;
+  interactiveAttach: boolean;
+  openDiagnostic: boolean;
+  liveSkillVerification: boolean;
+}
+
 export interface AgentRuntime {
   /** Launch and own a new agent process. */
   start(config?: AgentStartConfig): Promise<AgentSession>;
@@ -115,6 +126,8 @@ export interface AgentRuntime {
   /** Abort the active run. This does not undo tool side effects. */
   interrupt(sessionId: string): Promise<void>;
   status(sessionId: string): Promise<AgentStatus>;
+  /** Query allowlisted live-session capabilities without exposing adapter internals. */
+  sessionCapabilities?(sessionId: string): Promise<RuntimeSessionCapabilities>;
   events(sessionId: string): AsyncIterable<AgentEvent>;
   /** Optional sanitized activity stream for presentation layers. */
   activityEvents?(sessionId: string, options: RuntimeActivityOptions): AsyncIterable<RuntimeActivityEvent>;
