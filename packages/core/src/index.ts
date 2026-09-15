@@ -47,6 +47,10 @@ export interface RuntimeLaunchCapabilities {
   models: RuntimeModelCapability[];
   reasoningLevels: AgentReasoningLevel[];
   skills: RuntimeSkillCapability[];
+  /** Sanitized effective model selected when AgentStartConfig.model is omitted. */
+  defaultModel?: AgentModelSelection;
+  /** Sanitized effective reasoning selected when AgentStartConfig.reasoningLevel is omitted. */
+  defaultReasoningLevel?: AgentReasoningLevel;
 }
 
 export interface RuntimeMessage {
