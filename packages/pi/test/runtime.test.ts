@@ -524,7 +524,7 @@ process.stdin.on("data", (chunk) => {
     else if (request.type === "get_commands") respond({ commands: [{ name: "skill:reviewer", description: "Review changes", source: "skill", sourceInfo: { path: "/skills/reviewer/SKILL.md", source: "auto", scope: "user" } }] });
     else if (request.type === "get_available_thinking_levels") respond({ levels: ["off", "medium", "high"] });
     else if (request.type === "set_model" || request.type === "set_thinking_level") respond(undefined);
-    else if (request.type === "get_state") respond({ sessionId: "fake-owned-session", isStreaming: false });
+    else if (request.type === "get_state") respond({ model: { provider: "openai", id: "gpt-test" }, thinkingLevel: "medium", sessionId: "fake-owned-session", isStreaming: false });
     else if (request.type === "get_messages") respond({ messages });
     else if (request.type === "prompt") {
       messages.push({ role: "user", content: request.message, timestamp: Date.now() });
@@ -550,6 +550,8 @@ process.on("SIGTERM", () => process.exit(0));
       models: [{ provider: "openai", id: "gpt-test", name: "gpt-test", reasoning: true }],
       reasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
       skills: [{ id: "skill:reviewer", name: "reviewer", description: "Review changes" }],
+      defaultModel: { provider: "openai", id: "gpt-test" },
+      defaultReasoningLevel: "medium",
     });
     await assert.rejects(
       runtime.start({ cwd: directory, skillIds: ["skill:missing"] }),

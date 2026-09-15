@@ -140,11 +140,28 @@ export class PiAgentRuntime implements AgentRuntime {
           reasoning: model.reasoning === true,
         }];
       });
+      const reasoningLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+      const state = (await rpc.request("get_state")) as Record<string, unknown>;
+      const stateModel = state.model && typeof state.model === "object"
+        ? state.model as Record<string, unknown>
+        : undefined;
+      const defaultModel = stateModel
+        && typeof stateModel.provider === "string"
+        && typeof stateModel.id === "string"
+        && models.some((model) => model.provider === stateModel.provider && model.id === stateModel.id)
+        ? { provider: stateModel.provider, id: stateModel.id }
+        : undefined;
+      const defaultReasoningLevel = typeof state.thinkingLevel === "string"
+        && reasoningLevels.includes(state.thinkingLevel as typeof reasoningLevels[number])
+        ? state.thinkingLevel as typeof reasoningLevels[number]
+        : undefined;
       const skills = (await discoverSkills(rpc)).map(({ path: _path, ...skill }) => skill);
       return {
         models,
-        reasoningLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+        reasoningLevels: [...reasoningLevels],
         skills,
+        ...(defaultModel ? { defaultModel } : {}),
+        ...(defaultReasoningLevel ? { defaultReasoningLevel } : {}),
       };
     } finally {
       await rpc.stop();
