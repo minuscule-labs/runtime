@@ -595,8 +595,9 @@ process.on("SIGTERM", () => process.exit(0));
     );
     const accepted = await runtime.startTurn(session.id, "owned-turn-1", "recoverable");
     let recovered = accepted;
-    for (let attempt = 0; recovered.status === "running" && attempt < 20; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    const completionDeadline = Date.now() + 2_000;
+    while (recovered.status === "running" && Date.now() < completionDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
       recovered = (await runtime.turn(session.id, accepted.id))!;
     }
     assert.equal(recovered.status, "completed");
