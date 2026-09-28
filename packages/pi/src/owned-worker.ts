@@ -6,6 +6,13 @@ import type { AgentReasoningLevel, AgentStatus } from "@minu/runtime-core";
 import { normalizePiMessages } from "./messages.js";
 import { PiRpcProcess, type RpcEvent } from "./pi-rpc.js";
 import { removeRegistration, writeRegistration } from "./registry.js";
+import {
+  readManagedSessionManifest,
+  recordManagedSessionWorker,
+  recordManagedSessionWorkerStarted,
+  validateManagedSessionIdentity,
+  validatePiSessionFile,
+} from "./managed-sessions.js";
 import { BoundedDiagnosticLog, openLocalDiagnosticFile, resolveLocalDiagnosticOpener } from "./diagnostic.js";
 import { createPiBridgeServer, SessionBusyError, type PiBridgeServer } from "./server.js";
 
@@ -42,6 +49,9 @@ const modelId = optionalArgument("--model-id");
 const reasoningLevel = optionalArgument("--reasoning-level") as AgentReasoningLevel | undefined;
 const disableSkillDiscovery = process.argv.includes("--disable-skill-discovery");
 const skillPaths = argumentsFor("--skill-path");
+const runtimeSessionId = optionalArgument("--runtime-session-id");
+const runtimeOwnerId = optionalArgument("--runtime-owner-id");
+const resumeSessionFile = optionalArgument("--resume-session-file");
 const reasoningLevels: readonly AgentReasoningLevel[] = [
   "off", "minimal", "low", "medium", "high", "xhigh", "max",
 ];
@@ -51,9 +61,15 @@ if (Boolean(modelProvider) !== Boolean(modelId)) {
 if (reasoningLevel && !reasoningLevels.includes(reasoningLevel)) {
   throw new Error(`Unsupported reasoning level: ${reasoningLevel}`);
 }
+if (Boolean(runtimeSessionId) !== Boolean(runtimeOwnerId)) {
+  throw new Error("Managed Runtime session id and owner id must be supplied together");
+}
+if (runtimeSessionId && runtimeOwnerId) validateManagedSessionIdentity(runtimeSessionId, runtimeOwnerId);
+if (resumeSessionFile && !runtimeSessionId) throw new Error("Only managed Runtime sessions can resume a transcript");
 let rpc: PiRpcProcess | undefined;
 let bridge: PiBridgeServer | undefined;
 let sessionId: string | undefined;
+let registrationId: string | undefined;
 let status: AgentStatus = "offline";
 let pending: PendingTurn | undefined;
 let shuttingDown = false;
@@ -155,15 +171,24 @@ async function shutdown(exitCode = 0): Promise<void> {
   pending = undefined;
   await rpc?.stop().catch((error) => log(`Failed to stop Pi: ${String(error)}\n`));
   await bridge?.close().catch((error) => log(`Failed to close bridge: ${String(error)}\n`));
-  if (sessionId) await removeRegistration(sessionId);
+  if (registrationId) await removeRegistration(registrationId);
   process.exit(exitCode);
 }
 
 async function main(): Promise<void> {
   await mkdir(dirname(readyFile), { recursive: true });
+  if (runtimeSessionId && runtimeOwnerId) {
+    const manifest = await readManagedSessionManifest(runtimeSessionId, runtimeOwnerId);
+    if (!manifest || !resumeSessionFile || manifest.sessionFile !== resumeSessionFile) {
+      throw new Error("Runtime-managed Pi session is missing its verified transcript");
+    }
+    await validatePiSessionFile(resumeSessionFile, cwd, manifest.transcriptId);
+    await recordManagedSessionWorkerStarted(runtimeSessionId, runtimeOwnerId);
+  }
   rpc = new PiRpcProcess(cwd, (text) => void log(text), {
     systemPromptFile,
     appendSystemPromptFile,
+    sessionFile: resumeSessionFile,
     disableSkillDiscovery,
     skillPaths,
   });
@@ -194,6 +219,7 @@ async function main(): Promise<void> {
   if (typeof state.sessionId !== "string") throw new Error("Pi RPC did not return a session id");
   sessionId = state.sessionId;
   status = state.isStreaming === true ? "working" : "idle";
+  registrationId = runtimeSessionId ?? sessionId;
   await log("");
   const diagnosticOpener = await resolveLocalDiagnosticOpener();
   const token = randomBytes(32).toString("hex");
@@ -212,9 +238,11 @@ async function main(): Promise<void> {
       return normalizePiMessages(data.messages ?? []);
     },
     stop: () => shutdown(),
+    stopRequiresIdle: Boolean(runtimeSessionId),
   });
   await writeRegistration({
-    sessionId,
+    sessionId: registrationId,
+    ...(runtimeSessionId ? { ownerId: runtimeOwnerId } : {}),
     endpoint: bridge.endpoint,
     token,
     pid: process.pid,
@@ -224,7 +252,15 @@ async function main(): Promise<void> {
     logFile,
     updatedAt: new Date().toISOString(),
   });
-  await writeFile(readyFile, `${JSON.stringify({ sessionId })}\n`, { mode: 0o600 });
+  if (runtimeSessionId && runtimeOwnerId) {
+    await recordManagedSessionWorker(
+      runtimeSessionId,
+      runtimeOwnerId,
+      typeof state.sessionFile === "string" ? state.sessionFile : undefined,
+      sessionId,
+    );
+  }
+  await writeFile(readyFile, `${JSON.stringify({ sessionId, runtimeSessionId })}\n`, { mode: 0o600 });
 }
 
 process.on("SIGINT", () => void shutdown(130));

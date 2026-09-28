@@ -5,6 +5,7 @@ import { StringDecoder } from "node:string_decoder";
 export type RpcEvent = Record<string, unknown>;
 
 export interface PiRpcProcessOptions {
+  sessionFile?: string;
   systemPromptFile?: string;
   appendSystemPromptFile?: string;
   disableSkillDiscovery?: boolean;
@@ -30,6 +31,7 @@ export class PiRpcProcess {
       throw new Error("systemPromptFile and appendSystemPromptFile cannot both be set");
     }
     const args = ["--approve", "--mode", "rpc", "--no-extensions"];
+    if (options.sessionFile !== undefined) args.push("--session", options.sessionFile);
     if (options.systemPromptFile !== undefined) {
       args.push("--system-prompt", options.systemPromptFile);
     }

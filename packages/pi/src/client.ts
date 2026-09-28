@@ -10,6 +10,8 @@ import type {
   AgentStartConfig,
   AgentStatus,
   AgentTurn,
+  ManagedAgentSession,
+  ManagedSessionSummary,
   RuntimeActivityEvent,
   RuntimeActivityOptions,
   RuntimeActivityPhase,
@@ -19,7 +21,22 @@ import type {
   RuntimeSkillCapability,
 } from "@minu/runtime-core";
 import { PiRpcProcess } from "./pi-rpc.js";
-import { readRegistration, registryDirectory } from "./registry.js";
+import { listRegistrations, readRegistration, registryDirectory, type PiSessionRegistration } from "./registry.js";
+import {
+  createManagedSessionManifest,
+  listManagedSessionManifests,
+  managedSessionState,
+  managedWorkerProcessExists,
+  ManagedSessionBusyError,
+  ManagedSessionNotFoundError,
+  readManagedSessionManifest,
+  removeManagedSessionManifest,
+  validateManagedSessionIdentity,
+  validatePiSessionFile,
+  validateRuntimeOwnerId,
+  withManagedSessionLock,
+  writeManagedSessionManifest,
+} from "./managed-sessions.js";
 
 export class SessionOfflineError extends Error {}
 
@@ -169,6 +186,33 @@ export class PiAgentRuntime implements AgentRuntime {
   }
 
   async start(config: AgentStartConfig = {}): Promise<AgentSession> {
+    return this.startWorker(config);
+  }
+
+  async startManaged(config: AgentStartConfig, ownerId: string): Promise<ManagedAgentSession> {
+    validateRuntimeOwnerId(ownerId);
+    const managedSessionId = randomUUID();
+    return withManagedSessionLock(managedSessionId, ownerId, async () => {
+      const manifest = await createManagedSessionManifest(config, ownerId, managedSessionId);
+      try {
+        const session = await this.startWorker(manifest.launchConfig, {
+          managedSessionId,
+          ownerId,
+          sessionFile: manifest.sessionFile,
+        });
+        return { ...session, id: managedSessionId, ownerId, ownership: "owned" };
+      } catch (error) {
+        if (manifest.sessionFile) await rm(manifest.sessionFile, { force: true }).catch(() => {});
+        await removeManagedSessionManifest(managedSessionId, ownerId).catch(() => {});
+        throw error;
+      }
+    });
+  }
+
+  private async startWorker(
+    config: AgentStartConfig,
+    managed?: { managedSessionId: string; ownerId: string; sessionFile?: string },
+  ): Promise<AgentSession> {
     if (config.systemPrompt !== undefined && config.appendSystemPrompt !== undefined) {
       throw new Error("systemPrompt and appendSystemPrompt cannot both be set");
     }
@@ -210,6 +254,10 @@ export class PiAgentRuntime implements AgentRuntime {
       ? resolve(this.options.workerPath)
       : fileURLToPath(new URL("./owned-worker.js", import.meta.url));
     const workerArgs = [worker, "--cwd", cwd, "--ready-file", readyFile, "--log-file", logFile];
+    if (managed) {
+      workerArgs.push("--runtime-session-id", managed.managedSessionId, "--runtime-owner-id", managed.ownerId);
+      if (managed.sessionFile) workerArgs.push("--resume-session-file", managed.sessionFile);
+    }
     if (config.systemPrompt !== undefined) {
       await writeFile(promptFile, config.systemPrompt, { mode: 0o600 });
       workerArgs.push("--system-prompt-file", promptFile);
@@ -256,6 +304,7 @@ export class PiAgentRuntime implements AgentRuntime {
           try {
             const result = JSON.parse(await readFile(readyFile, "utf8")) as {
               sessionId?: string;
+              runtimeSessionId?: string;
               error?: string;
             };
             if (result.error) throw new Error(result.error);
@@ -281,6 +330,210 @@ export class PiAgentRuntime implements AgentRuntime {
       if (!started) await terminateChild(child);
       await Promise.all([rm(readyFile, { force: true }), rm(promptFile, { force: true })]);
     }
+  }
+
+  private async activeManagedRegistration(
+    manifest: NonNullable<Awaited<ReturnType<typeof readManagedSessionManifest>>>,
+    ownerId: string,
+  ): Promise<PiSessionRegistration | undefined> {
+    const readActive = async () => {
+      const registration = await readRegistration(manifest.managedSessionId);
+      if (registration && registration.ownerId !== ownerId) {
+        throw new ManagedSessionNotFoundError("Runtime-managed session is not available for this owner");
+      }
+      return registration;
+    };
+    let registration = await readActive();
+    if (registration || !manifest.workerPid || !managedWorkerProcessExists(manifest.workerPid)) return registration;
+    const deadline = Date.now() + (this.options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS);
+    while (Date.now() < deadline && managedWorkerProcessExists(manifest.workerPid)) {
+      registration = await readActive();
+      if (registration) return registration;
+      await delay(25);
+    }
+    registration = await readActive();
+    if (registration) return registration;
+    if (managedWorkerProcessExists(manifest.workerPid)) {
+      throw new ManagedSessionBusyError("Runtime-managed session worker is still starting");
+    }
+    return undefined;
+  }
+
+  async resume(managedSessionId: string, ownerId: string): Promise<ManagedAgentSession> {
+    validateManagedSessionIdentity(managedSessionId, ownerId);
+    return withManagedSessionLock(managedSessionId, ownerId, async () => {
+      const manifest = await readManagedSessionManifest(managedSessionId, ownerId);
+      if (!manifest || manifest.state === "destroying") {
+        throw new ManagedSessionNotFoundError("Runtime-managed session is not available for this owner");
+      }
+      const active = await this.activeManagedRegistration(manifest, ownerId);
+      if (active) {
+        return { id: managedSessionId, runtime: "pi", ownership: "owned", cwd: active.cwd, ownerId };
+      }
+      if (!manifest.sessionFile) {
+        throw new ManagedSessionNotFoundError("Runtime-managed session has no verified resume material");
+      }
+      await validatePiSessionFile(manifest.sessionFile, manifest.cwd, manifest.transcriptId);
+      manifest.state = "resuming";
+      manifest.updatedAt = new Date().toISOString();
+      await writeManagedSessionManifest(manifest);
+      try {
+        const session = await this.startWorker(manifest.launchConfig, {
+          managedSessionId,
+          ownerId,
+          sessionFile: manifest.sessionFile,
+        });
+        return { ...session, id: managedSessionId, ownerId, ownership: "owned" };
+      } catch (error) {
+        const latest = await readManagedSessionManifest(managedSessionId, ownerId).catch(() => undefined);
+        if (latest) {
+          latest.state = "suspended";
+          latest.updatedAt = new Date().toISOString();
+          await writeManagedSessionManifest(latest).catch(() => {});
+        }
+        throw error;
+      }
+    });
+  }
+
+  async suspend(managedSessionId: string, ownerId: string): Promise<void> {
+    validateManagedSessionIdentity(managedSessionId, ownerId);
+    return withManagedSessionLock(managedSessionId, ownerId, async () => {
+      const manifest = await readManagedSessionManifest(managedSessionId, ownerId);
+      if (!manifest || manifest.state === "destroying") {
+        throw new ManagedSessionNotFoundError("Runtime-managed session is not available for this owner");
+      }
+      const registration = await this.activeManagedRegistration(manifest, ownerId);
+      if (!registration) {
+        if (!manifest.sessionFile) throw new ManagedSessionNotFoundError("Runtime-managed session has no resume material");
+        await validatePiSessionFile(manifest.sessionFile, manifest.cwd, manifest.transcriptId);
+        manifest.state = "suspended";
+        manifest.updatedAt = new Date().toISOString();
+        await writeManagedSessionManifest(manifest);
+        return;
+      }
+      if (await this.status(managedSessionId) === "working") {
+        throw new ManagedSessionBusyError("A working Runtime-managed session cannot be suspended");
+      }
+      manifest.state = "suspending";
+      manifest.updatedAt = new Date().toISOString();
+      await writeManagedSessionManifest(manifest);
+      try {
+        await this.stopWorker(managedSessionId);
+      } catch (error) {
+        const stillActive = await readRegistration(managedSessionId).catch(() => undefined);
+        if (stillActive) {
+          manifest.state = "active";
+          manifest.updatedAt = new Date().toISOString();
+          await writeManagedSessionManifest(manifest).catch(() => {});
+          throw error;
+        }
+      }
+      const latest = await readManagedSessionManifest(managedSessionId, ownerId);
+      if (!latest) throw new ManagedSessionNotFoundError("Runtime-managed session metadata disappeared during suspend");
+      if (!latest.sessionFile) throw new ManagedSessionNotFoundError("Runtime-managed session has no resume material");
+      await validatePiSessionFile(latest.sessionFile, latest.cwd, latest.transcriptId);
+      latest.state = "suspended";
+      latest.updatedAt = new Date().toISOString();
+      await writeManagedSessionManifest(latest);
+    });
+  }
+
+  async destroy(managedSessionId: string, ownerId: string): Promise<void> {
+    validateManagedSessionIdentity(managedSessionId, ownerId);
+    return withManagedSessionLock(managedSessionId, ownerId, async () => {
+      let manifest;
+      let unreadableManifest = false;
+      try {
+        manifest = await readManagedSessionManifest(managedSessionId, ownerId);
+      } catch {
+        unreadableManifest = true;
+      }
+      if (!manifest) {
+        const orphaned = await readRegistration(managedSessionId);
+        if (orphaned && orphaned.ownerId !== ownerId) {
+          throw new ManagedSessionNotFoundError("Runtime-managed session is not available for this owner");
+        }
+        if (orphaned) {
+          if (await this.status(managedSessionId) === "working") {
+            throw new ManagedSessionBusyError("A working Runtime-managed session cannot be destroyed");
+          }
+          try {
+            await this.stopWorker(managedSessionId);
+          } catch (error) {
+            if (await readRegistration(managedSessionId)) throw error;
+          }
+        }
+        if (unreadableManifest) await removeManagedSessionManifest(managedSessionId, ownerId);
+        return;
+      }
+      const registration = await this.activeManagedRegistration(manifest, ownerId);
+      if (registration) {
+        if (await this.status(managedSessionId) === "working") {
+          throw new ManagedSessionBusyError("A working Runtime-managed session cannot be destroyed");
+        }
+      }
+      manifest.state = "destroying";
+      manifest.updatedAt = new Date().toISOString();
+      await writeManagedSessionManifest(manifest);
+      if (registration) {
+        try {
+          await this.stopWorker(managedSessionId);
+        } catch (error) {
+          const stillActive = await readRegistration(managedSessionId).catch(() => undefined);
+          if (stillActive) {
+            manifest.state = "active";
+            manifest.updatedAt = new Date().toISOString();
+            await writeManagedSessionManifest(manifest).catch(() => {});
+            throw error;
+          }
+        }
+      }
+      await removeManagedSessionManifest(managedSessionId, ownerId);
+    });
+  }
+
+  async listManagedSessions(ownerId: string): Promise<ManagedSessionSummary[]> {
+    validateRuntimeOwnerId(ownerId);
+    const manifests = await listManagedSessionManifests(ownerId);
+    const summaries = await Promise.all(manifests.map(async (entry) => {
+      const manifest = entry.manifest;
+      if (!manifest) {
+        return {
+          id: entry.managedSessionId,
+          ownerId,
+          state: "unavailable" as const,
+          createdAt: entry.createdAt,
+          updatedAt: entry.updatedAt,
+        };
+      }
+      const registration = await readRegistration(entry.managedSessionId).catch(() => undefined);
+      const registrationOwnerMatches = registration?.ownerId === ownerId;
+      const isActive = registrationOwnerMatches
+        || (!registration && manifest.state === "active" && manifest.workerPid !== undefined
+          && managedWorkerProcessExists(manifest.workerPid));
+      return {
+        id: entry.managedSessionId,
+        ownerId,
+        state: registration && !registrationOwnerMatches
+          ? "unavailable" as const
+          : await managedSessionState(manifest, isActive),
+        ...(entry.createdAt ? { createdAt: entry.createdAt } : {}),
+        ...(entry.updatedAt ? { updatedAt: entry.updatedAt } : {}),
+      };
+    }));
+    const knownIds = new Set(summaries.map(({ id }) => id));
+    for (const registration of await listRegistrations()) {
+      if (registration.ownerId !== ownerId || knownIds.has(registration.sessionId)) continue;
+      const updatedAt = Number.isFinite(Date.parse(registration.updatedAt)) ? registration.updatedAt : undefined;
+      summaries.push({
+        id: registration.sessionId,
+        ownerId,
+        state: "unavailable",
+        ...(updatedAt ? { updatedAt } : {}),
+      });
+    }
+    return summaries;
   }
 
   async send(sessionId: string, input: string): Promise<void> {
@@ -379,9 +632,19 @@ export class PiAgentRuntime implements AgentRuntime {
   }
 
   async stop(sessionId: string): Promise<void> {
+    const registration = await readRegistration(sessionId);
+    if (registration?.ownerId) {
+      await this.suspend(sessionId, registration.ownerId);
+      return;
+    }
+    await this.stopWorker(sessionId);
+  }
+
+  private async stopWorker(sessionId: string): Promise<void> {
     await checkedFetch(sessionId, "/stop", { method: "POST" }, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
     for (let attempt = 0; attempt < 50; attempt++) {
-      if ((await this.status(sessionId)) === "offline") return;
+      // The bridge reports offline as soon as shutdown starts; wait for the worker to deregister too.
+      if (!(await readRegistration(sessionId))) return;
       await delay(100);
     }
     throw new Error(`Timed out stopping Pi session: ${sessionId}`);
@@ -391,6 +654,7 @@ export class PiAgentRuntime implements AgentRuntime {
     const controller = new AbortController();
     const streamSignal = signal ? AbortSignal.any([controller.signal, signal]) : controller.signal;
     try {
+      const registration = await registrationFor(sessionId);
       const response = await checkedFetch(sessionId, "/events", { signal: streamSignal });
       if (!response.body) throw new Error("Runtime event stream has no body");
       const decoder = new TextDecoder();
@@ -403,7 +667,11 @@ export class PiAgentRuntime implements AgentRuntime {
           const frame = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
           for (const line of frame.split("\n")) {
-            if (line.startsWith("data: ")) yield JSON.parse(line.slice(6)) as AgentEvent;
+            if (!line.startsWith("data: ")) continue;
+            const event = JSON.parse(line.slice(6)) as AgentEvent;
+            yield registration.ownerId
+              ? { ...event, sessionId }
+              : event;
           }
         }
       }
