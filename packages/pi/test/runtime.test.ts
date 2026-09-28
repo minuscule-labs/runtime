@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { appendFile, chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +10,7 @@ import test from "node:test";
 import type { AgentEvent, AgentStatus, RuntimeMessage } from "@minu/runtime-core";
 import { PiAgentRuntime } from "../src/client.js";
 import { BoundedDiagnosticLog } from "../src/diagnostic.js";
-import { listRegistrations, writeRegistration } from "../src/registry.js";
+import { listRegistrations, readRegistration, writeRegistration } from "../src/registry.js";
 import { createPiBridgeServer } from "../src/server.js";
 
 async function fixture(
@@ -89,6 +91,80 @@ async function fixture(
     },
   };
 }
+
+test("managed stop atomically rejects work admitted while the request body is pending", async () => {
+  const sessionId = `managed-stop-${Date.now()}`;
+  const token = "managed-stop-token";
+  let stopCalls = 0;
+  const received: string[] = [];
+  const bridge = await createPiBridgeServer({
+    sessionId,
+    token,
+    getStatus: () => "idle",
+    async send(input) { received.push(input); },
+    stopRequiresIdle: true,
+    stop() { stopCalls += 1; },
+  });
+  try {
+    const startPendingRequest = (path: string, prefix: string, suffix: string) => {
+      let complete!: () => void;
+      const response = new Promise<{ statusCode: number; body: string }>((resolve, reject) => {
+        const request = httpRequest(`${bridge.endpoint}${path}`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        }, (incoming) => {
+          let body = "";
+          incoming.setEncoding("utf8");
+          incoming.on("data", (chunk: string) => { body += chunk; });
+          incoming.on("end", () => resolve({ statusCode: incoming.statusCode ?? 0, body }));
+        });
+        request.on("error", reject);
+        request.write(prefix);
+        complete = () => request.end(suffix);
+      });
+      return { complete: () => complete(), response };
+    };
+    const sendRace = startPendingRequest("/send", '{"input":', '"late request"}');
+    const turnRace = startPendingRequest("/turns", '{"turnId":"late-turn","input":', '"late turn"}');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const stopResponse = await fetch(`${bridge.endpoint}/stop`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(stopResponse.status, 202);
+    sendRace.complete();
+    turnRace.complete();
+    assert.equal((await sendRace.response).statusCode, 409);
+    assert.equal((await turnRace.response).statusCode, 409);
+    assert.equal(stopCalls, 1);
+    assert.deepEqual(received, []);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test("managed stop refuses a session that is already working", async () => {
+  let stopCalls = 0;
+  const bridge = await createPiBridgeServer({
+    sessionId: "managed-busy-stop",
+    token: "managed-busy-stop-token",
+    getStatus: () => "working",
+    async send() {},
+    stopRequiresIdle: true,
+    stop() { stopCalls += 1; },
+  });
+  try {
+    const response = await fetch(`${bridge.endpoint}/stop`, {
+      method: "POST",
+      headers: { authorization: "Bearer managed-busy-stop-token" },
+    });
+    assert.equal(response.status, 409);
+    assert.equal(stopCalls, 0);
+  } finally {
+    await bridge.close();
+  }
+});
 
 test("send wakes an idle bridge and resolves after it returns idle", async () => {
   const server = await fixture();
@@ -488,6 +564,302 @@ test("Runtime startup reports a worker that exits before readiness", async () =>
     );
     assert.ok(Date.now() - started < 1_000);
   } finally {
+    await rm(directory, { recursive: true, force: true });
+    delete process.env.MINU_RUNTIME_DIR;
+  }
+});
+
+test("managed Pi sessions preserve owner-scoped identity and transcript across suspend, resume, and worker restart", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "minu-runtime-managed-test-"));
+  const fakePi = join(directory, "fake-pi.mjs");
+  const runtimeDirectory = join(directory, "runtime");
+  const runCountFile = join(directory, "pi-runs");
+  await writeFile(fakePi, `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const sessionArg = args.indexOf("--session");
+const sessionFile = sessionArg >= 0 ? args[sessionArg + 1] : process.env.PI_SESSION_FILE;
+const runFile = process.env.PI_RUN_COUNT_FILE;
+let previousRuns = 0;
+try { previousRuns = Number(readFileSync(runFile, "utf8") || "0"); } catch {}
+const runCount = previousRuns + 1;
+writeFileSync(runFile, String(runCount));
+let header;
+let messages = [];
+if (sessionArg >= 0) {
+  const lines = readFileSync(sessionFile, "utf8").trim().split("\\n");
+  header = JSON.parse(lines[0]);
+  messages = lines.slice(1).map((line) => JSON.parse(line)).filter((entry) => entry.type === "message").map((entry) => entry.message);
+} else {
+  header = { type: "session", version: 3, id: "transcript-stable-id", timestamp: new Date().toISOString(), cwd: process.cwd() };
+}
+function saveTranscript() {
+  const entries = messages.map((message, index) => ({
+    type: "message",
+    id: String(index + 1).padStart(8, "0"),
+    parentId: index === 0 ? null : String(index).padStart(8, "0"),
+    timestamp: new Date(message.timestamp).toISOString(),
+    message,
+  }));
+  writeFileSync(sessionFile, [JSON.stringify(header), ...entries.map((entry) => JSON.stringify(entry))].join("\\n") + "\\n");
+}
+if (sessionArg < 0) saveTranscript();
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk.toString();
+  while (buffer.includes("\\n")) {
+    const index = buffer.indexOf("\\n");
+    const line = buffer.slice(0, index);
+    buffer = buffer.slice(index + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    const respond = (data) => console.log(JSON.stringify({ id: request.id, type: "response", command: request.type, success: true, data }));
+    if (request.type === "get_state") respond({ model: { provider: "openai", id: "gpt-test" }, thinkingLevel: "medium", sessionId: "native-pi-" + runCount, sessionFile, isStreaming: false });
+    else if (request.type === "get_messages") respond({ messages });
+    else if (request.type === "prompt") {
+      const finishPrompt = () => {
+        messages.push({ role: "user", content: request.message, timestamp: Date.now() });
+        messages.push({ role: "assistant", content: [{ type: "text", text: "RESUMED_OK" }], timestamp: Date.now() });
+        saveTranscript();
+        respond(undefined);
+        console.log(JSON.stringify({ type: "agent_start" }));
+        console.log(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "RESUMED_OK" } }));
+        console.log(JSON.stringify({ type: "agent_settled" }));
+      };
+      if (request.message === "RACE_DELAY") setTimeout(finishPrompt, 150);
+      else finishPrompt();
+    }
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+process.on("SIGTERM", () => process.exit(0));
+`);
+  await chmod(fakePi, 0o755);
+  process.env.MINU_RUNTIME_DIR = runtimeDirectory;
+  process.env.PI_COMMAND = fakePi;
+  process.env.PI_RUN_COUNT_FILE = runCountFile;
+  const ownerId = "workspace-owner-1";
+  const runtime = new PiAgentRuntime();
+  try {
+    const started = await runtime.startManaged({ cwd: directory, appendSystemPrompt: "Private managed persona" }, ownerId);
+    assert.equal(started.ownership, "owned");
+    assert.equal(started.ownerId, ownerId);
+    assert.notEqual(started.id, "native-pi-1");
+    const managedSessionId = started.id;
+    const ownerKey = createHash("sha256").update(ownerId).digest("hex");
+    const ownerDirectory = join(runtimeDirectory, "managed", ownerKey);
+    const manifestPath = join(ownerDirectory, `${managedSessionId}.json`);
+    const lockDatabasePath = join(ownerDirectory, `.lifecycle-${managedSessionId}.sqlite`);
+    const initialManifest = JSON.parse(await readFile(manifestPath, "utf8")) as { sessionFile: string; transcriptId: string };
+    const transcriptFile = initialManifest.sessionFile;
+    const transcriptHeader = JSON.parse((await readFile(transcriptFile, "utf8")).split("\n")[0]!) as { id: string };
+    assert.equal(transcriptHeader.id, initialManifest.transcriptId);
+    assert.equal((await stat(manifestPath)).mode & 0o777, 0o600);
+    assert.equal((await stat(lockDatabasePath)).mode & 0o777, 0o600);
+    assert.equal((await stat(transcriptFile)).mode & 0o777, 0o600);
+    await runtime.send(managedSessionId, "Before suspend");
+    assert.deepEqual((await runtime.messages(managedSessionId)).map(({ role, content }) => [role, content]), [
+      ["user", "Before suspend"],
+      ["assistant", "RESUMED_OK"],
+    ]);
+
+    assert.deepEqual(await runtime.listManagedSessions(ownerId).then((items) => items.map(({ id, state }) => [id, state])), [
+      [managedSessionId, "active"],
+    ]);
+    assert.deepEqual(await runtime.listManagedSessions("other-owner"), []);
+    await assert.rejects(runtime.resume(managedSessionId, "other-owner"), /not available for this owner/);
+    await runtime.suspend(managedSessionId, ownerId);
+    await runtime.suspend(managedSessionId, ownerId);
+    assert.equal(await runtime.status(managedSessionId), "offline");
+    assert.equal((await runtime.listManagedSessions(ownerId))[0]?.state, "suspended");
+    const validManifest = await readFile(manifestPath, "utf8");
+    const validTranscript = await readFile(transcriptFile, "utf8");
+    const transcriptLines = validTranscript.split("\n");
+    const redirectedTranscriptHeader = JSON.parse(transcriptLines[0]!) as { id: string };
+    redirectedTranscriptHeader.id = "another-pi-session";
+    transcriptLines[0] = JSON.stringify(redirectedTranscriptHeader);
+    await writeFile(transcriptFile, transcriptLines.join("\n"));
+    await assert.rejects(runtime.resume(managedSessionId, ownerId), /Managed Pi transcript/);
+    assert.equal((await runtime.listManagedSessions(ownerId))[0]?.state, "unavailable");
+    assert.equal(Number(await readFile(runCountFile, "utf8")), 1);
+    await writeFile(transcriptFile, validTranscript);
+
+    await writeFile(transcriptFile, `${validTranscript}{"type":"message",`);
+    await assert.rejects(runtime.resume(managedSessionId, ownerId), /Managed Pi transcript/);
+    assert.equal((await runtime.listManagedSessions(ownerId))[0]?.state, "unavailable");
+    assert.equal(Number(await readFile(runCountFile, "utf8")), 1);
+    await writeFile(transcriptFile, validTranscript);
+
+    const redirectedManifest = JSON.parse(validManifest) as { sessionFile: string };
+    redirectedManifest.sessionFile = join(directory, "redirected-session.jsonl");
+    await writeFile(manifestPath, JSON.stringify(redirectedManifest), { mode: 0o600 });
+    await assert.rejects(runtime.resume(managedSessionId, ownerId), /Invalid Runtime managed-session transcript path/);
+    assert.equal((await runtime.listManagedSessions(ownerId))[0]?.state, "unavailable");
+    assert.equal(Number(await readFile(runCountFile, "utf8")), 1);
+    await writeFile(manifestPath, validManifest, { mode: 0o600 });
+
+    const resumed = await runtime.resume(managedSessionId, ownerId);
+    assert.equal(resumed.id, managedSessionId);
+    const manifestAfterResume = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      nativeSessionId: string;
+      sessionFile: string;
+      transcriptId: string;
+    };
+    assert.equal(manifestAfterResume.nativeSessionId, "native-pi-2");
+    assert.notEqual(manifestAfterResume.nativeSessionId, initialManifest.transcriptId);
+    assert.equal(manifestAfterResume.transcriptId, initialManifest.transcriptId);
+    assert.equal(manifestAfterResume.sessionFile, transcriptFile);
+    assert.deepEqual((await runtime.messages(managedSessionId)).map(({ role, content }) => [role, content]), [
+      ["user", "Before suspend"],
+      ["assistant", "RESUMED_OK"],
+    ]);
+    const eventIterator = runtime.events(managedSessionId)[Symbol.asyncIterator]();
+    assert.equal((await eventIterator.next()).value?.sessionId, managedSessionId);
+    await eventIterator.return?.();
+    const summaryJson = JSON.stringify(await runtime.listManagedSessions(ownerId));
+    assert.doesNotMatch(summaryJson, /native-pi-2|\.jsonl/);
+
+    await Promise.all([
+      runtime.resume(managedSessionId, ownerId),
+      runtime.resume(managedSessionId, ownerId),
+    ]);
+    assert.equal(Number(await readFile(runCountFile, "utf8")), 2);
+
+    const originalStatus = runtime.status.bind(runtime);
+    let injectAfterIdleCheck = false;
+    let racedSend: Promise<void> | undefined;
+    runtime.status = async (sessionId) => {
+      const observed = await originalStatus(sessionId);
+      if (injectAfterIdleCheck && observed === "idle") {
+        injectAfterIdleCheck = false;
+        racedSend = runtime.send(sessionId, "RACE_DELAY");
+        const deadline = Date.now() + 2_000;
+        while (await originalStatus(sessionId) !== "working" && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.equal(await originalStatus(sessionId), "working");
+      }
+      return observed;
+    };
+    injectAfterIdleCheck = true;
+    await assert.rejects(runtime.suspend(managedSessionId, ownerId), /cannot be stopped for suspend or destroy/);
+    assert.equal(await originalStatus(managedSessionId), "working");
+    await racedSend;
+    assert.equal((await runtime.listManagedSessions(ownerId))[0]?.state, "active");
+
+    injectAfterIdleCheck = true;
+    await assert.rejects(runtime.destroy(managedSessionId, ownerId), /cannot be stopped for suspend or destroy/);
+    assert.equal(await originalStatus(managedSessionId), "working");
+    await racedSend;
+    assert.equal((await runtime.listManagedSessions(ownerId))[0]?.state, "active");
+
+    // A Runtime controller restart can recover an active manifest whose worker crashed.
+    const activeRegistration = await readRegistration(managedSessionId);
+    assert.ok(activeRegistration);
+    process.kill(activeRegistration.pid, "SIGKILL");
+    const crashDeadline = Date.now() + 2_000;
+    while (await runtime.status(managedSessionId) !== "offline" && Date.now() < crashDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(await runtime.status(managedSessionId), "offline");
+    const restartedRuntime = new PiAgentRuntime();
+    assert.equal((await restartedRuntime.listManagedSessions(ownerId))[0]?.state, "suspended");
+    await restartedRuntime.resume(managedSessionId, ownerId);
+    assert.equal(Number(await readFile(runCountFile, "utf8")), 3);
+    await restartedRuntime.destroy(managedSessionId, ownerId);
+    assert.deepEqual(await restartedRuntime.listManagedSessions(ownerId), []);
+    await writeFile(manifestPath, "{ malformed manifest\n", { mode: 0o600 });
+    assert.equal((await restartedRuntime.listManagedSessions(ownerId))[0]?.state, "unavailable");
+    await restartedRuntime.destroy(managedSessionId, ownerId);
+    assert.deepEqual(await restartedRuntime.listManagedSessions(ownerId), []);
+    assert.match(await readFile(transcriptFile, "utf8"), /Before suspend/);
+    await assert.rejects(restartedRuntime.resume(managedSessionId, ownerId), /not available for this owner/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+    delete process.env.MINU_RUNTIME_DIR;
+    delete process.env.PI_COMMAND;
+    delete process.env.PI_RUN_COUNT_FILE;
+  }
+});
+
+test("managed lifecycle lock recovers a crashed controller without overlapping contenders", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "minu-runtime-lock-test-"));
+  const runtimeDirectory = join(directory, "runtime");
+  const logFile = join(directory, "lock-events");
+  const readyFile = join(directory, "first-controller-ready");
+  process.env.MINU_RUNTIME_DIR = runtimeDirectory;
+  const moduleUrl = new URL("../src/managed-sessions.js", import.meta.url).href;
+  const script = `
+import { appendFile, writeFile } from "node:fs/promises";
+const { withManagedSessionLock } = await import(process.env.LOCK_MODULE);
+await withManagedSessionLock("cross-process-lock-test", "owner-one", async () => {
+  await appendFile(process.env.LOCK_LOG, "enter " + process.pid + "\\n");
+  if (process.env.LOCK_READY) await writeFile(process.env.LOCK_READY, "ready");
+  await new Promise((resolve) => setTimeout(resolve, Number(process.env.LOCK_HOLD_MS)));
+  await appendFile(process.env.LOCK_LOG, "exit " + process.pid + "\\n");
+});
+`;
+  const children: ReturnType<typeof spawn>[] = [];
+  const startChild = (holdMs: number, ready?: string) => {
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+      env: {
+        ...process.env,
+        LOCK_MODULE: moduleUrl,
+        LOCK_LOG: logFile,
+        LOCK_HOLD_MS: String(holdMs),
+        LOCK_READY: ready ?? "",
+      },
+      stdio: "ignore",
+    });
+    children.push(child);
+    return child;
+  };
+  const waitForExit = (child: ReturnType<typeof spawn>, timeoutMs: number) => new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("Managed lifecycle lock child timed out"));
+    }, timeoutMs);
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timeout);
+      if (code === 0) resolve();
+      else reject(new Error(`Managed lifecycle lock child exited (${signal ?? code})`));
+    });
+  });
+  try {
+    const crashedController = startChild(30_000, readyFile);
+    const readyDeadline = Date.now() + 5_000;
+    while (Date.now() < readyDeadline) {
+      try {
+        await readFile(readyFile, "utf8");
+        break;
+      } catch {
+        if (crashedController.exitCode !== null) throw new Error("First lifecycle lock child exited before acquiring the lock");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    assert.equal(crashedController.exitCode, null);
+    const crashedExit = new Promise<void>((resolve) => crashedController.once("exit", () => resolve()));
+    crashedController.kill("SIGKILL");
+    await crashedExit;
+
+    const contenderA = startChild(100);
+    const contenderB = startChild(100);
+    await Promise.all([waitForExit(contenderA, 10_000), waitForExit(contenderB, 10_000)]);
+    const events = (await readFile(logFile, "utf8")).trim().split("\n");
+    assert.equal(events.length, 5);
+    assert.match(events[0]!, /^enter \d+$/);
+    for (let index = 1; index < events.length; index += 2) {
+      const enteredPid = events[index]!.match(/^enter (\d+)$/)?.[1];
+      const exitedPid = events[index + 1]!.match(/^exit (\d+)$/)?.[1];
+      assert.ok(enteredPid);
+      assert.equal(exitedPid, enteredPid);
+    }
+  } finally {
+    for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await rm(directory, { recursive: true, force: true });
     delete process.env.MINU_RUNTIME_DIR;
   }

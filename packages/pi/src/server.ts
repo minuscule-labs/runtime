@@ -24,6 +24,8 @@ export interface PiBridgeServerOptions {
   openDiagnostic?(): Promise<void>;
   getMessages?(): Promise<RuntimeMessage[]>;
   stop?(): Promise<void> | void;
+  /** Managed sessions reject stop unless idle, closing the send/stop race at admission. */
+  stopRequiresIdle?: boolean;
   /** Completed turn ids remain idempotent within this bounded, insertion-ordered window. */
   turnRetentionLimit?: number;
 }
@@ -59,6 +61,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
     throw new Error("turnRetentionLimit must be a positive integer");
   }
   let activeTurnId: string | undefined;
+  let stopRequested = false;
 
   const copyTurn = (turn: AgentTurn): AgentTurn => ({
     ...turn,
@@ -163,6 +166,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       }
 
       if (request.method === "POST" && url.pathname === "/steer") {
+        if (stopRequested) throw new SessionBusyError("Pi session is stopping");
         if (!options.steer) {
           json(response, 405, { error: "This Runtime adapter does not support steering" });
           return;
@@ -175,6 +179,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           json(response, 400, { error: "input must be a non-empty string" });
           return;
         }
+        if (stopRequested) throw new SessionBusyError("Pi session is stopping");
         await options.steer(body.input);
         json(response, 202, { status: "steering" });
         return;
@@ -207,6 +212,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           json(response, 200, { turn: copyTurn(existing) });
           return;
         }
+        if (stopRequested) throw new SessionBusyError("Pi session is stopping");
         if (options.getStatus() !== "idle" || activeTurnId) {
           throw new SessionBusyError("Pi session is working");
         }
@@ -226,6 +232,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       }
 
       if (request.method === "POST" && url.pathname === "/interrupt") {
+        if (stopRequested) throw new SessionBusyError("Pi session is stopping");
         if (!options.interrupt) {
           json(response, 405, { error: "This Runtime adapter does not support interruption" });
           return;
@@ -256,6 +263,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       }
 
       if (request.method === "POST" && url.pathname === "/send") {
+        if (stopRequested) throw new SessionBusyError("Pi session is stopping");
         if (options.getStatus() !== "idle" || activeTurnId) {
           throw new SessionBusyError("Pi session is working");
         }
@@ -264,6 +272,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           json(response, 400, { error: "input must be a non-empty string" });
           return;
         }
+        if (stopRequested) throw new SessionBusyError("Pi session is stopping");
         const operationId = randomUUID();
         await options.send(body.input, operationId);
         json(response, 200, { operationId, status: "completed" });
@@ -275,6 +284,14 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           json(response, 405, { error: "Attached Pi sessions cannot be stopped by Runtime" });
           return;
         }
+        if (stopRequested) {
+          json(response, 202, { status: "stopping" });
+          return;
+        }
+        if (options.stopRequiresIdle && (options.getStatus() !== "idle" || activeTurnId)) {
+          throw new SessionBusyError("A working Pi session cannot be stopped for suspend or destroy");
+        }
+        stopRequested = true;
         json(response, 202, { status: "stopping" });
         setImmediate(() => void options.stop?.());
         return;

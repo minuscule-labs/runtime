@@ -3,7 +3,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export interface PiSessionRegistration {
+  /** Public Runtime address; managed sessions use their stable managed id. */
   sessionId: string;
+  /** Present only for owner-scoped managed sessions. */
+  ownerId?: string;
   endpoint: string;
   token: string;
   pid: number;

@@ -8,6 +8,23 @@ export interface AgentSession {
   cwd: string;
 }
 
+/** An owned session addressed by a Runtime-managed ID that survives worker restarts. */
+export interface ManagedAgentSession extends AgentSession {
+  ownership: "owned";
+  ownerId: string;
+}
+
+export type ManagedSessionState = "active" | "suspended" | "unavailable";
+
+/** Owner-scoped, presentation-safe summary; native harness identifiers remain private. */
+export interface ManagedSessionSummary {
+  id: string;
+  ownerId: string;
+  state: ManagedSessionState;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export type AgentReasoningLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface AgentModelSelection {
@@ -117,6 +134,16 @@ export interface RuntimeSessionCapabilities {
 export interface AgentRuntime {
   /** Launch and own a new agent process. */
   start(config?: AgentStartConfig): Promise<AgentSession>;
+  /** Start an owned, persistent session with a stable Runtime ID scoped to ownerId. */
+  startManaged?(config: AgentStartConfig, ownerId: string): Promise<ManagedAgentSession>;
+  /** Stop its worker while preserving owner-scoped resume material. */
+  suspend?(managedSessionId: string, ownerId: string): Promise<void>;
+  /** Reopen the same persisted transcript; repeated calls return the active session. */
+  resume?(managedSessionId: string, ownerId: string): Promise<ManagedAgentSession>;
+  /** Stop the worker and discard Runtime resume metadata without deleting the transcript. */
+  destroy?(managedSessionId: string, ownerId: string): Promise<void>;
+  /** Enumerate only sessions belonging to the exact owner scope. */
+  listManagedSessions?(ownerId: string): Promise<ManagedSessionSummary[]>;
   /** Discover adapter launch options without exposing provider credentials. */
   capabilities?(config?: Pick<AgentStartConfig, "cwd">): Promise<RuntimeLaunchCapabilities>;
   /** Send input to an idle session and resolve after the resulting run settles. */
@@ -138,6 +165,6 @@ export interface AgentRuntime {
   /** Optional sanitized activity stream for presentation layers. */
   activityEvents?(sessionId: string, options: RuntimeActivityOptions): AsyncIterable<RuntimeActivityEvent>;
   messages(sessionId: string): Promise<RuntimeMessage[]>;
-  /** Stop a runtime-owned session. Attached sessions cannot be stopped by Runtime. */
+  /** Stop a Runtime-owned worker; managed sessions preserve resume metadata. Attached sessions cannot be stopped by Runtime. */
   stop(sessionId: string): Promise<void>;
 }
