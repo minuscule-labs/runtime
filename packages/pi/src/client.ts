@@ -643,7 +643,8 @@ export class PiAgentRuntime implements AgentRuntime {
   private async stopWorker(sessionId: string): Promise<void> {
     await checkedFetch(sessionId, "/stop", { method: "POST" }, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
     for (let attempt = 0; attempt < 50; attempt++) {
-      if ((await this.status(sessionId)) === "offline") return;
+      // The bridge reports offline as soon as shutdown starts; wait for the worker to deregister too.
+      if (!(await readRegistration(sessionId))) return;
       await delay(100);
     }
     throw new Error(`Timed out stopping Pi session: ${sessionId}`);
