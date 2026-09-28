@@ -767,7 +767,22 @@ process.on("SIGTERM", () => process.exit(0));
     await restartedRuntime.resume(managedSessionId, ownerId);
     assert.equal(Number(await readFile(runCountFile, "utf8")), 3);
     await restartedRuntime.destroy(managedSessionId, ownerId);
-    assert.deepEqual(await restartedRuntime.listManagedSessions(ownerId), []);
+    const destroyedSummaries = await restartedRuntime.listManagedSessions(ownerId);
+    if (destroyedSummaries.length > 0) {
+      const manifestText = await readFile(manifestPath, "utf8").catch(() => undefined);
+      let manifestState: unknown;
+      try {
+        manifestState = manifestText === undefined ? "missing" : (JSON.parse(manifestText) as { state?: unknown }).state;
+      } catch {
+        manifestState = "unparseable";
+      }
+      console.error("Unexpected managed session after destroy", {
+        summaries: destroyedSummaries,
+        manifestState,
+        registrationPresent: Boolean(await readRegistration(managedSessionId)),
+      });
+    }
+    assert.deepEqual(destroyedSummaries, []);
     await writeFile(manifestPath, "{ malformed manifest\n", { mode: 0o600 });
     assert.equal((await restartedRuntime.listManagedSessions(ownerId))[0]?.state, "unavailable");
     await restartedRuntime.destroy(managedSessionId, ownerId);
