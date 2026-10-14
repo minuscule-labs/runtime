@@ -17,7 +17,8 @@ const SESSION_ENTRY_TYPES = new Set([
   "custom", "custom_message", "label", "session_info",
 ]);
 const SESSION_MESSAGE_ROLES = new Set([
-  "user", "assistant", "toolResult", "bashExecution", "custom", "branchSummary", "compactionSummary",
+  // Pi persists startup prompt/tool snapshots and later prompt updates as system messages.
+  "system", "user", "assistant", "toolResult", "bashExecution", "custom", "branchSummary", "compactionSummary",
 ]);
 const MAX_SESSION_ENTRY_LENGTH = 64 * 1024 * 1024;
 
