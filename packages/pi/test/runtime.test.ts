@@ -603,7 +603,11 @@ function saveTranscript() {
   }));
   writeFileSync(sessionFile, [JSON.stringify(header), ...entries.map((entry) => JSON.stringify(entry))].join("\\n") + "\\n");
 }
-if (sessionArg < 0) saveTranscript();
+// Current Pi persists its private prompt/tool snapshot before the first turn.
+if (messages.length === 0) {
+  messages.push({ role: "system", content: "", sections: { preamble: "Private startup instructions" }, toolsAdded: [], timestamp: Date.now() });
+  saveTranscript();
+}
 let buffer = "";
 process.stdin.on("data", (chunk) => {
   buffer += chunk.toString();
@@ -672,8 +676,18 @@ process.on("SIGTERM", () => process.exit(0));
     await runtime.suspend(managedSessionId, ownerId);
     assert.equal(await runtime.status(managedSessionId), "offline");
     assert.equal((await runtime.listManagedSessions(ownerId))[0]?.state, "suspended");
+    // Recover the exact on-disk state left by a stopped worker whose suspend
+    // failed during transcript validation. Inventory must not rewrite it.
+    const interruptedManifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    interruptedManifest.state = "suspending";
+    await writeFile(manifestPath, JSON.stringify(interruptedManifest), { mode: 0o600 });
     const validManifest = await readFile(manifestPath, "utf8");
     const validTranscript = await readFile(transcriptFile, "utf8");
+    const startupMessage = JSON.parse(validTranscript.trim().split("\n")[1]!).message;
+    assert.equal(startupMessage.role, "system");
+    assert.equal((await runtime.listManagedSessions(ownerId))[0]?.state, "suspended");
+    assert.equal(await readFile(manifestPath, "utf8"), validManifest);
+    assert.equal(await readFile(transcriptFile, "utf8"), validTranscript);
     const transcriptLines = validTranscript.split("\n");
     const redirectedTranscriptHeader = JSON.parse(transcriptLines[0]!) as { id: string };
     redirectedTranscriptHeader.id = "another-pi-session";
@@ -709,6 +723,7 @@ process.on("SIGTERM", () => process.exit(0));
     assert.notEqual(manifestAfterResume.nativeSessionId, initialManifest.transcriptId);
     assert.equal(manifestAfterResume.transcriptId, initialManifest.transcriptId);
     assert.equal(manifestAfterResume.sessionFile, transcriptFile);
+    assert.deepEqual(JSON.parse((await readFile(transcriptFile, "utf8")).trim().split("\n")[1]!).message, startupMessage);
     assert.deepEqual((await runtime.messages(managedSessionId)).map(({ role, content }) => [role, content]), [
       ["user", "Before suspend"],
       ["assistant", "RESUMED_OK"],
