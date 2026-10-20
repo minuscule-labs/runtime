@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import type { AgentReasoningLevel, AgentStatus } from "@minu/runtime-core";
 import { normalizePiMessages } from "./messages.js";
 import { PiRpcProcess, type RpcEvent } from "./pi-rpc.js";
+import { createSessionProfileReader } from "./session-profile.js";
 import { removeRegistration, writeRegistration } from "./registry.js";
 import {
   readManagedSessionManifest,
@@ -227,6 +228,10 @@ async function main(): Promise<void> {
     sessionId,
     token,
     getStatus: () => status,
+    ...(runtimeSessionId && runtimeOwnerId ? {
+      managedSession: { id: runtimeSessionId, ownerId: runtimeOwnerId },
+      getSessionProfile: createSessionProfileReader(rpc, sessionId),
+    } : {}),
     send: inject,
     steer,
     interrupt,

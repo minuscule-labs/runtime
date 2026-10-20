@@ -620,6 +620,7 @@ process.stdin.on("data", (chunk) => {
     const respond = (data) => console.log(JSON.stringify({ id: request.id, type: "response", command: request.type, success: true, data }));
     if (request.type === "get_state") respond({ model: { provider: "openai", id: "gpt-test" }, thinkingLevel: "medium", sessionId: "native-pi-" + runCount, sessionFile, isStreaming: false });
     else if (request.type === "get_messages") respond({ messages });
+    else if (request.type === "get_commands") respond({ commands: [{ source: "skill", name: "skill:existing" }] });
     else if (request.type === "prompt") {
       const finishPrompt = () => {
         messages.push({ role: "user", content: request.message, timestamp: Date.now() });
@@ -661,6 +662,16 @@ process.on("SIGTERM", () => process.exit(0));
     assert.equal((await stat(manifestPath)).mode & 0o777, 0o600);
     assert.equal((await stat(lockDatabasePath)).mode & 0o777, 0o600);
     assert.equal((await stat(transcriptFile)).mode & 0o777, 0o600);
+    const manifestBeforeInspection = await readFile(manifestPath, "utf8");
+    const transcriptBeforeInspection = await readFile(transcriptFile, "utf8");
+    const observed = await runtime.inspectSessionProfile(managedSessionId, ownerId);
+    assert.deepEqual(observed?.model, { status: "verified", provider: "openai", id: "gpt-test" });
+    assert.deepEqual(observed?.reasoning, { status: "verified", level: "medium" });
+    assert.deepEqual(observed?.skills, { status: "verified", commandIds: ["skill:existing"], complete: true });
+    assert.equal(await runtime.inspectSessionProfile(managedSessionId, "other-owner"), undefined);
+    assert.equal(await readFile(manifestPath, "utf8"), manifestBeforeInspection);
+    assert.equal(await readFile(transcriptFile, "utf8"), transcriptBeforeInspection);
+    assert.equal(Number(await readFile(runCountFile, "utf8")), 1, "inspection cannot start a worker");
     await runtime.send(managedSessionId, "Before suspend");
     assert.deepEqual((await runtime.messages(managedSessionId)).map(({ role, content }) => [role, content]), [
       ["user", "Before suspend"],
@@ -675,6 +686,8 @@ process.on("SIGTERM", () => process.exit(0));
     await runtime.suspend(managedSessionId, ownerId);
     await runtime.suspend(managedSessionId, ownerId);
     assert.equal(await runtime.status(managedSessionId), "offline");
+    assert.equal(await runtime.inspectSessionProfile(managedSessionId, ownerId), undefined);
+    assert.equal(Number(await readFile(runCountFile, "utf8")), 1, "inspection cannot resume a suspended worker");
     assert.equal((await runtime.listManagedSessions(ownerId))[0]?.state, "suspended");
     // Recover the exact on-disk state left by a stopped worker whose suspend
     // failed during transcript validation. Inventory must not rewrite it.
@@ -720,6 +733,7 @@ process.on("SIGTERM", () => process.exit(0));
       transcriptId: string;
     };
     assert.equal(manifestAfterResume.nativeSessionId, "native-pi-2");
+    assert.equal((await runtime.inspectSessionProfile(managedSessionId, ownerId))?.model.status, "verified");
     assert.notEqual(manifestAfterResume.nativeSessionId, initialManifest.transcriptId);
     assert.equal(manifestAfterResume.transcriptId, initialManifest.transcriptId);
     assert.equal(manifestAfterResume.sessionFile, transcriptFile);

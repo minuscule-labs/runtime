@@ -1,3 +1,6 @@
+import type { RuntimeSessionProfile } from "./session-profile.js";
+export { sessionProfile, SESSION_PROFILE_LIMITS, type RuntimeSessionProfile } from "./session-profile.js";
+
 export type AgentStatus = "idle" | "working" | "offline";
 export type AgentOwnership = "owned" | "attached";
 
@@ -159,6 +162,8 @@ export interface AgentRuntime {
   status(sessionId: string): Promise<AgentStatus>;
   /** Query allowlisted live-session capabilities without exposing adapter internals. */
   sessionCapabilities?(sessionId: string): Promise<RuntimeSessionCapabilities>;
+  /** Inspect an existing exact-owner managed worker. No start/resume/discovery or stored-data mutation. */
+  inspectSessionProfile?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeSessionProfile | undefined>;
   /** Open an adapter-owned local diagnostic without returning its path or contents. */
   openDiagnostic?(sessionId: string): Promise<void>;
   events(sessionId: string): AsyncIterable<AgentEvent>;

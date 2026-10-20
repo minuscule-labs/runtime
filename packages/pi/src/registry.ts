@@ -1,6 +1,7 @@
-import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile, lstat, open } from "node:fs/promises";
+import { constants } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 export interface PiSessionRegistration {
   /** Public Runtime address; managed sessions use their stable managed id. */
@@ -62,6 +63,32 @@ export async function readRegistration(sessionId: string): Promise<PiSessionRegi
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
+}
+
+/** A bounded, owner-private peek. Unlike readRegistration, never cleans up or migrates anything. */
+export async function inspectRegistration(sessionId: string): Promise<Pick<PiSessionRegistration, "sessionId" | "ownerId" | "endpoint" | "token" | "pid" | "ownership"> | undefined> {
+  const directory = registryDirectory();
+  if (!process.getuid || !constants.O_NOFOLLOW || !isAbsolute(directory) || directory.length > 4096) return undefined;
+  let handle;
+  try {
+    const dir = await lstat(directory);
+    if (!dir.isDirectory() || dir.isSymbolicLink() || dir.uid !== process.getuid() || (dir.mode & 0o077)) return undefined;
+    handle = await open(registrationPath(sessionId), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== process.getuid() || (stat.mode & 0o077) || stat.size > 32 * 1024) return undefined;
+    const buffer = Buffer.alloc(32 * 1024 + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > 32 * 1024) return undefined;
+    const raw = JSON.parse(buffer.toString("utf8", 0, bytesRead));
+    if (raw.sessionId !== sessionId || raw.ownership !== "owned" || typeof raw.ownerId !== "string"
+      || !Number.isSafeInteger(raw.pid) || raw.pid < 1 || !processExists(raw.pid)
+      || typeof raw.token !== "string" || !/^[a-zA-Z0-9_-]{1,512}$/.test(raw.token)) return undefined;
+    const endpoint = new URL(raw.endpoint);
+    if (endpoint.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(endpoint.hostname)
+      || endpoint.username || endpoint.password || endpoint.pathname !== "/" || endpoint.search || endpoint.hash) return undefined;
+    return { sessionId, ownerId: raw.ownerId, ownership: "owned", endpoint: endpoint.origin, token: raw.token, pid: raw.pid };
+  } catch { return undefined; }
+  finally { await handle?.close(); }
 }
 
 export async function listRegistrations(): Promise<PiSessionRegistration[]> {

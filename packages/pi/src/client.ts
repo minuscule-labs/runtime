@@ -18,10 +18,12 @@ import type {
   RuntimeLaunchCapabilities,
   RuntimeMessage,
   RuntimeSessionCapabilities,
+  RuntimeSessionProfile,
   RuntimeSkillCapability,
 } from "@minu/runtime-core";
+import { sessionProfile, SESSION_PROFILE_LIMITS } from "@minu/runtime-core";
 import { PiRpcProcess } from "./pi-rpc.js";
-import { listRegistrations, readRegistration, registryDirectory, type PiSessionRegistration } from "./registry.js";
+import { inspectRegistration, listRegistrations, readRegistration, registryDirectory, type PiSessionRegistration } from "./registry.js";
 import {
   createManagedSessionManifest,
   listManagedSessionManifests,
@@ -130,6 +132,7 @@ export interface PiAgentRuntimeOptions {
 }
 
 export class PiAgentRuntime implements AgentRuntime {
+  private readonly profileReads = new Set<string>();
   constructor(private readonly options: PiAgentRuntimeOptions = {}) {
     for (const [name, value] of Object.entries({
       requestTimeoutMs: options.requestTimeoutMs,
@@ -614,6 +617,59 @@ export class PiAgentRuntime implements AgentRuntime {
       openDiagnostic: candidate.openDiagnostic as boolean,
       liveSkillVerification: candidate.liveSkillVerification as boolean,
     };
+  }
+
+  async inspectSessionProfile(managedSessionId: string, ownerId: string, options: { signal?: AbortSignal } = {}): Promise<RuntimeSessionProfile | undefined> {
+    validateManagedSessionIdentity(managedSessionId, ownerId);
+    const signal = AbortSignal.any([AbortSignal.timeout(SESSION_PROFILE_LIMITS.readMs), ...(options.signal ? [options.signal] : [])]);
+    const same = (a: Awaited<ReturnType<typeof inspectRegistration>>, b: Awaited<ReturnType<typeof inspectRegistration>>) =>
+      a && b && a.sessionId === b.sessionId && a.ownerId === b.ownerId && a.endpoint === b.endpoint && a.token === b.token && a.pid === b.pid;
+    let aborted: (() => void) | undefined;
+    try {
+      signal.throwIfAborted();
+      const key = JSON.stringify([ownerId, managedSessionId]);
+      if (this.profileReads.has(key) || this.profileReads.size >= 16) return undefined;
+      this.profileReads.add(key);
+      const task = (async () => {
+        const registration = await inspectRegistration(managedSessionId);
+        signal.throwIfAborted();
+        if (!registration || registration.ownerId !== ownerId) return undefined;
+        const response = await fetch(`${registration.endpoint}/session-profile`, { signal, redirect: "error", headers: {
+          authorization: `Bearer ${registration.token}`, "x-minu-runtime-owner": ownerId, "x-minu-runtime-session": managedSessionId,
+        } });
+        if (!response.ok) { await response.body?.cancel(); return undefined; }
+        const reader = response.body?.getReader();
+        if (!reader) return undefined;
+        const chunks: Uint8Array[] = [];
+        let bytes = 0;
+        try {
+          while (true) {
+            const value = await reader.read();
+            signal.throwIfAborted();
+            if (value.done) break;
+            bytes += value.value.byteLength;
+            // The fixed {profile: ...} envelope is included in the transport bound.
+            if (bytes > SESSION_PROFILE_LIMITS.bytes) { await reader.cancel(); return undefined; }
+            chunks.push(value.value);
+          }
+        } finally { reader.releaseLock(); }
+        const value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { profile?: unknown };
+        const profile = sessionProfile(value.profile);
+        const current = await inspectRegistration(managedSessionId);
+        signal.throwIfAborted();
+        return same(registration, current) ? profile : undefined;
+      })();
+      const release = () => { this.profileReads.delete(key); };
+      void task.then(release, release);
+      return await Promise.race([task, new Promise<never>((_, reject) => {
+        aborted = () => reject(new DOMException("Session profile read aborted", "AbortError"));
+        signal.addEventListener("abort", aborted, { once: true });
+        if (signal.aborted) aborted();
+      })]);
+    } catch {
+      if (options.signal?.aborted) throw new DOMException("Session profile read aborted", "AbortError");
+      return undefined;
+    } finally { if (aborted) signal.removeEventListener("abort", aborted); }
   }
 
   async openDiagnostic(sessionId: string): Promise<void> {
