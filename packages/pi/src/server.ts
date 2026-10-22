@@ -7,7 +7,9 @@ import type {
   AgentTurn,
   RuntimeMessage,
   RuntimeSessionCapabilities,
+  RuntimeSessionProfile,
 } from "@minu/runtime-core";
+import { sessionProfile, SESSION_PROFILE_LIMITS } from "@minu/runtime-core";
 
 const MAX_INPUT_BYTES = 1024 * 1024;
 const DEFAULT_TURN_RETENTION_LIMIT = 1_000;
@@ -23,6 +25,8 @@ export interface PiBridgeServerOptions {
   interrupt?(): Promise<void>;
   openDiagnostic?(): Promise<void>;
   getMessages?(): Promise<RuntimeMessage[]>;
+  managedSession?: { id: string; ownerId: string };
+  getSessionProfile?(signal: AbortSignal): Promise<RuntimeSessionProfile>;
   stop?(): Promise<void> | void;
   /** Managed sessions reject stop unless idle, closing the send/stop race at admission. */
   stopRequiresIdle?: boolean;
@@ -62,6 +66,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
   }
   let activeTurnId: string | undefined;
   let stopRequested = false;
+  let profileReading = false;
 
   const copyTurn = (turn: AgentTurn): AgentTurn => ({
     ...turn,
@@ -140,6 +145,36 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           liveSkillVerification: false,
         };
         json(response, 200, { capabilities });
+        return;
+      }
+
+      if (url.pathname === "/session-profile") {
+        response.setHeader("cache-control", "no-store");
+        if (!options.managedSession || !options.getSessionProfile
+          || request.headers["x-minu-runtime-owner"] !== options.managedSession.ownerId
+          || request.headers["x-minu-runtime-session"] !== options.managedSession.id) {
+          json(response, 404, { error: "Session profile unavailable" }); return;
+        }
+        if (request.method !== "GET") { json(response, 405, { error: "Read-only resource" }); return; }
+        if (profileReading || stopRequested || options.getStatus() === "offline") { json(response, 503, { error: "Session profile unavailable" }); return; }
+        profileReading = true;
+        const controller = new AbortController();
+        const closed = () => controller.abort();
+        response.once("close", closed);
+        const timer = setTimeout(closed, SESSION_PROFILE_LIMITS.readMs);
+        const task = Promise.resolve().then(() => options.getSessionProfile!(controller.signal));
+        // A getter ignoring cancellation must retain the single physical slot until it settles.
+        void task.then(() => { profileReading = false; }, () => { profileReading = false; });
+        try {
+          const value = await Promise.race([task, new Promise<never>((_, reject) => {
+            const aborted = () => reject(new Error("Session profile unavailable"));
+            controller.signal.addEventListener("abort", aborted, { once: true });
+            if (controller.signal.aborted) aborted();
+          })]);
+          controller.signal.throwIfAborted();
+          if (!response.destroyed) json(response, 200, { profile: sessionProfile(value) });
+        } catch { if (!response.destroyed) json(response, 503, { error: "Session profile unavailable" }); }
+        finally { clearTimeout(timer); response.off("close", closed); }
         return;
       }
 

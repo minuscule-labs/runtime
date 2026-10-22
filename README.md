@@ -27,6 +27,7 @@ interface AgentRuntime {
   interrupt(sessionId: string): Promise<void>;
   status(sessionId: string): Promise<AgentStatus>;
   sessionCapabilities?(sessionId: string): Promise<RuntimeSessionCapabilities>;
+  inspectSessionProfile?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeSessionProfile | undefined>;
   openDiagnostic?(sessionId: string): Promise<void>;
   events(sessionId: string): AsyncIterable<AgentEvent>;
   activityEvents?(
@@ -49,6 +50,10 @@ The Pi adapter persists versioned resume manifests and transcripts in owner-priv
 `events` is the adapter-level stream and may contain message deltas, tool names, errors, operation IDs, and session IDs. Presentation layers must not consume it directly. Adapters may instead expose `activityEvents`, an optional sanitized stream containing only `working`, `using_tools`, or `responding` plus an observation timestamp. The Pi adapter coalesces repeated raw events, discards all private fields before yielding, and stops when the caller aborts.
 
 `sessionCapabilities` is an optional live-session query, distinct from launch-time `capabilities`. Version 1 returns only booleans for safe activity events, interruption, reconnecting an existing live session, interactive attachment, diagnostic opening, and live skill verification. Consumers must treat an absent or failed query as **not verified**, not as proof that a capability is unsupported. The Pi bridge computes this response from the currently reachable session and never includes session IDs, endpoints, paths, commands, tools, providers, or credentials.
+
+`inspectSessionProfile` is an optional, separately versioned read of an **existing owner-scoped managed worker**, not launch discovery. Pi observes that process’s model, reasoning, and available skill-command identifiers through `get_state`, `get_commands`, and a confirming `get_state`. Each field is verified or not verified; commands do not prove loaded instructions or turn usage. The allowlisted profile contains no prompts, raw state, model credentials, paths, native IDs, PIDs or tokens. Reads are limited to two seconds, 16 KiB of UTF-8 transport and 64 skill identifiers, with cancellation covering registration reads, HTTP and body decoding. One physical read per session and at most 16 per client remain occupied until their underlying work settles; stalled inspection never grants lifecycle authority. The bridge separately bounds its getter and RPC reads.
+
+Missing/older workers, unsupported versions, unsafe registrations, suspended sessions, and unavailable evidence return `undefined`; caller cancellation throws `AbortError`. There is no start, resume, message, registry cleanup, manifest migration, credential refresh or fallback to saved launch configuration. Registration inspection requires owner-private POSIX permissions and uses bounded, non-following/non-blocking file reads; redirects are rejected and registration replacement fences late results. Attached and legacy sessions do not acquire this optional managed-session capability.
 
 `openDiagnostic` is an optional explicit local action. It returns no path or content: the adapter asks the reachable session to open its own diagnostic with an installed OS viewer. Runtime-owned Pi sessions expose a private, permission-restricted log capped at 1 MiB; attached sessions and hosts without a verified local opener leave the live capability false. The authenticated bridge response contains only an allowlisted completion state.
 
