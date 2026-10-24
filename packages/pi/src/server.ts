@@ -9,7 +9,8 @@ import type {
   RuntimeSessionCapabilities,
   RuntimeSessionProfile,
 } from "@minu/runtime-core";
-import { sessionProfile, SESSION_PROFILE_LIMITS } from "@minu/runtime-core";
+import { sessionProfile, SESSION_PROFILE_LIMITS, SESSION_EVENTS_LIMITS } from "@minu/runtime-core";
+import { SessionEventLog } from "./session-events.js";
 
 const MAX_INPUT_BYTES = 1024 * 1024;
 const DEFAULT_TURN_RETENTION_LIMIT = 1_000;
@@ -67,6 +68,19 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
   let activeTurnId: string | undefined;
   let stopRequested = false;
   let profileReading = false;
+  let eventsReading = false;
+  const eventLog = options.managedSession ? new SessionEventLog() : undefined;
+
+  const dispatch = async (input: string, operationId: string): Promise<void> => {
+    eventLog?.record("turn_dispatch_requested");
+    try {
+      await options.send(input, operationId);
+      eventLog?.record("turn_dispatch_returned");
+    } catch (error) {
+      eventLog?.record("turn_dispatch_failed");
+      throw error;
+    }
+  };
 
   const copyTurn = (turn: AgentTurn): AgentTurn => ({
     ...turn,
@@ -91,7 +105,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
   const runTurn = async (turn: AgentTurn): Promise<void> => {
     try {
       const before = await options.getMessages?.() ?? [];
-      await options.send(turn.input, turn.id);
+      await dispatch(turn.input, turn.id);
       if (turn.status === "interrupted") return;
       const after = await options.getMessages?.() ?? [];
       let sharedPrefix = 0;
@@ -105,11 +119,13 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       turn.status = "completed";
       turn.response = { ...responseMessage };
       turn.updatedAt = new Date().toISOString();
+      eventLog?.record("turn_completed");
     } catch (error) {
       if (turn.status === "interrupted") return;
       turn.status = "failed";
       turn.error = error instanceof Error ? error.message : String(error);
       turn.updatedAt = new Date().toISOString();
+      eventLog?.record("turn_failed");
     } finally {
       if (activeTurnId === turn.id) activeTurnId = undefined;
       pruneTurns();
@@ -122,6 +138,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
   };
 
   const server = createServer(async (request, response) => {
+    let observeBusy = false;
     try {
       if (request.headers.authorization !== `Bearer ${options.token}`) {
         json(response, 401, { error: "Unauthorized" });
@@ -129,6 +146,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       }
 
       const url = new URL(request.url ?? "/", "http://runtime.local");
+      observeBusy = request.method === "POST" && ["/turns", "/send", "/steer", "/interrupt", "/stop"].includes(url.pathname);
       if (request.method === "GET" && url.pathname === "/status") {
         json(response, 200, { sessionId: options.sessionId, status: options.getStatus() });
         return;
@@ -178,6 +196,35 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
         return;
       }
 
+      if (url.pathname === "/session-events") {
+        response.setHeader("cache-control", "no-store");
+        if (!eventLog || !options.managedSession
+          || request.headers["x-minu-runtime-owner"] !== options.managedSession.ownerId
+          || request.headers["x-minu-runtime-session"] !== options.managedSession.id) {
+          json(response, 404, { error: "Session events unavailable" }); return;
+        }
+        if (request.method !== "GET") { json(response, 405, { error: "Read-only resource" }); return; }
+        let available = false;
+        try { available = options.getStatus() !== "offline"; } catch {}
+        if (url.search || eventsReading || !available) {
+          json(response, 503, { error: "Session events unavailable" }); return;
+        }
+        // Snapshot work is synchronous and bounded; retain the response slot until physical delivery ends.
+        eventsReading = true;
+        const timer = setTimeout(() => response.destroy(), SESSION_EVENTS_LIMITS.readMs);
+        const release = () => {
+          clearTimeout(timer);
+          eventsReading = false;
+          response.off("finish", release);
+          response.off("close", release);
+        };
+        response.once("finish", release);
+        response.once("close", release);
+        try { json(response, 200, { events: eventLog.snapshot() }); }
+        catch { json(response, 503, { error: "Session events unavailable" }); }
+        return;
+      }
+
       if (request.method === "GET" && url.pathname === "/messages") {
         json(response, 200, { messages: await options.getMessages?.() ?? [] });
         return;
@@ -215,7 +262,10 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           return;
         }
         if (stopRequested) throw new SessionBusyError("Pi session is stopping");
-        await options.steer(body.input);
+        eventLog?.record("steer_requested");
+        try { await options.steer(body.input); }
+        catch (error) { eventLog?.record("steer_failed"); throw error; }
+        eventLog?.record("steer_acknowledged");
         json(response, 202, { status: "steering" });
         return;
       }
@@ -241,9 +291,11 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
         const existing = turns.get(body.turnId);
         if (existing) {
           if (existing.input !== body.input) {
+            eventLog?.record("turn_rejected_conflict");
             json(response, 409, { error: "turnId is already associated with different input" });
             return;
           }
+          eventLog?.record("turn_reused");
           json(response, 200, { turn: copyTurn(existing) });
           return;
         }
@@ -261,6 +313,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
         };
         turns.set(turn.id, turn);
         activeTurnId = turn.id;
+        eventLog?.record("turn_accepted");
         void runTurn(turn);
         json(response, 202, { turn: copyTurn(turn) });
         return;
@@ -275,7 +328,10 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
         if (options.getStatus() !== "working") {
           throw new SessionBusyError("Pi session must be working to interrupt it");
         }
-        await options.interrupt();
+        eventLog?.record("interrupt_requested");
+        try { await options.interrupt(); }
+        catch (error) { eventLog?.record("interrupt_failed"); throw error; }
+        eventLog?.record("interrupt_acknowledged");
         if (activeTurnId) {
           const turn = turns.get(activeTurnId);
           if (turn) {
@@ -309,7 +365,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
         }
         if (stopRequested) throw new SessionBusyError("Pi session is stopping");
         const operationId = randomUUID();
-        await options.send(body.input, operationId);
+        await dispatch(body.input, operationId);
         json(response, 200, { operationId, status: "completed" });
         return;
       }
@@ -327,6 +383,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           throw new SessionBusyError("A working Pi session cannot be stopped for suspend or destroy");
         }
         stopRequested = true;
+        eventLog?.record("stop_requested");
         json(response, 202, { status: "stopping" });
         setImmediate(() => void options.stop?.());
         return;
@@ -334,6 +391,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
 
       json(response, 404, { error: "Not found" });
     } catch (error) {
+      if (observeBusy && error instanceof SessionBusyError) eventLog?.record("request_rejected_busy");
       const status = error instanceof SessionBusyError ? 409 : 500;
       json(response, status, { error: error instanceof Error ? error.message : String(error) });
     }
@@ -347,6 +405,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
     });
   });
   const address = server.address() as AddressInfo;
+  eventLog?.record("bridge_ready");
 
   return {
     endpoint: `http://127.0.0.1:${address.port}`,
