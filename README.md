@@ -28,6 +28,7 @@ interface AgentRuntime {
   status(sessionId: string): Promise<AgentStatus>;
   sessionCapabilities?(sessionId: string): Promise<RuntimeSessionCapabilities>;
   inspectSessionProfile?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeSessionProfile | undefined>;
+  inspectSessionEvents?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeSessionEvents | undefined>;
   openDiagnostic?(sessionId: string): Promise<void>;
   events(sessionId: string): AsyncIterable<AgentEvent>;
   activityEvents?(
@@ -54,6 +55,22 @@ The Pi adapter persists versioned resume manifests and transcripts in owner-priv
 `inspectSessionProfile` is an optional, separately versioned read of an **existing owner-scoped managed worker**, not launch discovery. Pi observes that process’s model, reasoning, and available skill-command identifiers through `get_state`, `get_commands`, and a confirming `get_state`. Each field is verified or not verified; commands do not prove loaded instructions or turn usage. The allowlisted profile contains no prompts, raw state, model credentials, paths, native IDs, PIDs or tokens. Reads are limited to two seconds, 16 KiB of UTF-8 transport and 64 skill identifiers, with cancellation covering registration reads, HTTP and body decoding. One physical read per session and at most 16 per client remain occupied until their underlying work settles; stalled inspection never grants lifecycle authority. The bridge separately bounds its getter and RPC reads.
 
 Missing/older workers, unsupported versions, unsafe registrations, suspended sessions, and unavailable evidence return `undefined`; caller cancellation throws `AbortError`. There is no start, resume, message, registry cleanup, manifest migration, credential refresh or fallback to saved launch configuration. Registration inspection requires owner-private POSIX permissions and uses bounded, non-following/non-blocking file reads; redirects are rejected and registration replacement fences late results. Attached and legacy sessions do not acquire this optional managed-session capability.
+
+`inspectSessionEvents` reads the current managed worker's **structured Runtime bridge observations**, not Pi/Codex logs. It returns a version-one `runtime_bridge` snapshot with capture/recording-since times, an eviction count and at most 200 ordered records containing only a sequence, worker observation time and fixed event code. The total UTF-8 transport is capped at 32 KiB; reads have a two-second deadline. It shares the profile reader's per-session physical slot and 16-read per-client budget, pure registration inspection, exact owner/session authentication, cancellation, redirect rejection and worker-replacement fencing. No discovery, RPC, message/transcript/log reading, file writes or process wakeup occurs. The bridge route is read-only and `no-store`; attached/legacy/old workers and unavailable sources return `undefined` without a fallback. Caller cancellation throws `AbortError`.
+
+The in-memory window starts when the already-verified managed worker creates its bridge. A resumed/replaced worker starts a new window at sequence one; no persistent history, pagination or cross-worker continuity is promised. `eventsDropped` counts evicted records, so zero retained events is not evidence of health or complete logical-session history. Reads and raw harness events do not add records. Recording has fixed memory bounds and cannot fail an authoritative operation; a failed recorder makes the optional snapshot unavailable, not a misleading empty history.
+
+Event codes describe only observed Runtime boundaries:
+
+- `bridge_ready`: bridge listener is ready, not proof of downstream routing or model health.
+- `turn_accepted`, `turn_reused`, `turn_rejected_conflict`: turn admission/idempotency decisions, without IDs or input.
+- `turn_dispatch_requested`, `turn_dispatch_returned`, `turn_dispatch_failed`: invocation/result of the adapter send callback; a returned callback is not proof of Channels delivery.
+- `turn_completed`, `turn_failed`: the Runtime turn tracker recorded a result after response extraction; not confirmation of a public Conversation response.
+- `request_rejected_busy`: a control/turn request was rejected as busy.
+- `steer_requested`, `steer_acknowledged`, `steer_failed`, `interrupt_requested`, `interrupt_acknowledged`, `interrupt_failed`: control callback observations; acknowledgment does not prove turn settlement.
+- `stop_requested`: stop admitted; no claim of physical process exit or completed cleanup.
+
+There are no free-text errors, prompts, payloads, tool names, severities or private/native identifiers. Consumers independently authorize the human/resource, revalidate their binding generation around reads, render curated labels and discard stale snapshots. Channels' own operation timeline remains the source for host routing, lifecycle and delivery observations; Runtime events must not be misrepresented as those observations.
 
 `openDiagnostic` is an optional explicit local action. It returns no path or content: the adapter asks the reachable session to open its own diagnostic with an installed OS viewer. Runtime-owned Pi sessions expose a private, permission-restricted log capped at 1 MiB; attached sessions and hosts without a verified local opener leave the live capability false. The authenticated bridge response contains only an allowlisted completion state.
 

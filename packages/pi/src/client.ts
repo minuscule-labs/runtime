@@ -19,9 +19,10 @@ import type {
   RuntimeMessage,
   RuntimeSessionCapabilities,
   RuntimeSessionProfile,
+  RuntimeSessionEvents,
   RuntimeSkillCapability,
 } from "@minu/runtime-core";
-import { sessionProfile, SESSION_PROFILE_LIMITS } from "@minu/runtime-core";
+import { sessionProfile, SESSION_PROFILE_LIMITS, sessionEvents, SESSION_EVENTS_LIMITS } from "@minu/runtime-core";
 import { PiRpcProcess } from "./pi-rpc.js";
 import { inspectRegistration, listRegistrations, readRegistration, registryDirectory, type PiSessionRegistration } from "./registry.js";
 import {
@@ -132,7 +133,7 @@ export interface PiAgentRuntimeOptions {
 }
 
 export class PiAgentRuntime implements AgentRuntime {
-  private readonly profileReads = new Set<string>();
+  private readonly inspectionReads = new Set<string>();
   constructor(private readonly options: PiAgentRuntimeOptions = {}) {
     for (const [name, value] of Object.entries({
       requestTimeoutMs: options.requestTimeoutMs,
@@ -620,21 +621,35 @@ export class PiAgentRuntime implements AgentRuntime {
   }
 
   async inspectSessionProfile(managedSessionId: string, ownerId: string, options: { signal?: AbortSignal } = {}): Promise<RuntimeSessionProfile | undefined> {
+    return this.inspectManaged(managedSessionId, ownerId, options, {
+      path: "/session-profile", limits: SESSION_PROFILE_LIMITS, decode: value => sessionProfile(value.profile),
+    });
+  }
+
+  async inspectSessionEvents(managedSessionId: string, ownerId: string, options: { signal?: AbortSignal } = {}): Promise<RuntimeSessionEvents | undefined> {
+    return this.inspectManaged(managedSessionId, ownerId, options, {
+      path: "/session-events", limits: SESSION_EVENTS_LIMITS, decode: value => sessionEvents(value.events),
+    });
+  }
+
+  /** Shared physical resource budget for optional reads, without lifecycle/discovery helpers. */
+  private async inspectManaged<T>(managedSessionId: string, ownerId: string, options: { signal?: AbortSignal },
+    resource: { path: string; limits: { readMs: number; bytes: number }; decode(value: Record<string, unknown>): T }): Promise<T | undefined> {
     validateManagedSessionIdentity(managedSessionId, ownerId);
-    const signal = AbortSignal.any([AbortSignal.timeout(SESSION_PROFILE_LIMITS.readMs), ...(options.signal ? [options.signal] : [])]);
+    const signal = AbortSignal.any([AbortSignal.timeout(resource.limits.readMs), ...(options.signal ? [options.signal] : [])]);
     const same = (a: Awaited<ReturnType<typeof inspectRegistration>>, b: Awaited<ReturnType<typeof inspectRegistration>>) =>
       a && b && a.sessionId === b.sessionId && a.ownerId === b.ownerId && a.endpoint === b.endpoint && a.token === b.token && a.pid === b.pid;
     let aborted: (() => void) | undefined;
     try {
       signal.throwIfAborted();
       const key = JSON.stringify([ownerId, managedSessionId]);
-      if (this.profileReads.has(key) || this.profileReads.size >= 16) return undefined;
-      this.profileReads.add(key);
+      if (this.inspectionReads.has(key) || this.inspectionReads.size >= 16) return undefined;
+      this.inspectionReads.add(key);
       const task = (async () => {
         const registration = await inspectRegistration(managedSessionId);
         signal.throwIfAborted();
         if (!registration || registration.ownerId !== ownerId) return undefined;
-        const response = await fetch(`${registration.endpoint}/session-profile`, { signal, redirect: "error", headers: {
+        const response = await fetch(`${registration.endpoint}${resource.path}`, { signal, redirect: "error", headers: {
           authorization: `Bearer ${registration.token}`, "x-minu-runtime-owner": ownerId, "x-minu-runtime-session": managedSessionId,
         } });
         if (!response.ok) { await response.body?.cancel(); return undefined; }
@@ -648,26 +663,26 @@ export class PiAgentRuntime implements AgentRuntime {
             signal.throwIfAborted();
             if (value.done) break;
             bytes += value.value.byteLength;
-            // The fixed {profile: ...} envelope is included in the transport bound.
-            if (bytes > SESSION_PROFILE_LIMITS.bytes) { await reader.cancel(); return undefined; }
+            // The fixed envelope is included in each resource's transport bound.
+            if (bytes > resource.limits.bytes) { await reader.cancel(); return undefined; }
             chunks.push(value.value);
           }
         } finally { reader.releaseLock(); }
-        const value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { profile?: unknown };
-        const profile = sessionProfile(value.profile);
+        const value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+        const projection = resource.decode(value);
         const current = await inspectRegistration(managedSessionId);
         signal.throwIfAborted();
-        return same(registration, current) ? profile : undefined;
+        return same(registration, current) ? projection : undefined;
       })();
-      const release = () => { this.profileReads.delete(key); };
+      const release = () => { this.inspectionReads.delete(key); };
       void task.then(release, release);
       return await Promise.race([task, new Promise<never>((_, reject) => {
-        aborted = () => reject(new DOMException("Session profile read aborted", "AbortError"));
+        aborted = () => reject(new DOMException("Session inspection aborted", "AbortError"));
         signal.addEventListener("abort", aborted, { once: true });
         if (signal.aborted) aborted();
       })]);
     } catch {
-      if (options.signal?.aborted) throw new DOMException("Session profile read aborted", "AbortError");
+      if (options.signal?.aborted) throw new DOMException("Session inspection aborted", "AbortError");
       return undefined;
     } finally { if (aborted) signal.removeEventListener("abort", aborted); }
   }

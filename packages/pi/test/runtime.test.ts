@@ -664,6 +664,9 @@ process.on("SIGTERM", () => process.exit(0));
     assert.equal((await stat(transcriptFile)).mode & 0o777, 0o600);
     const manifestBeforeInspection = await readFile(manifestPath, "utf8");
     const transcriptBeforeInspection = await readFile(transcriptFile, "utf8");
+    const initialEvents = await runtime.inspectSessionEvents(managedSessionId, ownerId);
+    assert.deepEqual(initialEvents?.events.map(event => event.code), ["bridge_ready"]);
+    assert.equal(await runtime.inspectSessionEvents(managedSessionId, "other-owner"), undefined);
     const observed = await runtime.inspectSessionProfile(managedSessionId, ownerId);
     assert.deepEqual(observed?.model, { status: "verified", provider: "openai", id: "gpt-test" });
     assert.deepEqual(observed?.reasoning, { status: "verified", level: "medium" });
@@ -673,6 +676,9 @@ process.on("SIGTERM", () => process.exit(0));
     assert.equal(await readFile(transcriptFile, "utf8"), transcriptBeforeInspection);
     assert.equal(Number(await readFile(runCountFile, "utf8")), 1, "inspection cannot start a worker");
     await runtime.send(managedSessionId, "Before suspend");
+    const dispatchedEvents = await runtime.inspectSessionEvents(managedSessionId, ownerId);
+    assert.deepEqual(dispatchedEvents?.events.map(event => event.code), ["bridge_ready", "turn_dispatch_requested", "turn_dispatch_returned"]);
+    assert.doesNotMatch(JSON.stringify(dispatchedEvents), /Private managed persona|native-pi-|Before suspend|RESUMED_OK|\.jsonl/);
     assert.deepEqual((await runtime.messages(managedSessionId)).map(({ role, content }) => [role, content]), [
       ["user", "Before suspend"],
       ["assistant", "RESUMED_OK"],
@@ -687,6 +693,7 @@ process.on("SIGTERM", () => process.exit(0));
     await runtime.suspend(managedSessionId, ownerId);
     assert.equal(await runtime.status(managedSessionId), "offline");
     assert.equal(await runtime.inspectSessionProfile(managedSessionId, ownerId), undefined);
+    assert.equal(await runtime.inspectSessionEvents(managedSessionId, ownerId), undefined);
     assert.equal(Number(await readFile(runCountFile, "utf8")), 1, "inspection cannot resume a suspended worker");
     assert.equal((await runtime.listManagedSessions(ownerId))[0]?.state, "suspended");
     // Recover the exact on-disk state left by a stopped worker whose suspend
@@ -733,6 +740,10 @@ process.on("SIGTERM", () => process.exit(0));
       transcriptId: string;
     };
     assert.equal(manifestAfterResume.nativeSessionId, "native-pi-2");
+    const resumedEvents = await runtime.inspectSessionEvents(managedSessionId, ownerId);
+    assert.deepEqual(resumedEvents?.events.map(event => event.code), ["bridge_ready"], "worker restart does not import earlier events");
+    assert.equal(resumedEvents?.events[0]?.sequence, 1);
+    assert.equal(resumedEvents?.eventsDropped, 0);
     assert.equal((await runtime.inspectSessionProfile(managedSessionId, ownerId))?.model.status, "verified");
     assert.notEqual(manifestAfterResume.nativeSessionId, initialManifest.transcriptId);
     assert.equal(manifestAfterResume.transcriptId, initialManifest.transcriptId);
