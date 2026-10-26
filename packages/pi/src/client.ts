@@ -17,12 +17,14 @@ import type {
   RuntimeActivityPhase,
   RuntimeLaunchCapabilities,
   RuntimeMessage,
+  RuntimeImageContent,
+  RuntimeInputCapabilities,
   RuntimeSessionCapabilities,
   RuntimeSessionProfile,
   RuntimeSessionEvents,
   RuntimeSkillCapability,
 } from "@minu/runtime-core";
-import { sessionProfile, SESSION_PROFILE_LIMITS, sessionEvents, SESSION_EVENTS_LIMITS } from "@minu/runtime-core";
+import { sessionProfile, SESSION_PROFILE_LIMITS, sessionEvents, SESSION_EVENTS_LIMITS, runtimeInput } from "@minu/runtime-core";
 import { PiRpcProcess } from "./pi-rpc.js";
 import { inspectRegistration, listRegistrations, readRegistration, registryDirectory, type PiSessionRegistration } from "./registry.js";
 import {
@@ -540,21 +542,30 @@ export class PiAgentRuntime implements AgentRuntime {
     return summaries;
   }
 
-  async send(sessionId: string, input: string): Promise<void> {
+  async send(sessionId: string, input: string, images?: RuntimeImageContent[]): Promise<void> {
+    const content = runtimeInput(input, images);
     await checkedFetch(sessionId, "/send", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ input }),
+      body: JSON.stringify({ input: content.input, ...(content.images.length ? { images: content.images } : {}) }),
     }, this.options.controlRequestTimeoutMs ?? CONTROL_REQUEST_TIMEOUT_MS);
   }
 
-  async startTurn(sessionId: string, turnId: string, input: string): Promise<AgentTurn> {
+  async startTurn(sessionId: string, turnId: string, input: string, images?: RuntimeImageContent[]): Promise<AgentTurn> {
+    const content = runtimeInput(input, images);
     const response = await checkedFetch(sessionId, "/turns", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ turnId, input }),
+      body: JSON.stringify({ turnId, input: content.input, ...(content.images.length ? { images: content.images } : {}) }),
     }, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
     return ((await response.json()) as { turn: AgentTurn }).turn;
+  }
+
+  async inputCapabilities(sessionId: string): Promise<RuntimeInputCapabilities> {
+    const response = await checkedFetch(sessionId, "/input-capabilities", undefined, this.options.requestTimeoutMs ?? SHORT_REQUEST_TIMEOUT_MS);
+    const { capabilities } = await response.json() as { capabilities?: RuntimeInputCapabilities };
+    if (capabilities?.version !== 1 || typeof capabilities.images !== "boolean") throw new Error("Invalid Runtime input capability response");
+    return { version: 1, images: capabilities.images };
   }
 
   async turn(sessionId: string, turnId: string): Promise<AgentTurn | undefined> {

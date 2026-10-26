@@ -1,5 +1,7 @@
 import type { RuntimeSessionProfile } from "./session-profile.js";
 import type { RuntimeSessionEvents } from "./session-events.js";
+import type { RuntimeImageContent, RuntimeInputCapabilities } from "./input.js";
+export { runtimeInput, RuntimeInputError, RUNTIME_INPUT_LIMITS, type RuntimeImageContent, type RuntimeInputCapabilities } from "./input.js";
 export { sessionProfile, SESSION_PROFILE_LIMITS, type RuntimeSessionProfile } from "./session-profile.js";
 export { sessionEvents, SESSION_EVENT_CODES, SESSION_EVENTS_LIMITS, type RuntimeSessionEvents, type RuntimeSessionEvent, type RuntimeSessionEventCode } from "./session-events.js";
 
@@ -152,9 +154,11 @@ export interface AgentRuntime {
   /** Discover adapter launch options without exposing provider credentials. */
   capabilities?(config?: Pick<AgentStartConfig, "cwd">): Promise<RuntimeLaunchCapabilities>;
   /** Send input to an idle session and resolve after the resulting run settles. */
-  send(sessionId: string, input: string): Promise<void>;
+  send(sessionId: string, input: string, images?: RuntimeImageContent[]): Promise<void>;
   /** Idempotently start or recover a turn identified by a caller-stable id. */
-  startTurn(sessionId: string, turnId: string, input: string): Promise<AgentTurn>;
+  startTurn(sessionId: string, turnId: string, input: string, images?: RuntimeImageContent[]): Promise<AgentTurn>;
+  /** Verify the current adapter and model can consume pixels. Missing means not verified. */
+  inputCapabilities?(sessionId: string): Promise<RuntimeInputCapabilities>;
   /** Read a previously accepted turn. */
   turn(sessionId: string, turnId: string): Promise<AgentTurn | undefined>;
   /** Adjust an active run at the harness's next safe model boundary. */

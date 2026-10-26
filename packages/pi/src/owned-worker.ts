@@ -2,7 +2,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { AgentReasoningLevel, AgentStatus } from "@minu/runtime-core";
+import type { AgentReasoningLevel, AgentStatus, RuntimeImageContent } from "@minu/runtime-core";
 import { normalizePiMessages } from "./messages.js";
 import { PiRpcProcess, type RpcEvent } from "./pi-rpc.js";
 import { createSessionProfileReader } from "./session-profile.js";
@@ -131,7 +131,16 @@ function handleEvent(event: RpcEvent): void {
   }
 }
 
-async function inject(input: string, operationId: string): Promise<void> {
+async function supportsImages(): Promise<boolean> {
+  if (!rpc || !sessionId) return false;
+  try {
+    const state = await rpc.request("get_state") as { sessionId?: unknown; model?: { input?: unknown } };
+    return state.sessionId === sessionId && Array.isArray(state.model?.input) && state.model.input.includes("image");
+  } catch { return false; }
+}
+
+async function inject(input: string, operationId: string, images?: RuntimeImageContent[]): Promise<void> {
+  if (images?.length && !(await supportsImages())) throw new Error("Image input is not supported by the active Pi model");
   if (!rpc || status !== "idle" || pending) throw new SessionBusyError("Pi session is working");
   return new Promise<void>((resolve, reject) => {
     pending = { operationId, resolve, reject };
@@ -142,7 +151,7 @@ async function inject(input: string, operationId: string): Promise<void> {
       operationId,
       timestamp: new Date().toISOString(),
     });
-    void rpc!.request("prompt", { message: input }).catch((error) => {
+    void rpc!.request("prompt", { message: input, ...(images?.length ? { images } : {}) }).catch((error) => {
       pending = undefined;
       publishStatus("idle");
       reject(error instanceof Error ? error : new Error(String(error)));
@@ -233,6 +242,7 @@ async function main(): Promise<void> {
       getSessionProfile: createSessionProfileReader(rpc, sessionId),
     } : {}),
     send: inject,
+    supportsImages,
     steer,
     interrupt,
     openDiagnostic: diagnosticOpener
