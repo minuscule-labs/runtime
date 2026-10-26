@@ -618,12 +618,12 @@ process.stdin.on("data", (chunk) => {
     if (!line) continue;
     const request = JSON.parse(line);
     const respond = (data) => console.log(JSON.stringify({ id: request.id, type: "response", command: request.type, success: true, data }));
-    if (request.type === "get_state") respond({ model: { provider: "openai", id: "gpt-test" }, thinkingLevel: "medium", sessionId: "native-pi-" + runCount, sessionFile, isStreaming: false });
+    if (request.type === "get_state") respond({ model: { provider: "openai", id: "gpt-test", input: ["text", "image"] }, thinkingLevel: "medium", sessionId: "native-pi-" + runCount, sessionFile, isStreaming: false });
     else if (request.type === "get_messages") respond({ messages });
     else if (request.type === "get_commands") respond({ commands: [{ source: "skill", name: "skill:existing" }] });
     else if (request.type === "prompt") {
       const finishPrompt = () => {
-        messages.push({ role: "user", content: request.message, timestamp: Date.now() });
+        messages.push({ role: "user", content: request.images?.length ? [{ type: "text", text: request.message }, ...request.images] : request.message, timestamp: Date.now() });
         messages.push({ role: "assistant", content: [{ type: "text", text: "RESUMED_OK" }], timestamp: Date.now() });
         saveTranscript();
         respond(undefined);
@@ -675,7 +675,11 @@ process.on("SIGTERM", () => process.exit(0));
     assert.equal(await readFile(manifestPath, "utf8"), manifestBeforeInspection);
     assert.equal(await readFile(transcriptFile, "utf8"), transcriptBeforeInspection);
     assert.equal(Number(await readFile(runCountFile, "utf8")), 1, "inspection cannot start a worker");
-    await runtime.send(managedSessionId, "Before suspend");
+    const pixels = [{ type: "image" as const, mimeType: "image/png" as const, data: Buffer.from("private managed pixels").toString("base64") }];
+    assert.deepEqual(await runtime.inputCapabilities(managedSessionId), { version: 1, images: true });
+    await runtime.send(managedSessionId, "Before suspend", pixels);
+    assert.ok((await readFile(transcriptFile, "utf8")).includes(pixels[0]!.data));
+    assert.ok(!JSON.stringify(await runtime.messages(managedSessionId)).includes(pixels[0]!.data));
     const dispatchedEvents = await runtime.inspectSessionEvents(managedSessionId, ownerId);
     assert.deepEqual(dispatchedEvents?.events.map(event => event.code), ["bridge_ready", "turn_dispatch_requested", "turn_dispatch_returned"]);
     assert.doesNotMatch(JSON.stringify(dispatchedEvents), /Private managed persona|native-pi-|Before suspend|RESUMED_OK|\.jsonl/);
@@ -734,6 +738,7 @@ process.on("SIGTERM", () => process.exit(0));
 
     const resumed = await runtime.resume(managedSessionId, ownerId);
     assert.equal(resumed.id, managedSessionId);
+    assert.ok((await readFile(transcriptFile, "utf8")).includes(pixels[0]!.data));
     const manifestAfterResume = JSON.parse(await readFile(manifestPath, "utf8")) as {
       nativeSessionId: string;
       sessionFile: string;
@@ -936,7 +941,7 @@ process.stdin.on("data", (chunk) => {
     else if (request.type === "get_commands") respond({ commands: [{ name: "skill:reviewer", description: "Review changes", source: "skill", sourceInfo: { path: "/skills/reviewer/SKILL.md", source: "auto", scope: "user" } }] });
     else if (request.type === "get_available_thinking_levels") respond({ levels: ["off", "medium", "high"] });
     else if (request.type === "set_model" || request.type === "set_thinking_level") respond(undefined);
-    else if (request.type === "get_state") respond({ model: { provider: "openai", id: "gpt-test" }, thinkingLevel: "medium", sessionId: "fake-owned-session", isStreaming: false });
+    else if (request.type === "get_state") respond({ model: { provider: "openai", id: "gpt-test", input: ["text", "image"] }, thinkingLevel: "medium", sessionId: "fake-owned-session", isStreaming: false });
     else if (request.type === "get_messages") respond({ messages });
     else if (request.type === "prompt") {
       messages.push({ role: "user", content: request.message, timestamp: Date.now() });
@@ -1005,7 +1010,9 @@ process.on("SIGTERM", () => process.exit(0));
       (await runtime.messages(session.id)).map((message) => [message.role, message.content]),
       [["user", "hello"], ["assistant", "READY"]],
     );
-    const accepted = await runtime.startTurn(session.id, "owned-turn-1", "recoverable");
+    assert.deepEqual(await runtime.inputCapabilities(session.id), { version: 1, images: true });
+    const images = [{ type: "image" as const, mimeType: "image/png" as const, data: Buffer.from("pixel fixture").toString("base64") }];
+    const accepted = await runtime.startTurn(session.id, "owned-turn-1", "recoverable", images);
     let recovered = accepted;
     const completionDeadline = Date.now() + 2_000;
     while (recovered.status === "running" && Date.now() < completionDeadline) {
@@ -1023,6 +1030,9 @@ process.on("SIGTERM", () => process.exit(0));
         ["assistant", "READY"],
       ],
     );
+    const recorded = JSON.parse(await readFile(argsFile, "utf8")) as { requests: Array<Record<string, unknown>> };
+    assert.deepEqual(recorded.requests.find((request) => request.type === "prompt" && request.message === "recoverable")?.images, images);
+    assert.equal((await runtime.turn(session.id, accepted.id) as unknown as Record<string, unknown>).images, undefined);
     await runtime.stop(session.id);
     sessionId = undefined;
     assert.equal(await runtime.status(session.id), "offline");

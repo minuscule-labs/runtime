@@ -2,7 +2,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { AgentReasoningLevel, AgentStatus } from "@minu/runtime-core";
+import type { AgentReasoningLevel, AgentStatus, RuntimeImageContent } from "@minu/runtime-core";
 import { normalizePiMessages } from "./messages.js";
 import { PiRpcProcess, type RpcEvent } from "./pi-rpc.js";
 import { createSessionProfileReader } from "./session-profile.js";
@@ -19,6 +19,7 @@ import { createPiBridgeServer, SessionBusyError, type PiBridgeServer } from "./s
 
 interface PendingTurn {
   operationId: string;
+  dispatched: boolean;
   resolve(): void;
   reject(error: Error): void;
 }
@@ -131,10 +132,20 @@ function handleEvent(event: RpcEvent): void {
   }
 }
 
-async function inject(input: string, operationId: string): Promise<void> {
+async function supportsImages(): Promise<boolean> {
+  if (!rpc || !sessionId) return false;
+  try {
+    const state = await rpc.request("get_state") as { sessionId?: unknown; model?: { input?: unknown } };
+    return state.sessionId === sessionId && Array.isArray(state.model?.input) && state.model.input.includes("image");
+  } catch { return false; }
+}
+
+async function inject(input: string, operationId: string, images?: RuntimeImageContent[]): Promise<void> {
   if (!rpc || status !== "idle" || pending) throw new SessionBusyError("Pi session is working");
   return new Promise<void>((resolve, reject) => {
-    pending = { operationId, resolve, reject };
+    // Reserve the operation before any capability await so cancellation can own it.
+    const turn: PendingTurn = { operationId, dispatched: false, resolve, reject };
+    pending = turn;
     publishStatus("working");
     bridge?.publish({
       type: "turn_started",
@@ -142,7 +153,15 @@ async function inject(input: string, operationId: string): Promise<void> {
       operationId,
       timestamp: new Date().toISOString(),
     });
-    void rpc!.request("prompt", { message: input }).catch((error) => {
+    void (async () => {
+      const supported = !images?.length || await supportsImages();
+      // An interrupted preparation may return after another turn has started.
+      if (pending !== turn) return;
+      if (!supported) throw new Error("Image input is not supported by the active Pi model");
+      turn.dispatched = true;
+      await rpc!.request("prompt", { message: input, ...(images?.length ? { images } : {}) });
+    })().catch((error) => {
+      if (pending !== turn) return;
       pending = undefined;
       publishStatus("idle");
       reject(error instanceof Error ? error : new Error(String(error)));
@@ -151,7 +170,7 @@ async function inject(input: string, operationId: string): Promise<void> {
 }
 
 async function steer(input: string): Promise<void> {
-  if (!rpc || status !== "working" || !pending) {
+  if (!rpc || status !== "working" || !pending?.dispatched) {
     throw new SessionBusyError("Pi session must be working to steer it");
   }
   await rpc.request("steer", { message: input });
@@ -160,6 +179,13 @@ async function steer(input: string): Promise<void> {
 async function interrupt(): Promise<void> {
   if (!rpc || status !== "working") {
     throw new SessionBusyError("Pi session must be working to interrupt it");
+  }
+  if (pending && !pending.dispatched) {
+    const canceled = pending;
+    pending = undefined;
+    publishStatus("idle");
+    canceled.resolve();
+    return;
   }
   await rpc.request("abort");
 }
@@ -233,6 +259,7 @@ async function main(): Promise<void> {
       getSessionProfile: createSessionProfileReader(rpc, sessionId),
     } : {}),
     send: inject,
+    supportsImages,
     steer,
     interrupt,
     openDiagnostic: diagnosticOpener

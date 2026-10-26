@@ -20,8 +20,9 @@ interface AgentRuntime {
   destroy?(managedSessionId: string, ownerId: string): Promise<void>;
   listManagedSessions?(ownerId: string): Promise<ManagedSessionSummary[]>;
   capabilities?(config?: Pick<AgentStartConfig, "cwd">): Promise<RuntimeLaunchCapabilities>;
-  send(sessionId: string, input: string): Promise<void>;
-  startTurn(sessionId: string, turnId: string, input: string): Promise<AgentTurn>;
+  send(sessionId: string, input: string, images?: RuntimeImageContent[]): Promise<void>;
+  startTurn(sessionId: string, turnId: string, input: string, images?: RuntimeImageContent[]): Promise<AgentTurn>;
+  inputCapabilities?(sessionId: string): Promise<RuntimeInputCapabilities>;
   turn(sessionId: string, turnId: string): Promise<AgentTurn | undefined>;
   steer(sessionId: string, input: string): Promise<void>;
   interrupt(sessionId: string): Promise<void>;
@@ -74,7 +75,32 @@ There are no free-text errors, prompts, payloads, tool names, severities or priv
 
 `openDiagnostic` is an optional explicit local action. It returns no path or content: the adapter asks the reachable session to open its own diagnostic with an installed OS viewer. Runtime-owned Pi sessions expose a private, permission-restricted log capped at 1 MiB; attached sessions and hosts without a verified local opener leave the live capability false. The authenticated bridge response contains only an allowlisted completion state.
 
-`startTurn` accepts a caller-stable turn id and returns an existing running or terminal turn when retried. `turn` lets a caller recover completion and the assistant response after its own process reconnects. Turn records live with the active Runtime bridge, so they survive a Channels/Relay restart while the Runtime session remains alive; they do not survive termination of that Runtime session. Bridges retain the most recent 1,000 terminal/running turn records by default, defining the in-memory retry-idempotency window without allowing unbounded session growth.
+`startTurn` accepts a caller-stable turn id and returns an existing running or terminal turn when retried. `turn` lets a caller recover completion and the assistant response after its own process reconnects. Turn records live with the active Runtime bridge, so they survive a Channels/Relay restart while the Runtime session remains alive; they do not survive termination of that Runtime session. Bridges retain the most recent 1,000 terminal/running turn records by default, defining the in-memory retry-idempotency window without allowing unbounded session growth. Execution ownership uses turn-instance identity, so late cleanup from an evicted, canceled entry cannot alter a newer execution reusing its caller ID.
+
+## Image input
+
+Text callers remain unchanged. Adapters can additionally accept ordered typed raster parts:
+
+```ts
+interface RuntimeImageContent {
+  type: "image";
+  data: string; // canonical base64 bytes, not a path, URL or data URI
+  mimeType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+}
+interface RuntimeInputCapabilities { version: 1; images: boolean }
+
+if ((await runtime.inputCapabilities?.(sessionId))?.images === true) {
+  await runtime.startTurn(sessionId, "caller-stable-turn", "Inspect the image", [image]);
+}
+```
+
+The optional authenticated live query is separate from launch discovery and existing session-control capabilities. Missing/failed queries mean **not verified**. Owned Pi workers verify the current `get_state` model's `input` includes `image`, then recheck at dispatch. Text-only, unknown and attached-TUI sessions do not claim image support; the bridge rejects their image input rather than silently discarding pixels. Existing text send, steering and transcript projections are unchanged.
+
+Client and bridge validate canonical base64, MIME and bounds: four images, 10 MiB each, 20 MiB combined and 1 MiB text. The JSON transport is separately capped at 34 MiB to accommodate base64 and text escaping. Runtime does not decode/resize pixels or fetch URLs; the consumer validates image containers and decides what to omit before submission. Owned Pi maps these parts to the native RPC `prompt.images` field, relying on the harness/provider for normal pixel processing.
+
+Accepted turns remain cancellable while transcript or final model-capability reads are pending. Before native dispatch, cancellation settles locally without sending a native abort; a late read is fenced from dispatching or changing a subsequent turn. Once native work is dispatched, the existing native interruption/acknowledgment semantics apply, without claiming to undo side effects.
+
+Turn identity covers text plus ordered image bytes/MIME. Matching concurrent/repeated requests reuse one turn; changed pixels or ordering conflict. Only a digest is retained for idempotency, in the same bounded retention window as turns; turn polling, normalized `messages`, structured events and image-dispatch errors do not return pixels. As with any native prompt, **Pi may persist the image parts in its owner-private transcript** and submit them to the selected model provider. Transcript resume preserves them; Runtime is not an independent attachment store and makes no secure-erasure claim.
 
 ## Personas
 

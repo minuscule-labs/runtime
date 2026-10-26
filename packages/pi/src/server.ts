@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import type {
@@ -8,8 +8,9 @@ import type {
   RuntimeMessage,
   RuntimeSessionCapabilities,
   RuntimeSessionProfile,
+  RuntimeImageContent,
 } from "@minu/runtime-core";
-import { sessionProfile, SESSION_PROFILE_LIMITS, SESSION_EVENTS_LIMITS } from "@minu/runtime-core";
+import { sessionProfile, SESSION_PROFILE_LIMITS, SESSION_EVENTS_LIMITS, runtimeInput, RuntimeInputError, RUNTIME_INPUT_LIMITS } from "@minu/runtime-core";
 import { SessionEventLog } from "./session-events.js";
 
 const MAX_INPUT_BYTES = 1024 * 1024;
@@ -21,7 +22,9 @@ export interface PiBridgeServerOptions {
   sessionId: string;
   token: string;
   getStatus(): AgentStatus;
-  send(input: string, operationId: string): Promise<void>;
+  send(input: string, operationId: string, images?: RuntimeImageContent[]): Promise<void>;
+  /** Must reflect the active model; absent adapters reject image input. */
+  supportsImages?(): Promise<boolean>;
   steer?(input: string): Promise<void>;
   interrupt?(): Promise<void>;
   openDiagnostic?(): Promise<void>;
@@ -41,13 +44,16 @@ export interface PiBridgeServer {
   close(): Promise<void>;
 }
 
-async function readJson(request: IncomingMessage): Promise<unknown> {
+async function readJson(request: IncomingMessage, limit = MAX_INPUT_BYTES): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
-  for await (const chunk of request) {
+  for await (const chunk of request.iterator({ destroyOnReturn: false })) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > MAX_INPUT_BYTES) throw new Error("Input exceeds 1 MiB");
+    if (size > limit) {
+      request.resume();
+      throw new RuntimeInputError("Input transport is too large", 413);
+    }
     chunks.push(buffer);
   }
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
@@ -61,23 +67,33 @@ function json(response: ServerResponse, status: number, body: unknown): void {
 export async function createPiBridgeServer(options: PiBridgeServerOptions): Promise<PiBridgeServer> {
   const streams = new Set<ServerResponse>();
   const turns = new Map<string, AgentTurn>();
+  // Only hashes survive dispatch. Do not retain or return image bytes in turn polling.
+  const fingerprints = new Map<string, string>();
   const turnRetentionLimit = options.turnRetentionLimit ?? DEFAULT_TURN_RETENTION_LIMIT;
   if (!Number.isSafeInteger(turnRetentionLimit) || turnRetentionLimit < 1) {
     throw new Error("turnRetentionLimit must be a positive integer");
   }
-  let activeTurnId: string | undefined;
+  // Track executions by object identity: an evicted caller ID can be reused while
+  // an older canceled read with that same ID is still physically outstanding.
+  let activeTurn: AgentTurn | undefined;
+  let dispatchingTurn: AgentTurn | undefined;
   let stopRequested = false;
   let profileReading = false;
   let eventsReading = false;
   const eventLog = options.managedSession ? new SessionEventLog() : undefined;
 
-  const dispatch = async (input: string, operationId: string): Promise<void> => {
+  const assertImageSupport = async (images: RuntimeImageContent[]): Promise<void> => {
+    if (images.length && (await options.supportsImages?.()) !== true) throw new RuntimeInputError("Image input is not supported by this session's active model");
+  };
+
+  const dispatch = async (input: string, operationId: string, images: RuntimeImageContent[] = []): Promise<void> => {
     eventLog?.record("turn_dispatch_requested");
     try {
-      await options.send(input, operationId);
+      await options.send(input, operationId, images.length ? images : undefined);
       eventLog?.record("turn_dispatch_returned");
     } catch (error) {
       eventLog?.record("turn_dispatch_failed");
+      if (images.length && !(error instanceof SessionBusyError)) throw new Error("Image dispatch failed");
       throw error;
     }
   };
@@ -92,6 +108,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
     for (const [id, candidate] of turns) {
       if (candidate.status === "running") continue;
       turns.delete(id);
+      fingerprints.delete(id);
       if (turns.size <= turnRetentionLimit) return;
     }
   };
@@ -102,12 +119,16 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
     && left.timestamp === right.timestamp
     && left.toolName === right.toolName;
 
-  const runTurn = async (turn: AgentTurn): Promise<void> => {
+  const runTurn = async (turn: AgentTurn, images: RuntimeImageContent[]): Promise<void> => {
+    const interrupted = () => turn.status === "interrupted";
     try {
       const before = await options.getMessages?.() ?? [];
-      await dispatch(turn.input, turn.id);
-      if (turn.status === "interrupted") return;
+      if (interrupted()) return;
+      dispatchingTurn = turn;
+      await dispatch(turn.input, turn.id, images);
+      if (interrupted()) return;
       const after = await options.getMessages?.() ?? [];
+      if (interrupted()) return;
       let sharedPrefix = 0;
       while (sharedPrefix < before.length && sharedPrefix < after.length
         && messageEquals(before[sharedPrefix]!, after[sharedPrefix]!)) sharedPrefix += 1;
@@ -121,13 +142,14 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       turn.updatedAt = new Date().toISOString();
       eventLog?.record("turn_completed");
     } catch (error) {
-      if (turn.status === "interrupted") return;
+      if (interrupted()) return;
       turn.status = "failed";
-      turn.error = error instanceof Error ? error.message : String(error);
+      turn.error = images.length ? "Image turn failed" : error instanceof Error ? error.message : String(error);
       turn.updatedAt = new Date().toISOString();
       eventLog?.record("turn_failed");
     } finally {
-      if (activeTurnId === turn.id) activeTurnId = undefined;
+      if (activeTurn === turn) activeTurn = undefined;
+      if (dispatchingTurn === turn) dispatchingTurn = undefined;
       pruneTurns();
     }
   };
@@ -149,6 +171,12 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       observeBusy = request.method === "POST" && ["/turns", "/send", "/steer", "/interrupt", "/stop"].includes(url.pathname);
       if (request.method === "GET" && url.pathname === "/status") {
         json(response, 200, { sessionId: options.sessionId, status: options.getStatus() });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname === "/input-capabilities") {
+        response.setHeader("cache-control", "no-store");
+        json(response, 200, { capabilities: { version: 1, images: (await options.supportsImages?.()) === true } });
         return;
       }
 
@@ -279,42 +307,47 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       }
 
       if (request.method === "POST" && url.pathname === "/turns") {
-        const body = (await readJson(request)) as { turnId?: unknown; input?: unknown };
+        const body = (await readJson(request, RUNTIME_INPUT_LIMITS.transportBytes)) as { turnId?: unknown; input?: unknown; images?: unknown };
         if (typeof body.turnId !== "string" || !body.turnId.trim() || body.turnId.length > 512) {
           json(response, 400, { error: "turnId must be a non-empty string of at most 512 characters" });
           return;
         }
-        if (typeof body.input !== "string" || body.input.trim().length === 0) {
-          json(response, 400, { error: "input must be a non-empty string" });
-          return;
-        }
-        const existing = turns.get(body.turnId);
-        if (existing) {
-          if (existing.input !== body.input) {
+        const content = runtimeInput(body.input, body.images);
+        const fingerprint = createHash("sha256").update(JSON.stringify(content)).digest("hex");
+        const turnId = body.turnId;
+        const replay = (): boolean => {
+          const existing = turns.get(turnId);
+          if (!existing) return false;
+          if (fingerprints.get(turnId) !== fingerprint) {
             eventLog?.record("turn_rejected_conflict");
             json(response, 409, { error: "turnId is already associated with different input" });
-            return;
+          } else {
+            eventLog?.record("turn_reused");
+            json(response, 200, { turn: copyTurn(existing) });
           }
-          eventLog?.record("turn_reused");
-          json(response, 200, { turn: copyTurn(existing) });
-          return;
-        }
+          return true;
+        };
+        if (replay()) return;
+        await assertImageSupport(content.images);
+        if (replay()) return;
+        // Recheck admission after the model capability read, including pending-body races.
         if (stopRequested) throw new SessionBusyError("Pi session is stopping");
-        if (options.getStatus() !== "idle" || activeTurnId) {
+        if (options.getStatus() !== "idle" || activeTurn) {
           throw new SessionBusyError("Pi session is working");
         }
         const timestamp = new Date().toISOString();
         const turn: AgentTurn = {
           id: body.turnId,
           status: "running",
-          input: body.input,
+          input: content.input,
           createdAt: timestamp,
           updatedAt: timestamp,
         };
         turns.set(turn.id, turn);
-        activeTurnId = turn.id;
+        fingerprints.set(turn.id, fingerprint);
+        activeTurn = turn;
         eventLog?.record("turn_accepted");
-        void runTurn(turn);
+        void runTurn(turn, content.images);
         json(response, 202, { turn: copyTurn(turn) });
         return;
       }
@@ -325,19 +358,19 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           json(response, 405, { error: "This Runtime adapter does not support interruption" });
           return;
         }
-        if (options.getStatus() !== "working") {
+        const turn = activeTurn;
+        const preparing = turn?.status === "running" && dispatchingTurn !== turn;
+        if (!preparing && options.getStatus() !== "working") {
           throw new SessionBusyError("Pi session must be working to interrupt it");
         }
         eventLog?.record("interrupt_requested");
-        try { await options.interrupt(); }
+        try { if (!preparing) await options.interrupt(); }
         catch (error) { eventLog?.record("interrupt_failed"); throw error; }
         eventLog?.record("interrupt_acknowledged");
-        if (activeTurnId) {
-          const turn = turns.get(activeTurnId);
-          if (turn) {
-            turn.status = "interrupted";
-            turn.updatedAt = new Date().toISOString();
-          }
+        if (turn) {
+          turn.status = "interrupted";
+          turn.updatedAt = new Date().toISOString();
+          if (preparing && activeTurn === turn) activeTurn = undefined;
         }
         json(response, 202, { status: "interrupting" });
         return;
@@ -355,17 +388,16 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
 
       if (request.method === "POST" && url.pathname === "/send") {
         if (stopRequested) throw new SessionBusyError("Pi session is stopping");
-        if (options.getStatus() !== "idle" || activeTurnId) {
+        if (options.getStatus() !== "idle" || activeTurn) {
           throw new SessionBusyError("Pi session is working");
         }
-        const body = (await readJson(request)) as { input?: unknown };
-        if (typeof body.input !== "string" || body.input.trim().length === 0) {
-          json(response, 400, { error: "input must be a non-empty string" });
-          return;
-        }
+        const body = (await readJson(request, RUNTIME_INPUT_LIMITS.transportBytes)) as { input?: unknown; images?: unknown };
+        const content = runtimeInput(body.input, body.images);
+        await assertImageSupport(content.images);
         if (stopRequested) throw new SessionBusyError("Pi session is stopping");
+        if (options.getStatus() !== "idle" || activeTurn) throw new SessionBusyError("Pi session is working");
         const operationId = randomUUID();
-        await dispatch(body.input, operationId);
+        await dispatch(content.input, operationId, content.images);
         json(response, 200, { operationId, status: "completed" });
         return;
       }
@@ -379,7 +411,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           json(response, 202, { status: "stopping" });
           return;
         }
-        if (options.stopRequiresIdle && (options.getStatus() !== "idle" || activeTurnId)) {
+        if (options.stopRequiresIdle && (options.getStatus() !== "idle" || activeTurn)) {
           throw new SessionBusyError("A working Pi session cannot be stopped for suspend or destroy");
         }
         stopRequested = true;
@@ -392,7 +424,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       json(response, 404, { error: "Not found" });
     } catch (error) {
       if (observeBusy && error instanceof SessionBusyError) eventLog?.record("request_rejected_busy");
-      const status = error instanceof SessionBusyError ? 409 : 500;
+      const status = error instanceof SessionBusyError ? 409 : error instanceof RuntimeInputError ? error.status : 500;
       json(response, status, { error: error instanceof Error ? error.message : String(error) });
     }
   });
