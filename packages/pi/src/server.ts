@@ -74,6 +74,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
     throw new Error("turnRetentionLimit must be a positive integer");
   }
   let activeTurnId: string | undefined;
+  let dispatchingTurnId: string | undefined;
   let stopRequested = false;
   let profileReading = false;
   let eventsReading = false;
@@ -117,11 +118,15 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
     && left.toolName === right.toolName;
 
   const runTurn = async (turn: AgentTurn, images: RuntimeImageContent[]): Promise<void> => {
+    const interrupted = () => turn.status === "interrupted";
     try {
       const before = await options.getMessages?.() ?? [];
+      if (interrupted()) return;
+      dispatchingTurnId = turn.id;
       await dispatch(turn.input, turn.id, images);
-      if (turn.status === "interrupted") return;
+      if (interrupted()) return;
       const after = await options.getMessages?.() ?? [];
+      if (interrupted()) return;
       let sharedPrefix = 0;
       while (sharedPrefix < before.length && sharedPrefix < after.length
         && messageEquals(before[sharedPrefix]!, after[sharedPrefix]!)) sharedPrefix += 1;
@@ -135,13 +140,14 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       turn.updatedAt = new Date().toISOString();
       eventLog?.record("turn_completed");
     } catch (error) {
-      if (turn.status === "interrupted") return;
+      if (interrupted()) return;
       turn.status = "failed";
       turn.error = images.length ? "Image turn failed" : error instanceof Error ? error.message : String(error);
       turn.updatedAt = new Date().toISOString();
       eventLog?.record("turn_failed");
     } finally {
       if (activeTurnId === turn.id) activeTurnId = undefined;
+      if (dispatchingTurnId === turn.id) dispatchingTurnId = undefined;
       pruneTurns();
     }
   };
@@ -350,19 +356,19 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           json(response, 405, { error: "This Runtime adapter does not support interruption" });
           return;
         }
-        if (options.getStatus() !== "working") {
+        const turn = activeTurnId ? turns.get(activeTurnId) : undefined;
+        const preparing = turn?.status === "running" && dispatchingTurnId !== turn.id;
+        if (!preparing && options.getStatus() !== "working") {
           throw new SessionBusyError("Pi session must be working to interrupt it");
         }
         eventLog?.record("interrupt_requested");
-        try { await options.interrupt(); }
+        try { if (!preparing) await options.interrupt(); }
         catch (error) { eventLog?.record("interrupt_failed"); throw error; }
         eventLog?.record("interrupt_acknowledged");
-        if (activeTurnId) {
-          const turn = turns.get(activeTurnId);
-          if (turn) {
-            turn.status = "interrupted";
-            turn.updatedAt = new Date().toISOString();
-          }
+        if (turn) {
+          turn.status = "interrupted";
+          turn.updatedAt = new Date().toISOString();
+          if (preparing && activeTurnId === turn.id) activeTurnId = undefined;
         }
         json(response, 202, { status: "interrupting" });
         return;

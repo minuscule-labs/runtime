@@ -79,6 +79,33 @@ test("bridge carries images beyond the old text transport limit and sanitizes di
   } finally { await bridge.close(); }
 });
 
+test("accepted turns can be canceled during transcript preparation without native dispatch", async () => {
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let reads = 0;
+  let interrupts = 0;
+  const sent: string[] = [];
+  const messages = [{ role: "assistant" as const, content: "before" }];
+  const bridge = await createPiBridgeServer({ sessionId: "preparing", token: "test", getStatus: () => "idle",
+    async getMessages() { if (reads++ === 0) await held; return [...messages]; },
+    async send(input) { sent.push(input); messages.push({ role: "assistant", content: "done" }); },
+    async interrupt() { interrupts += 1; },
+  });
+  const request = (path: string, body?: unknown) => fetch(`${bridge.endpoint}${path}`, {
+    headers: { authorization: "Bearer test" }, ...(body ? { method: "POST", body: JSON.stringify(body) } : {}),
+  });
+  try {
+    assert.equal((await request("/turns", { turnId: "first", input: "canceled" })).status, 202);
+    assert.equal((await request("/interrupt", {})).status, 202);
+    assert.equal((await (await request("/turns/first")).json() as { turn: { status: string } }).turn.status, "interrupted");
+    assert.equal(interrupts, 0, "A pre-dispatch turn does not require a native interrupt");
+    assert.equal((await request("/turns", { turnId: "next", input: "next" })).status, 202);
+    release();
+    await request("/turns/first"); // Cross the server event loop after releasing the stale preparation.
+    assert.deepEqual(sent, ["next"]);
+  } finally { release(); await bridge.close(); }
+});
+
 test("legacy/attached bridges reject images before dispatch", async () => {
   let calls = 0;
   const bridge = await createPiBridgeServer({ sessionId: "legacy", token: "test", getStatus: () => "idle", async send() { calls += 1; } });

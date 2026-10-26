@@ -98,6 +98,8 @@ The optional authenticated live query is separate from launch discovery and exis
 
 Client and bridge validate canonical base64, MIME and bounds: four images, 10 MiB each, 20 MiB combined and 1 MiB text. The JSON transport is separately capped at 34 MiB to accommodate base64 and text escaping. Runtime does not decode/resize pixels or fetch URLs; the consumer validates image containers and decides what to omit before submission. Owned Pi maps these parts to the native RPC `prompt.images` field, relying on the harness/provider for normal pixel processing.
 
+Accepted turns remain cancellable while transcript or final model-capability reads are pending. Before native dispatch, cancellation settles locally without sending a native abort; a late read is fenced from dispatching or changing a subsequent turn. Once native work is dispatched, the existing native interruption/acknowledgment semantics apply, without claiming to undo side effects.
+
 Turn identity covers text plus ordered image bytes/MIME. Matching concurrent/repeated requests reuse one turn; changed pixels or ordering conflict. Only a digest is retained for idempotency, in the same bounded retention window as turns; turn polling, normalized `messages`, structured events and image-dispatch errors do not return pixels. As with any native prompt, **Pi may persist the image parts in its owner-private transcript** and submit them to the selected model provider. Transcript resume preserves them; Runtime is not an independent attachment store and makes no secure-erasure claim.
 
 ## Personas

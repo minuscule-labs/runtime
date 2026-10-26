@@ -19,6 +19,7 @@ import { createPiBridgeServer, SessionBusyError, type PiBridgeServer } from "./s
 
 interface PendingTurn {
   operationId: string;
+  dispatched: boolean;
   resolve(): void;
   reject(error: Error): void;
 }
@@ -140,10 +141,11 @@ async function supportsImages(): Promise<boolean> {
 }
 
 async function inject(input: string, operationId: string, images?: RuntimeImageContent[]): Promise<void> {
-  if (images?.length && !(await supportsImages())) throw new Error("Image input is not supported by the active Pi model");
   if (!rpc || status !== "idle" || pending) throw new SessionBusyError("Pi session is working");
   return new Promise<void>((resolve, reject) => {
-    pending = { operationId, resolve, reject };
+    // Reserve the operation before any capability await so cancellation can own it.
+    const turn: PendingTurn = { operationId, dispatched: false, resolve, reject };
+    pending = turn;
     publishStatus("working");
     bridge?.publish({
       type: "turn_started",
@@ -151,7 +153,15 @@ async function inject(input: string, operationId: string, images?: RuntimeImageC
       operationId,
       timestamp: new Date().toISOString(),
     });
-    void rpc!.request("prompt", { message: input, ...(images?.length ? { images } : {}) }).catch((error) => {
+    void (async () => {
+      const supported = !images?.length || await supportsImages();
+      // An interrupted preparation may return after another turn has started.
+      if (pending !== turn) return;
+      if (!supported) throw new Error("Image input is not supported by the active Pi model");
+      turn.dispatched = true;
+      await rpc!.request("prompt", { message: input, ...(images?.length ? { images } : {}) });
+    })().catch((error) => {
+      if (pending !== turn) return;
       pending = undefined;
       publishStatus("idle");
       reject(error instanceof Error ? error : new Error(String(error)));
@@ -160,7 +170,7 @@ async function inject(input: string, operationId: string, images?: RuntimeImageC
 }
 
 async function steer(input: string): Promise<void> {
-  if (!rpc || status !== "working" || !pending) {
+  if (!rpc || status !== "working" || !pending?.dispatched) {
     throw new SessionBusyError("Pi session must be working to steer it");
   }
   await rpc.request("steer", { message: input });
@@ -169,6 +179,13 @@ async function steer(input: string): Promise<void> {
 async function interrupt(): Promise<void> {
   if (!rpc || status !== "working") {
     throw new SessionBusyError("Pi session must be working to interrupt it");
+  }
+  if (pending && !pending.dispatched) {
+    const canceled = pending;
+    pending = undefined;
+    publishStatus("idle");
+    canceled.resolve();
+    return;
   }
   await rpc.request("abort");
 }
