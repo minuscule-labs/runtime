@@ -73,8 +73,10 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
   if (!Number.isSafeInteger(turnRetentionLimit) || turnRetentionLimit < 1) {
     throw new Error("turnRetentionLimit must be a positive integer");
   }
-  let activeTurnId: string | undefined;
-  let dispatchingTurnId: string | undefined;
+  // Track executions by object identity: an evicted caller ID can be reused while
+  // an older canceled read with that same ID is still physically outstanding.
+  let activeTurn: AgentTurn | undefined;
+  let dispatchingTurn: AgentTurn | undefined;
   let stopRequested = false;
   let profileReading = false;
   let eventsReading = false;
@@ -122,7 +124,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
     try {
       const before = await options.getMessages?.() ?? [];
       if (interrupted()) return;
-      dispatchingTurnId = turn.id;
+      dispatchingTurn = turn;
       await dispatch(turn.input, turn.id, images);
       if (interrupted()) return;
       const after = await options.getMessages?.() ?? [];
@@ -146,8 +148,8 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
       turn.updatedAt = new Date().toISOString();
       eventLog?.record("turn_failed");
     } finally {
-      if (activeTurnId === turn.id) activeTurnId = undefined;
-      if (dispatchingTurnId === turn.id) dispatchingTurnId = undefined;
+      if (activeTurn === turn) activeTurn = undefined;
+      if (dispatchingTurn === turn) dispatchingTurn = undefined;
       pruneTurns();
     }
   };
@@ -330,7 +332,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
         if (replay()) return;
         // Recheck admission after the model capability read, including pending-body races.
         if (stopRequested) throw new SessionBusyError("Pi session is stopping");
-        if (options.getStatus() !== "idle" || activeTurnId) {
+        if (options.getStatus() !== "idle" || activeTurn) {
           throw new SessionBusyError("Pi session is working");
         }
         const timestamp = new Date().toISOString();
@@ -343,7 +345,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
         };
         turns.set(turn.id, turn);
         fingerprints.set(turn.id, fingerprint);
-        activeTurnId = turn.id;
+        activeTurn = turn;
         eventLog?.record("turn_accepted");
         void runTurn(turn, content.images);
         json(response, 202, { turn: copyTurn(turn) });
@@ -356,8 +358,8 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           json(response, 405, { error: "This Runtime adapter does not support interruption" });
           return;
         }
-        const turn = activeTurnId ? turns.get(activeTurnId) : undefined;
-        const preparing = turn?.status === "running" && dispatchingTurnId !== turn.id;
+        const turn = activeTurn;
+        const preparing = turn?.status === "running" && dispatchingTurn !== turn;
         if (!preparing && options.getStatus() !== "working") {
           throw new SessionBusyError("Pi session must be working to interrupt it");
         }
@@ -368,7 +370,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
         if (turn) {
           turn.status = "interrupted";
           turn.updatedAt = new Date().toISOString();
-          if (preparing && activeTurnId === turn.id) activeTurnId = undefined;
+          if (preparing && activeTurn === turn) activeTurn = undefined;
         }
         json(response, 202, { status: "interrupting" });
         return;
@@ -386,14 +388,14 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
 
       if (request.method === "POST" && url.pathname === "/send") {
         if (stopRequested) throw new SessionBusyError("Pi session is stopping");
-        if (options.getStatus() !== "idle" || activeTurnId) {
+        if (options.getStatus() !== "idle" || activeTurn) {
           throw new SessionBusyError("Pi session is working");
         }
         const body = (await readJson(request, RUNTIME_INPUT_LIMITS.transportBytes)) as { input?: unknown; images?: unknown };
         const content = runtimeInput(body.input, body.images);
         await assertImageSupport(content.images);
         if (stopRequested) throw new SessionBusyError("Pi session is stopping");
-        if (options.getStatus() !== "idle" || activeTurnId) throw new SessionBusyError("Pi session is working");
+        if (options.getStatus() !== "idle" || activeTurn) throw new SessionBusyError("Pi session is working");
         const operationId = randomUUID();
         await dispatch(content.input, operationId, content.images);
         json(response, 200, { operationId, status: "completed" });
@@ -409,7 +411,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           json(response, 202, { status: "stopping" });
           return;
         }
-        if (options.stopRequiresIdle && (options.getStatus() !== "idle" || activeTurnId)) {
+        if (options.stopRequiresIdle && (options.getStatus() !== "idle" || activeTurn)) {
           throw new SessionBusyError("A working Pi session cannot be stopped for suspend or destroy");
         }
         stopRequested = true;
