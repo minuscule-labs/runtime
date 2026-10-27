@@ -51,6 +51,8 @@ const modelId = optionalArgument("--model-id");
 const reasoningLevel = optionalArgument("--reasoning-level") as AgentReasoningLevel | undefined;
 const disableSkillDiscovery = process.argv.includes("--disable-skill-discovery");
 const skillPaths = argumentsFor("--skill-path");
+const skillIds = argumentsFor("--skill-id");
+const extensionPaths = argumentsFor("--extension-path");
 const runtimeSessionId = optionalArgument("--runtime-session-id");
 const runtimeOwnerId = optionalArgument("--runtime-owner-id");
 const resumeSessionFile = optionalArgument("--resume-session-file");
@@ -218,10 +220,12 @@ async function main(): Promise<void> {
     sessionFile: resumeSessionFile,
     disableSkillDiscovery,
     skillPaths,
+    extensionPaths,
   });
   rpc.onEvent(handleEvent);
   rpc.onExit((_code, _signal) => {
-    if (!shuttingDown) void shutdown(1);
+    // During startup, let the rejected RPC request report failure through readyFile.
+    if (!shuttingDown && sessionId) void shutdown(1);
   });
 
   if (modelProvider && modelId) {
@@ -244,6 +248,22 @@ async function main(): Promise<void> {
 
   const state = (await rpc.request("get_state")) as Record<string, unknown>;
   if (typeof state.sessionId !== "string") throw new Error("Pi RPC did not return a session id");
+  if (disableSkillDiscovery) {
+    // --no-skills does not exclude extension-package or resources_discover skills.
+    const available = await rpc.request("get_commands") as { commands?: unknown[] } | undefined;
+    const observed = Array.isArray(available?.commands)
+      ? available.commands.filter((command) => command && typeof command === "object"
+        && (command as Record<string, unknown>).source === "skill")
+        .map((command) => (command as Record<string, unknown>).name)
+      : undefined;
+    const expected = new Set(skillIds);
+    if (!observed || observed.length !== expected.size
+      || observed.some((id) => typeof id !== "string" || !expected.has(id))
+      || new Set(observed).size !== expected.size) {
+      await log(`Pi skill selection mismatch: ${JSON.stringify({ expected: skillIds, observed })}\n`);
+      throw new Error("Pi could not enforce the selected skills; check skills supplied by configured extensions");
+    }
+  }
   sessionId = state.sessionId;
   status = state.isStreaming === true ? "working" : "idle";
   registrationId = runtimeSessionId ?? sessionId;
@@ -300,7 +320,7 @@ process.on("SIGTERM", () => void shutdown(143));
 
 main().catch(async (error) => {
   await log(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`).catch(() => {});
-  await writeFile(readyFile, `${JSON.stringify({ error: error instanceof Error ? error.message : String(error) })}\n`).catch(
+  await writeFile(readyFile, `${JSON.stringify({ error: `${error instanceof Error ? error.message : String(error)}. See ${logFile}` })}\n`).catch(
     () => {},
   );
   await shutdown(1);

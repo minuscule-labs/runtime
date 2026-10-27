@@ -132,11 +132,26 @@ export interface PiAgentRuntimeOptions {
   controlRequestTimeoutMs?: number;
   startTimeoutMs?: number;
   workerPath?: string;
+  /** Explicit Pi extensions; discovery remains disabled. Relative paths use the host's cwd. */
+  extensionPaths?: string[];
 }
 
 export class PiAgentRuntime implements AgentRuntime {
   private readonly inspectionReads = new Set<string>();
+  private readonly extensionPaths: string[];
+
   constructor(private readonly options: PiAgentRuntimeOptions = {}) {
+    if (options.extensionPaths !== undefined && (!Array.isArray(options.extensionPaths)
+      || options.extensionPaths.length > 100
+      || Array.from(options.extensionPaths).some((path) => typeof path !== "string" || !path.trim()
+        || path !== path.trim() || path.length > 4_096 || path.includes("\0")))) {
+      throw new TypeError("extensionPaths must contain at most 100 non-empty extension paths");
+    }
+    this.extensionPaths = (options.extensionPaths ?? []).map((path) =>
+      path.startsWith("builtin:") ? path : resolve(path));
+    if (new Set(this.extensionPaths).size !== this.extensionPaths.length) {
+      throw new TypeError("extensionPaths must not contain duplicate extensions");
+    }
     for (const [name, value] of Object.entries({
       requestTimeoutMs: options.requestTimeoutMs,
       controlRequestTimeoutMs: options.controlRequestTimeoutMs,
@@ -149,7 +164,9 @@ export class PiAgentRuntime implements AgentRuntime {
   }
 
   async capabilities(config: Pick<AgentStartConfig, "cwd"> = {}): Promise<RuntimeLaunchCapabilities> {
-    const rpc = new PiRpcProcess(resolve(config.cwd ?? process.cwd()), () => {});
+    const rpc = new PiRpcProcess(resolve(config.cwd ?? process.cwd()), () => {}, {
+      extensionPaths: this.extensionPaths,
+    });
     try {
       const available = (await rpc.request("get_available_models")) as { models?: unknown[] };
       const models = (available.models ?? []).flatMap((value) => {
@@ -237,7 +254,7 @@ export class PiAgentRuntime implements AgentRuntime {
     const cwd = resolve(config.cwd ?? process.cwd());
     let skillPaths: string[] | undefined;
     if (config.skillIds !== undefined) {
-      const discovery = new PiRpcProcess(cwd, () => {});
+      const discovery = new PiRpcProcess(cwd, () => {}, { extensionPaths: this.extensionPaths });
       try {
         const skills = await discoverSkills(discovery);
         const byId = new Map(skills.map((skill) => [skill.id, skill.path]));
@@ -260,6 +277,7 @@ export class PiAgentRuntime implements AgentRuntime {
       ? resolve(this.options.workerPath)
       : fileURLToPath(new URL("./owned-worker.js", import.meta.url));
     const workerArgs = [worker, "--cwd", cwd, "--ready-file", readyFile, "--log-file", logFile];
+    for (const path of this.extensionPaths) workerArgs.push("--extension-path", path);
     if (managed) {
       workerArgs.push("--runtime-session-id", managed.managedSessionId, "--runtime-owner-id", managed.ownerId);
       if (managed.sessionFile) workerArgs.push("--resume-session-file", managed.sessionFile);
@@ -278,6 +296,7 @@ export class PiAgentRuntime implements AgentRuntime {
     if (config.reasoningLevel) workerArgs.push("--reasoning-level", config.reasoningLevel);
     if (skillPaths !== undefined) {
       workerArgs.push("--disable-skill-discovery");
+      for (const id of config.skillIds ?? []) workerArgs.push("--skill-id", id);
       for (const path of skillPaths) workerArgs.push("--skill-path", path);
     }
     const child = spawn(process.execPath, workerArgs, {

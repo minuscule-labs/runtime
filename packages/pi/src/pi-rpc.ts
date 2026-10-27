@@ -10,6 +10,7 @@ export interface PiRpcProcessOptions {
   appendSystemPromptFile?: string;
   disableSkillDiscovery?: boolean;
   skillPaths?: string[];
+  extensionPaths?: string[];
   command?: string;
 }
 
@@ -25,12 +26,15 @@ export class PiRpcProcess {
   private buffer = "";
   private readonly decoder = new StringDecoder("utf8");
   private eventHandler: (event: RpcEvent) => void = () => {};
+  private receivedResponse = false;
+  private startupError?: Error;
 
-  constructor(cwd: string, onStderr: (text: string) => void, options: PiRpcProcessOptions = {}) {
+  constructor(cwd: string, private readonly onStderr: (text: string) => void, options: PiRpcProcessOptions = {}) {
     if (options.systemPromptFile !== undefined && options.appendSystemPromptFile !== undefined) {
       throw new Error("systemPromptFile and appendSystemPromptFile cannot both be set");
     }
     const args = ["--approve", "--mode", "rpc", "--no-extensions"];
+    for (const path of options.extensionPaths ?? []) args.push("--extension", path);
     if (options.sessionFile !== undefined) args.push("--session", options.sessionFile);
     if (options.systemPromptFile !== undefined) {
       args.push("--system-prompt", options.systemPromptFile);
@@ -49,9 +53,13 @@ export class PiRpcProcess {
     this.child.stdin.on("error", (error) => this.failAll(error));
     this.child.stderr.on("data", (chunk: Buffer) => onStderr(chunk.toString("utf8")));
     this.child.on("error", (error) => this.failAll(error));
-    this.child.on("exit", (code, signal) =>
-      this.failAll(new Error(`Pi RPC exited (${signal ?? code ?? "unknown"})`)),
-    );
+    this.child.on("exit", (code, signal) => {
+      this.startupError ??= new Error(`Pi RPC exited (${signal ?? code ?? "unknown"})`
+        + (!this.receivedResponse && options.extensionPaths?.length
+          ? "; check configured Pi extensions and RPC compatibility"
+          : ""));
+      this.failAll(this.startupError);
+    });
   }
 
   onEvent(handler: (event: RpcEvent) => void): void {
@@ -63,6 +71,7 @@ export class PiRpcProcess {
   }
 
   async request(type: string, fields: Record<string, unknown> = {}, timeoutMs = 15_000): Promise<unknown> {
+    if (this.startupError) throw this.startupError;
     const id = randomUUID();
     const result = new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -108,7 +117,15 @@ export class PiRpcProcess {
   }
 
   private handle(event: RpcEvent): void {
+    if (event.type === "extension_error" && !this.receivedResponse) {
+      this.onStderr(`${JSON.stringify({
+        type: "extension_error", extensionPath: event.extensionPath, event: event.event, error: event.error,
+      })}\n`);
+      this.startupError = new Error("Pi extension initialization failed; check configured extensions and RPC compatibility");
+      this.failAll(this.startupError);
+    }
     if (event.type === "response" && typeof event.id === "string") {
+      this.receivedResponse = true;
       const request = this.pending.get(event.id);
       if (!request) return;
       this.pending.delete(event.id);
