@@ -142,25 +142,9 @@ const session = await runtime.start({
 });
 ```
 
-Omitting `skillIds` preserves the harness's default skill behavior. Supplying an empty array explicitly disables discovered skills for adapters that support selection. The Pi adapter discovers skills from its available-command RPC response, keeps native paths private, revalidates selected ids before launch, and starts the owned process with only those skills. Skill changes require a new session. Because Pi's `--no-skills` does not exclude skills supplied by extension packages or `resources_discover`, the adapter verifies the initialized skill-command set before registering an explicitly restricted worker. Startup/resume fails if that set differs from `skillIds`; Runtime does not silently enable extras or filter instructions after loading. Omitting `skillIds` retains Pi's normal behavior, including extension-provided skills.
+Omitting `skillIds` preserves the harness's default skill behavior. Supplying an empty array explicitly disables discovered skills for adapters that support selection. The Pi adapter discovers skills from its available-command RPC response, keeps native paths private, revalidates selected ids before launch, and starts the owned process with only those skills. Skill changes require a new session.
 
-## Pi extensions
-
-Owned Pi sessions disable automatic extension discovery, including built-in extensions. A host can explicitly load trusted extensions through Pi-adapter configuration without changing the shared `AgentStartConfig` contract:
-
-```ts
-import { PiAgentRuntime } from "@minu/runtime-pi";
-
-const runtime = new PiAgentRuntime({
-  extensionPaths: ["/absolute/path/to/integration.ts"],
-});
-```
-
-The adapter passes each entry to Pi as `--extension` while retaining `--no-extensions`. Omitting `extensionPaths` or supplying `[]` keeps extensions disabled. Entries may be extension files/directories or Pi's `builtin:<name>` identifiers. Relative filesystem paths resolve against the host's working directory when the adapter is constructed, not the agent's working directory. The list is copied and validated at construction; invalid paths, load failures, and startup-hook errors fail discovery/startup rather than silently dropping the extension. Worker startup failures point to its owner-private diagnostic log. Startup-hook details (extension path, hook, and original error) are retained in that bounded log; caller-facing initialization errors remain generic.
-
-The same configured list applies to capability/skill discovery and every worker the adapter starts, including managed-session resume. It is **host policy**, not saved per-session launch configuration: a restarted host must configure its adapter again, and a resumed worker uses that host's current list. Already-running and attached sessions are unchanged. Extensions must support headless RPC; Runtime does not answer extension dialogs or provide a terminal UI. They can execute code during discovery as well as worker startup, so load only trusted extensions with appropriate lifecycle cleanup.
-
-Extension loading is separate from skill selection and does not grant service permissions. Credentials remain in the host service's environment, inherited by its worker and Pi; terminal-only environment variables are not necessarily available to a background service. Runtime does not copy credential values into its launch configuration, catalog, or public diagnostics. Each integration and the external service enforce their own access policy. API fallback, if needed, remains an explicitly authorized workflow, not automatic Runtime behavior.
+Owned Pi workers disable extension discovery and inherit their host's environment. Authorized API workflows can use existing shell tools; credentials must reach the actual host process, not only an interactive terminal. Runtime does not provision secrets or treat Skills as credential grants.
 
 ## Development
 

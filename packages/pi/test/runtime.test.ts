@@ -577,6 +577,8 @@ test("managed Pi sessions preserve owner-scoped identity and transcript across s
   await writeFile(fakePi, `#!/usr/bin/env node
 import { readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
+if (!args.includes("--no-extensions") || args.includes("--extension")) throw new Error("Unexpected extension loading");
+if (process.env.PI_TEST_API_CREDENTIAL !== "fixture-only-api-key") throw new Error("API credential was not inherited");
 const sessionArg = args.indexOf("--session");
 const sessionFile = sessionArg >= 0 ? args[sessionArg + 1] : process.env.PI_SESSION_FILE;
 const runFile = process.env.PI_RUN_COUNT_FILE;
@@ -643,6 +645,7 @@ process.on("SIGTERM", () => process.exit(0));
   process.env.MINU_RUNTIME_DIR = runtimeDirectory;
   process.env.PI_COMMAND = fakePi;
   process.env.PI_RUN_COUNT_FILE = runCountFile;
+  process.env.PI_TEST_API_CREDENTIAL = "fixture-only-api-key";
   const ownerId = "workspace-owner-1";
   const runtime = new PiAgentRuntime();
   try {
@@ -824,6 +827,7 @@ process.on("SIGTERM", () => process.exit(0));
     delete process.env.MINU_RUNTIME_DIR;
     delete process.env.PI_COMMAND;
     delete process.env.PI_RUN_COUNT_FILE;
+    delete process.env.PI_TEST_API_CREDENTIAL;
   }
 });
 
@@ -922,7 +926,9 @@ const args = process.argv.slice(2);
 const promptFlag = args.indexOf("--append-system-prompt");
 const prompt = promptFlag >= 0 ? readFileSync(args[promptFlag + 1], "utf8") : undefined;
 const requests = [];
-const save = () => writeFileSync(process.env.PI_ARGS_FILE, JSON.stringify({ args, prompt, requests }));
+const save = () => writeFileSync(process.env.PI_ARGS_FILE, JSON.stringify({
+  args, prompt, requests, credentialPresent: process.env.PI_TEST_API_CREDENTIAL === "fixture-only-api-key",
+}));
 save();
 let buffer = "";
 const messages = [];
@@ -960,6 +966,7 @@ process.on("SIGTERM", () => process.exit(0));
   process.env.MINU_RUNTIME_DIR = join(directory, "registry");
   process.env.PI_COMMAND = fakePi;
   process.env.PI_ARGS_FILE = argsFile;
+  process.env.PI_TEST_API_CREDENTIAL = "fixture-only-api-key";
   const runtime = new PiAgentRuntime();
   let sessionId: string | undefined;
   try {
@@ -987,10 +994,15 @@ process.on("SIGTERM", () => process.exit(0));
       args: string[];
       prompt?: string;
       requests: Array<Record<string, unknown>>;
+      credentialPresent: boolean;
     };
     const promptIndex = launch.args.indexOf("--append-system-prompt");
     assert.match(launch.args[promptIndex + 1]!, /\.prompt$/);
     assert.equal(launch.prompt, "You are the reviewer persona.");
+    assert.equal(launch.credentialPresent, true);
+    assert.ok(launch.args.includes("--no-extensions"));
+    assert.ok(!launch.args.includes("--extension"));
+    assert.ok(!JSON.stringify(launch).includes("fixture-only-api-key"));
     assert.ok(launch.args.includes("--no-skills"));
     const skillIndex = launch.args.indexOf("--skill");
     assert.equal(launch.args[skillIndex + 1], "/skills/reviewer/SKILL.md");
@@ -1040,11 +1052,18 @@ process.on("SIGTERM", () => process.exit(0));
       runtime.start({ cwd: directory, model: { provider: "openai", id: "missing-model" } }),
       /Pi model is not available/,
     );
+    const withoutSkills = await runtime.start({ cwd: directory, skillIds: [] });
+    sessionId = withoutSkills.id;
+    const emptyLaunch = JSON.parse(await readFile(argsFile, "utf8")) as { args: string[]; credentialPresent: boolean };
+    assert.ok(emptyLaunch.args.includes("--no-skills"));
+    assert.ok(!emptyLaunch.args.includes("--skill"));
+    assert.equal(emptyLaunch.credentialPresent, true);
   } finally {
     if (sessionId) await runtime.stop(sessionId).catch(() => {});
     await rm(directory, { recursive: true, force: true });
     delete process.env.MINU_RUNTIME_DIR;
     delete process.env.PI_COMMAND;
     delete process.env.PI_ARGS_FILE;
+    delete process.env.PI_TEST_API_CREDENTIAL;
   }
 });
