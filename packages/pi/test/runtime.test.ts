@@ -530,21 +530,46 @@ test("registry listing ignores launch markers and isolates corrupt registrations
   }
 });
 
-test("failed Runtime startup terminates its worker", async () => {
+test("failed Runtime startup terminates its worker", { timeout: 10_000 }, async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "minu-runtime-startup-"));
   const worker = join(directory, "worker.mjs");
   const pidFile = join(directory, "pid");
-  await writeFile(worker, `import { writeFileSync } from "node:fs";\nwriteFileSync(process.env.WORKER_PID_FILE, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
+  await writeFile(worker, `import { writeFileSync } from "node:fs";\nawait new Promise((resolve) => setTimeout(resolve, 100));\nwriteFileSync(process.env.WORKER_PID_FILE, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
   process.env.MINU_RUNTIME_DIR = join(directory, "registry");
   process.env.WORKER_PID_FILE = pidFile;
+  // Freeze only the deadline clock; real timers and the child process still run.
+  let now = Date.now();
+  const clock = t.mock.method(Date, "now", () => now);
+  const starting = new PiAgentRuntime({ workerPath: worker, startTimeoutMs: 50 })
+    .start({ cwd: directory }).then(() => undefined, (error: unknown) => error);
+  let pid: number | undefined;
   try {
-    await assert.rejects(
-      new PiAgentRuntime({ workerPath: worker, startTimeoutMs: 50 }).start({ cwd: directory }),
-      /Timed out starting Pi runtime/,
-    );
-    const pid = Number(await readFile(pidFile, "utf8"));
-    assert.throws(() => process.kill(pid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH");
+    const handshakeDeadline = performance.now() + 5_000;
+    while (pid === undefined && performance.now() < handshakeDeadline) {
+      try {
+        const value = Number(await readFile(pidFile, "utf8"));
+        if (Number.isSafeInteger(value) && value > 0) pid = value;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      if (pid === undefined) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(pid !== undefined, "Worker must report its PID before exercising the startup deadline");
+    const workerPid = pid;
+    process.kill(workerPid, 0);
+
+    now += 50;
+    const error = await starting;
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /Timed out starting Pi runtime after 50ms/);
+    assert.throws(() => process.kill(workerPid, 0), (error: NodeJS.ErrnoException) => error.code === "ESRCH");
   } finally {
+    clock.mock.restore();
+    if (pid !== undefined) {
+      try { process.kill(pid, "SIGKILL"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    }
+    await starting;
     await rm(directory, { recursive: true, force: true });
     delete process.env.MINU_RUNTIME_DIR;
     delete process.env.WORKER_PID_FILE;
