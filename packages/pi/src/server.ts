@@ -402,7 +402,15 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
         return;
       }
 
-      if (request.method === "POST" && url.pathname === "/stop") {
+      const recovering = request.method === "POST" && url.pathname === "/managed/stop";
+      if (recovering) {
+        const body = await readJson(request) as { managedSessionId?: unknown; ownerId?: unknown };
+        if (!options.managedSession || body.managedSessionId !== options.managedSession.id || body.ownerId !== options.managedSession.ownerId) {
+          json(response, 403, { error: "Managed session owner does not match" });
+          return;
+        }
+      }
+      if (request.method === "POST" && (url.pathname === "/stop" || recovering)) {
         if (!options.stop) {
           json(response, 405, { error: "Attached Pi sessions cannot be stopped by Runtime" });
           return;
@@ -411,7 +419,7 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           json(response, 202, { status: "stopping" });
           return;
         }
-        if (options.stopRequiresIdle && (options.getStatus() !== "idle" || activeTurn)) {
+        if (!recovering && options.stopRequiresIdle && (options.getStatus() !== "idle" || activeTurn)) {
           throw new SessionBusyError("A working Pi session cannot be stopped for suspend or destroy");
         }
         stopRequested = true;

@@ -145,8 +145,11 @@ export interface AgentRuntime {
   startManaged?(config: AgentStartConfig, ownerId: string): Promise<ManagedAgentSession>;
   /** Stop its worker while preserving owner-scoped resume material. */
   suspend?(managedSessionId: string, ownerId: string): Promise<void>;
+  /** Explicit recovery: terminate the exact owner's worker, even if busy, and confirm exit.
+   * Preserves resume material; never resumes or replaces the session. */
+  forceStopManaged?(managedSessionId: string, ownerId: string): Promise<void>;
   /** Reopen the same persisted transcript; repeated calls return the active session. */
-  resume?(managedSessionId: string, ownerId: string): Promise<ManagedAgentSession>;
+  resume?(managedSessionId: string, ownerId: string, options?: { allowStopped?: boolean }): Promise<ManagedAgentSession>;
   /** Stop the worker and discard Runtime resume metadata without deleting the transcript. */
   destroy?(managedSessionId: string, ownerId: string): Promise<void>;
   /** Enumerate only sessions belonging to the exact owner scope. */

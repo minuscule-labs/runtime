@@ -26,6 +26,8 @@ import type {
 } from "@minu/runtime-core";
 import { sessionProfile, SESSION_PROFILE_LIMITS, sessionEvents, SESSION_EVENTS_LIMITS, runtimeInput } from "@minu/runtime-core";
 import { PiRpcProcess } from "./pi-rpc.js";
+import { processGroupExists, terminateManagedWorker } from "./worker-recovery.js";
+import { removeRegistration } from "./registry.js";
 import { inspectRegistration, listRegistrations, readRegistration, registryDirectory, type PiSessionRegistration } from "./registry.js";
 import {
   createManagedSessionManifest,
@@ -280,8 +282,10 @@ export class PiAgentRuntime implements AgentRuntime {
       workerArgs.push("--disable-skill-discovery");
       for (const path of skillPaths) workerArgs.push("--skill-path", path);
     }
+    const isolated = Boolean(managed) && process.platform !== "win32";
+    if (isolated) workerArgs.push("--isolated-process-group");
     const child = spawn(process.execPath, workerArgs, {
-      detached: false,
+      detached: isolated,
       stdio: "ignore",
       env: process.env,
     });
@@ -303,7 +307,16 @@ export class PiAgentRuntime implements AgentRuntime {
     });
     const timeoutMs = this.options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
     let started = false;
+    void failed.catch(() => {});
     try {
+      if (managed) {
+        const manifest = await readManagedSessionManifest(managed.managedSessionId, managed.ownerId);
+        if (!manifest || !child.pid) throw new Error("Managed worker launch lost its manifest");
+        manifest.workerPid = child.pid;
+        manifest.workerProcessGroup = isolated ? child.pid : undefined;
+        manifest.updatedAt = new Date().toISOString();
+        await writeManagedSessionManifest(manifest);
+      }
       const ready = (async () => {
         const deadline = Date.now() + timeoutMs;
         while (!cancelled && Date.now() < deadline) {
@@ -365,15 +378,23 @@ export class PiAgentRuntime implements AgentRuntime {
     return undefined;
   }
 
-  async resume(managedSessionId: string, ownerId: string): Promise<ManagedAgentSession> {
+  async resume(managedSessionId: string, ownerId: string, options?: { allowStopped?: boolean }): Promise<ManagedAgentSession> {
     validateManagedSessionIdentity(managedSessionId, ownerId);
     return withManagedSessionLock(managedSessionId, ownerId, async () => {
       const manifest = await readManagedSessionManifest(managedSessionId, ownerId);
       if (!manifest || manifest.state === "destroying") {
         throw new ManagedSessionNotFoundError("Runtime-managed session is not available for this owner");
       }
+      if (manifest.requiresExplicitResume && !options?.allowStopped) {
+        throw new ManagedSessionBusyError("Runtime session was manually stopped; explicit resume is required");
+      }
       const active = await this.activeManagedRegistration(manifest, ownerId);
       if (active) {
+        if (manifest.requiresExplicitResume) {
+          delete manifest.requiresExplicitResume;
+          manifest.updatedAt = new Date().toISOString();
+          await writeManagedSessionManifest(manifest);
+        }
         return { id: managedSessionId, runtime: "pi", ownership: "owned", cwd: active.cwd, ownerId };
       }
       if (!manifest.sessionFile) {
@@ -389,6 +410,12 @@ export class PiAgentRuntime implements AgentRuntime {
           ownerId,
           sessionFile: manifest.sessionFile,
         });
+        if (manifest.requiresExplicitResume) {
+          const latest = await readManagedSessionManifest(managedSessionId, ownerId);
+          if (!latest) throw new Error("Managed session disappeared during resume");
+          delete latest.requiresExplicitResume;
+          await writeManagedSessionManifest(latest);
+        }
         return { ...session, id: managedSessionId, ownerId, ownership: "owned" };
       } catch (error) {
         const latest = await readManagedSessionManifest(managedSessionId, ownerId).catch(() => undefined);
@@ -399,6 +426,56 @@ export class PiAgentRuntime implements AgentRuntime {
         }
         throw error;
       }
+    });
+  }
+
+  async forceStopManaged(managedSessionId: string, ownerId: string): Promise<void> {
+    validateManagedSessionIdentity(managedSessionId, ownerId);
+    return withManagedSessionLock(managedSessionId, ownerId, async () => {
+      const manifest = await readManagedSessionManifest(managedSessionId, ownerId);
+      if (!manifest || manifest.state === "destroying") {
+        throw new ManagedSessionNotFoundError("Runtime-managed session is not available for this owner");
+      }
+      const registration = await inspectRegistration(managedSessionId);
+      if (registration && (registration.ownerId !== ownerId || registration.pid !== manifest.workerPid)) {
+        throw new ManagedSessionNotFoundError("Runtime-managed worker ownership does not match");
+      }
+      const previousState = manifest.state;
+      manifest.state = "suspending";
+      manifest.requiresExplicitResume = true;
+      manifest.updatedAt = new Date().toISOString();
+      await writeManagedSessionManifest(manifest);
+      if (!registration && !manifest.workerProcessGroup && manifest.workerPid
+        && !managedWorkerProcessExists(manifest.workerPid) && previousState !== "suspended") {
+        // A dead legacy bridge does not prove its native writer also exited.
+        throw new Error("Legacy Runtime worker descendants cannot be verified; session remains fenced");
+      }
+      if (registration) {
+        // Bypass normal idle admission, not ownership. Do not depend on Pi RPC/status.
+        await fetch(`${registration.endpoint}/managed/stop`, {
+          method: "POST",
+          redirect: "error",
+          headers: { authorization: `Bearer ${registration.token}`, "content-type": "application/json" },
+          body: JSON.stringify({ managedSessionId, ownerId }),
+          signal: AbortSignal.timeout(2_000),
+        }).then((response) => response.body?.cancel()).catch(() => {});
+      }
+      const alive = () => manifest.workerProcessGroup
+        ? processGroupExists(manifest.workerProcessGroup)
+        : Boolean(manifest.workerPid && managedWorkerProcessExists(manifest.workerPid));
+      if (registration) {
+        const deadline = Date.now() + 7_000;
+        while (alive() && Date.now() < deadline) await delay(50);
+      }
+      if (alive()) await terminateManagedWorker(manifest, resolve(this.options.workerPath ?? fileURLToPath(new URL("./owned-worker.js", import.meta.url))));
+      if (alive()) throw new Error("Runtime worker exit could not be confirmed");
+      // Stop succeeds even if resume material is invalid. Resume validates it separately.
+      await removeRegistration(managedSessionId);
+      delete manifest.workerPid;
+      delete manifest.workerProcessGroup;
+      manifest.state = "suspended";
+      manifest.updatedAt = new Date().toISOString();
+      await writeManagedSessionManifest(manifest);
     });
   }
 
