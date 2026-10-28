@@ -30,7 +30,7 @@ export class PiRpcProcess {
     if (options.systemPromptFile !== undefined && options.appendSystemPromptFile !== undefined) {
       throw new Error("systemPromptFile and appendSystemPromptFile cannot both be set");
     }
-    const args = ["--approve", "--mode", "rpc", "--no-extensions"];
+    const args = ["--approve", "--mode", "rpc"];
     if (options.sessionFile !== undefined) args.push("--session", options.sessionFile);
     if (options.systemPromptFile !== undefined) {
       args.push("--system-prompt", options.systemPromptFile);

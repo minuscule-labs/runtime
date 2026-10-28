@@ -577,7 +577,7 @@ test("managed Pi sessions preserve owner-scoped identity and transcript across s
   await writeFile(fakePi, `#!/usr/bin/env node
 import { readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
-if (!args.includes("--no-extensions") || args.includes("--extension")) throw new Error("Unexpected extension loading");
+if (args.includes("--no-extensions") || args.includes("--no-mcp") || args.includes("--extension")) throw new Error("Unexpected integration override");
 if (process.env.PI_TEST_API_CREDENTIAL !== "fixture-only-api-key") throw new Error("API credential was not inherited");
 const sessionArg = args.indexOf("--session");
 const sessionFile = sessionArg >= 0 ? args[sessionArg + 1] : process.env.PI_SESSION_FILE;
@@ -996,11 +996,13 @@ process.on("SIGTERM", () => process.exit(0));
       requests: Array<Record<string, unknown>>;
       credentialPresent: boolean;
     };
+    assert.ok(!launch.args.includes("--no-extensions"));
+    assert.ok(!launch.args.includes("--no-mcp"));
+    assert.equal(launch.args[launch.args.indexOf("--mode") + 1], "rpc");
     const promptIndex = launch.args.indexOf("--append-system-prompt");
     assert.match(launch.args[promptIndex + 1]!, /\.prompt$/);
     assert.equal(launch.prompt, "You are the reviewer persona.");
     assert.equal(launch.credentialPresent, true);
-    assert.ok(launch.args.includes("--no-extensions"));
     assert.ok(!launch.args.includes("--extension"));
     assert.ok(!JSON.stringify(launch).includes("fixture-only-api-key"));
     assert.ok(launch.args.includes("--no-skills"));
