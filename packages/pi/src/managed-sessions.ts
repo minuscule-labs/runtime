@@ -34,6 +34,10 @@ export interface ManagedSessionManifest {
   transcriptId: string;
   nativeSessionId?: string;
   workerPid?: number;
+  /** Dedicated POSIX process group, never a shared controller/terminal group. */
+  workerProcessGroup?: number;
+  /** Explicit recovery blocks stale/automatic wake until a human requests resume. */
+  requiresExplicitResume?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -147,6 +151,12 @@ function validateManifest(manifest: ManagedSessionManifest): void {
   }
   if (manifest.workerPid !== undefined && (!Number.isSafeInteger(manifest.workerPid) || manifest.workerPid < 1)) {
     throw new Error("Invalid Runtime managed-session worker process reference");
+  }
+  if (manifest.requiresExplicitResume !== undefined && typeof manifest.requiresExplicitResume !== "boolean") {
+    throw new Error("Invalid Runtime recovery fence");
+  }
+  if (manifest.workerProcessGroup !== undefined && manifest.workerProcessGroup !== manifest.workerPid) {
+    throw new Error("Invalid Runtime managed-session process group");
   }
   if (typeof manifest.createdAt !== "string" || typeof manifest.updatedAt !== "string"
     || !Number.isFinite(Date.parse(manifest.createdAt)) || !Number.isFinite(Date.parse(manifest.updatedAt))) {
@@ -297,13 +307,19 @@ export async function removeManagedSessionManifest(managedSessionId: string, own
   await syncDirectory(dirname(path));
 }
 
-export async function recordManagedSessionWorkerStarted(managedSessionId: string, ownerId: string): Promise<void> {
-  const manifest = await readManagedSessionManifest(managedSessionId, ownerId);
-  if (!manifest || (manifest.state !== "starting" && manifest.state !== "resuming")) {
-    throw new ManagedSessionNotFoundError("Runtime-managed session is not in a start or resume transition");
+export async function recordManagedSessionWorkerStarted(managedSessionId: string, ownerId: string, isolatedProcessGroup = false): Promise<void> {
+  let manifest = await readManagedSessionManifest(managedSessionId, ownerId);
+  const deadline = Date.now() + 5_000;
+  while (manifest && manifest.workerPid === undefined && (manifest.state === "starting" || manifest.state === "resuming") && Date.now() < deadline) {
+    await delay(25);
+    manifest = await readManagedSessionManifest(managedSessionId, ownerId);
+  }
+  if (!manifest || manifest.workerPid !== process.pid || (manifest.state !== "starting" && manifest.state !== "resuming")) {
+    throw new ManagedSessionNotFoundError("Runtime-managed session is not in an authorized worker launch");
   }
   await validateManagedSessionCwd(manifest.cwd);
   manifest.workerPid = process.pid;
+  manifest.workerProcessGroup = isolatedProcessGroup ? process.pid : undefined;
   manifest.updatedAt = new Date().toISOString();
   await writeManagedSessionManifest(manifest);
 }

@@ -81,7 +81,7 @@ export class PiRpcProcess {
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
         this.child.kill("SIGKILL");
-        resolve();
+        // Shutdown is confirmed by exit, not by delivery of a signal.
       }, 5_000);
       this.child.once("exit", () => {
         clearTimeout(timer);

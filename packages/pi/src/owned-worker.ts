@@ -213,7 +213,7 @@ async function main(): Promise<void> {
       throw new Error("Runtime-managed Pi session is missing its verified transcript");
     }
     await validatePiSessionFile(resumeSessionFile, cwd, manifest.transcriptId);
-    await recordManagedSessionWorkerStarted(runtimeSessionId, runtimeOwnerId);
+    await recordManagedSessionWorkerStarted(runtimeSessionId, runtimeOwnerId, process.argv.includes("--isolated-process-group"));
   }
   rpc = new PiRpcProcess(cwd, (text) => void log(text), {
     systemPromptFile,
