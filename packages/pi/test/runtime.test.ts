@@ -955,6 +955,7 @@ const save = () => writeFileSync(process.env.PI_ARGS_FILE, JSON.stringify({
   args, prompt, requests, credentialPresent: process.env.PI_TEST_API_CREDENTIAL === "fixture-only-api-key",
 }));
 save();
+console.log(JSON.stringify({ type: "extension_error", error: "fixture startup hook failed", privateMetadata: process.env.PI_TEST_API_CREDENTIAL }));
 let buffer = "";
 const messages = [];
 process.stdin.on("data", (chunk) => {
@@ -1015,6 +1016,12 @@ process.on("SIGTERM", () => process.exit(0));
     });
     sessionId = session.id;
     assert.equal(session.ownership, "owned");
+    const registration = await readRegistration(session.id);
+    assert.ok(registration?.logFile);
+    const diagnostic = await readFile(registration.logFile, "utf8");
+    assert.match(diagnostic, /Pi extension error: fixture startup hook failed/);
+    assert.doesNotMatch(diagnostic, /fixture-only-api-key/);
+    assert.equal((await stat(registration.logFile)).mode & 0o777, 0o600);
     const launch = JSON.parse(await readFile(argsFile, "utf8")) as {
       args: string[];
       prompt?: string;

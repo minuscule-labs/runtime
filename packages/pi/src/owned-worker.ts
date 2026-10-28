@@ -90,6 +90,9 @@ function publishStatus(next: AgentStatus): void {
 }
 
 function handleEvent(event: RpcEvent): void {
+  if (event.type === "extension_error") {
+    void log(`Pi extension error: ${String(event.error ?? "Unknown extension error")}\n`).catch(() => {});
+  }
   if (!sessionId) return;
   const timestamp = new Date().toISOString();
   if (event.type === "agent_start") publishStatus("working");
