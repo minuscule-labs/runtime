@@ -130,6 +130,10 @@ const session = await runtime.start({
 
 The Pi adapter discovers configured models through Pi RPC and reports the sanitized effective model and reasoning defaults that would be used when launch selections are omitted. At startup it verifies the exact provider/model, selects it, checks the model's available thinking levels, and then applies the requested reasoning level. Unsupported selections fail before the session is registered; they never silently fall back to Pi defaults. Launch selection is immutable for that session. Owned-worker startup remains supervised until readiness; timeout, setup failure, spawn failure, or early exit terminates and awaits the worker before launch artifacts are removed. Short bridge requests and control operations use bounded deadlines, while event streams remain caller-cancellable and long-lived.
 
+## Extensions and MCP
+
+Owned Pi workers inherit Pi's configured extensions and MCP servers, including its normal built-in extensions. Runtime does not filter them or force codemode on; enable codemode through Pi's settings. Configured extensions execute code and MCP servers may start processes or connect to external services. Workers launch with `--approve`, so project-local configuration is trusted for that process.
+
 ## Skills
 
 Adapters may advertise sanitized skill metadata and accept adapter-scoped skill ids when starting a session:
@@ -144,7 +148,7 @@ const session = await runtime.start({
 
 Omitting `skillIds` preserves the harness's default skill behavior. Supplying an empty array explicitly disables discovered skills for adapters that support selection. The Pi adapter discovers skills from its available-command RPC response, keeps native paths private, revalidates selected ids before launch, and starts the owned process with only those skills. Skill changes require a new session.
 
-Owned Pi workers disable extension discovery and inherit their host's environment. Authorized API workflows can use existing shell tools; credentials must reach the actual host process, not only an interactive terminal. Runtime does not provision secrets or treat Skills as credential grants.
+Owned Pi workers inherit their host's environment. Authorized API workflows can use existing shell tools; credentials must reach the actual host process, not only an interactive terminal. Runtime does not provision secrets or treat Skills as credential grants.
 
 ## Development
 
