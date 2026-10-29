@@ -32,7 +32,7 @@ import { inspectRegistration, listRegistrations, readRegistration, registryDirec
 import {
   createManagedSessionManifest,
   listManagedSessionManifests,
-  managedSessionState,
+  managedSessionAvailability,
   managedWorkerProcessExists,
   ManagedSessionBusyError,
   ManagedSessionNotFoundError,
@@ -586,6 +586,7 @@ export class PiAgentRuntime implements AgentRuntime {
           id: entry.managedSessionId,
           ownerId,
           state: "unavailable" as const,
+          unavailableReason: "session_metadata_unavailable" as const,
           createdAt: entry.createdAt,
           updatedAt: entry.updatedAt,
         };
@@ -598,9 +599,9 @@ export class PiAgentRuntime implements AgentRuntime {
       return {
         id: entry.managedSessionId,
         ownerId,
-        state: registration && !registrationOwnerMatches
-          ? "unavailable" as const
-          : await managedSessionState(manifest, isActive),
+        ...(registration && !registrationOwnerMatches
+          ? { state: "unavailable" as const, unavailableReason: "session_metadata_unavailable" as const }
+          : await managedSessionAvailability(manifest, isActive)),
         ...(entry.createdAt ? { createdAt: entry.createdAt } : {}),
         ...(entry.updatedAt ? { updatedAt: entry.updatedAt } : {}),
       };

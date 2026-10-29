@@ -28,6 +28,8 @@ export interface ManagedSessionSummary {
   id: string;
   ownerId: string;
   state: ManagedSessionState;
+  /** Bounded cause only; never native paths, transcript content, or raw errors. */
+  unavailableReason?: "session_metadata_unavailable" | "session_transcript_invalid";
   createdAt?: string;
   updatedAt?: string;
 }
