@@ -36,6 +36,35 @@ export interface ManagedSessionManifest {
 
 const processLocks = new Map<string, Promise<void>>();
 
+// Bound the remaining full-transcript work (resume and inventory), not metadata-only status reads.
+const activeTranscriptReads = new Set<string>();
+const transcriptReadQueue: Array<{ path: string; start(): void }> = [];
+function drainTranscriptReads(): void {
+  while (activeTranscriptReads.size < 4) {
+    const index = transcriptReadQueue.findIndex(entry => !activeTranscriptReads.has(entry.path));
+    if (index === -1) return;
+    transcriptReadQueue.splice(index, 1)[0]!.start();
+  }
+}
+function acquireTranscriptRead(path: string, signal?: AbortSignal): Promise<() => void> {
+  signal?.throwIfAborted();
+  return new Promise((resolveSlot, reject) => {
+    const entry = { path, start() {
+      signal?.removeEventListener("abort", abort);
+      activeTranscriptReads.add(path);
+      resolveSlot(() => { activeTranscriptReads.delete(path); drainTranscriptReads(); });
+    } };
+    const abort = () => {
+      const index = transcriptReadQueue.indexOf(entry);
+      if (index !== -1) transcriptReadQueue.splice(index, 1);
+      reject(signal!.reason);
+    };
+    transcriptReadQueue.push(entry);
+    signal?.addEventListener("abort", abort, { once: true });
+    drainTranscriptReads();
+  });
+}
+
 export class ManagedSessionBusyError extends Error {}
 export class ManagedSessionNotFoundError extends Error {}
 
@@ -347,12 +376,14 @@ export async function validateManagedSessionCwd(cwd: string): Promise<void> {
   }
 }
 
-export async function validatePiSessionFile(sessionFile: string, cwd: string, transcriptId: string): Promise<void> {
+export async function validatePiSessionFile(sessionFile: string, cwd: string, transcriptId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
   if (!isAbsolute(sessionFile) || resolve(sessionFile) !== sessionFile) {
     throw new Error("Pi session transcript path is invalid");
   }
+  const release = await acquireTranscriptRead(sessionFile, options.signal);
   let handle;
   try {
+    options.signal?.throwIfAborted();
     await validateManagedSessionCwd(cwd);
     const metadata = await lstat(sessionFile);
     if (!metadata.isFile() || metadata.isSymbolicLink()
@@ -405,7 +436,9 @@ export async function validatePiSessionFile(sessionFile: string, cwd: string, tr
     };
 
     while (true) {
+      options.signal?.throwIfAborted();
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      options.signal?.throwIfAborted();
       if (bytesRead === 0) break;
       pending += decoder.write(buffer.subarray(0, bytesRead));
       let newlineIndex = pending.indexOf("\n");
@@ -420,24 +453,28 @@ export async function validatePiSessionFile(sessionFile: string, cwd: string, tr
     if (pending.length > 0) validateLine(pending.replace(/\r$/, ""));
     if (lineNumber === 0) throw new Error("missing session header");
   } catch {
+    options.signal?.throwIfAborted();
     throw new Error("Managed Pi transcript is missing, redirected, or invalid");
   } finally {
-    await handle?.close();
+    try { await handle?.close(); } finally { release(); }
   }
 }
 
 export async function managedSessionAvailability(
   manifest: ManagedSessionManifest,
   isActive: boolean,
+  options: { signal?: AbortSignal } = {},
 ): Promise<Pick<ManagedSessionSummary, "state" | "unavailableReason">> {
+  options.signal?.throwIfAborted();
   if (isActive) return { state: "active" };
   if (!manifest.sessionFile || manifest.state === "starting" || manifest.state === "destroying") {
     return { state: "unavailable", unavailableReason: "session_metadata_unavailable" };
   }
   try {
-    await validatePiSessionFile(manifest.sessionFile, manifest.cwd, manifest.transcriptId);
+    await validatePiSessionFile(manifest.sessionFile, manifest.cwd, manifest.transcriptId, options);
     return { state: "suspended" };
   } catch {
+    options.signal?.throwIfAborted();
     return { state: "unavailable", unavailableReason: "session_transcript_invalid" };
   }
 }
