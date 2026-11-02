@@ -3,7 +3,43 @@ import { chmod, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { managedSessionAvailability, validatePiSessionFile, type ManagedSessionManifest } from "../src/managed-sessions.js";
+import { createManagedSessionManifest, managedSessionAvailability, validatePiSessionFile, writeManagedSessionManifest, type ManagedSessionManifest } from "../src/managed-sessions.js";
+import { PiAgentRuntime } from "../src/client.js";
+import { writeRegistration } from "../src/registry.js";
+
+test("exact managed lookup is metadata-only, owner-isolated and never enumerates or rewrites transcripts", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "runtime-exact-lookup-")));
+  const previousDirectory = process.env.MINU_RUNTIME_DIR;
+  process.env.MINU_RUNTIME_DIR = join(directory, "registry");
+  try {
+    const manifest = await createManagedSessionManifest({ cwd: directory }, "owner");
+    const id = manifest.managedSessionId;
+    manifest.state = "suspended";
+    await writeManagedSessionManifest(manifest);
+    await writeFile(manifest.sessionFile!, "PRIVATE_INVALID_TRANSCRIPT");
+    const runtime = new PiAgentRuntime();
+    runtime.listManagedSessions = async () => { throw new Error("Inventory must not run"); };
+    const before = await readFile(manifest.sessionFile!, "utf8");
+    const summary = await runtime.getManagedSession(id, "owner");
+    assert.equal(summary?.state, "suspended", "Metadata does not claim the transcript was validated");
+    assert.equal(await runtime.getManagedSession(id, "other-owner"), undefined);
+    assert.equal(await runtime.getManagedSession("missing", "owner"), undefined);
+    await assert.rejects(runtime.resume(id, "owner"), /Managed Pi transcript/);
+    assert.equal(await readFile(manifest.sessionFile!, "utf8"), before);
+    assert.ok(!JSON.stringify(summary).includes("PRIVATE"));
+    assert.ok(!JSON.stringify(summary).includes(directory));
+
+    await writeRegistration({ sessionId: id, ownerId: "other-owner", ownership: "owned",
+      pid: process.pid, endpoint: "http://127.0.0.1:12345", token: "fixture-token", cwd: directory,
+      updatedAt: new Date().toISOString() });
+    assert.equal((await runtime.getManagedSession(id, "owner"))?.state, "unavailable");
+    await assert.rejects(runtime.getManagedSession("../target", "owner"));
+  } finally {
+    if (previousDirectory === undefined) delete process.env.MINU_RUNTIME_DIR;
+    else process.env.MINU_RUNTIME_DIR = previousDirectory;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 const timestamp = "2026-10-14T12:26:24.000Z";
 const transcriptId = "system-snapshot-session";

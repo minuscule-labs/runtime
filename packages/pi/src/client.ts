@@ -576,6 +576,33 @@ export class PiAgentRuntime implements AgentRuntime {
     });
   }
 
+  async getManagedSession(managedSessionId: string, ownerId: string): Promise<ManagedSessionSummary | undefined> {
+    validateManagedSessionIdentity(managedSessionId, ownerId);
+    let manifest;
+    try {
+      manifest = await readManagedSessionManifest(managedSessionId, ownerId);
+    } catch {
+      return { id: managedSessionId, ownerId, state: "unavailable", unavailableReason: "session_metadata_unavailable" };
+    }
+    if (!manifest) return undefined;
+    const registration = await inspectRegistration(managedSessionId);
+    const mismatch = registration && (registration.ownerId !== ownerId
+      || (manifest.workerPid !== undefined && registration.pid !== manifest.workerPid));
+    const active = !mismatch && (registration !== undefined
+      || (manifest.workerPid !== undefined && managedWorkerProcessExists(manifest.workerPid)));
+    // Status never opens the transcript. The selected transcript is validated by resume,
+    // under the same lifecycle lock that excludes a second writer.
+    return {
+      id: managedSessionId,
+      ownerId,
+      ...(mismatch || manifest.state === "destroying" || (!active && (!manifest.sessionFile || manifest.state === "starting"))
+        ? { state: "unavailable" as const, unavailableReason: "session_metadata_unavailable" as const }
+        : { state: active ? "active" as const : "suspended" as const }),
+      createdAt: manifest.createdAt,
+      updatedAt: manifest.updatedAt,
+    };
+  }
+
   async listManagedSessions(ownerId: string): Promise<ManagedSessionSummary[]> {
     validateRuntimeOwnerId(ownerId);
     const manifests = await listManagedSessionManifests(ownerId);

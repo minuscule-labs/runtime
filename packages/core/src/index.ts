@@ -154,6 +154,9 @@ export interface AgentRuntime {
   resume?(managedSessionId: string, ownerId: string, options?: { allowStopped?: boolean }): Promise<ManagedAgentSession>;
   /** Stop the worker and discard Runtime resume metadata without deleting the transcript. */
   destroy?(managedSessionId: string, ownerId: string): Promise<void>;
+  /** Exact metadata-only lookup. Suspended means resume material is recorded, not validated;
+   * resume validates the selected transcript before launching a writer. Never enumerates other sessions. */
+  getManagedSession?(managedSessionId: string, ownerId: string): Promise<ManagedSessionSummary | undefined>;
   /** Enumerate only sessions belonging to the exact owner scope. */
   listManagedSessions?(ownerId: string): Promise<ManagedSessionSummary[]>;
   /** Discover adapter launch options without exposing provider credentials. */
