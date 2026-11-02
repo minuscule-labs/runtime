@@ -156,9 +156,9 @@ export interface AgentRuntime {
   destroy?(managedSessionId: string, ownerId: string): Promise<void>;
   /** Exact metadata-only lookup. Suspended means resume material is recorded, not validated;
    * resume validates the selected transcript before launching a writer. Never enumerates other sessions. */
-  getManagedSession?(managedSessionId: string, ownerId: string): Promise<ManagedSessionSummary | undefined>;
+  getManagedSession?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<ManagedSessionSummary | undefined>;
   /** Enumerate only sessions belonging to the exact owner scope. */
-  listManagedSessions?(ownerId: string): Promise<ManagedSessionSummary[]>;
+  listManagedSessions?(ownerId: string, options?: { signal?: AbortSignal }): Promise<ManagedSessionSummary[]>;
   /** Discover adapter launch options without exposing provider credentials. */
   capabilities?(config?: Pick<AgentStartConfig, "cwd">): Promise<RuntimeLaunchCapabilities>;
   /** Send input to an idle session and resolve after the resulting run settles. */

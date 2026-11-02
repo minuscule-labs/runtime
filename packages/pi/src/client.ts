@@ -576,16 +576,20 @@ export class PiAgentRuntime implements AgentRuntime {
     });
   }
 
-  async getManagedSession(managedSessionId: string, ownerId: string): Promise<ManagedSessionSummary | undefined> {
+  async getManagedSession(managedSessionId: string, ownerId: string, options: { signal?: AbortSignal } = {}): Promise<ManagedSessionSummary | undefined> {
     validateManagedSessionIdentity(managedSessionId, ownerId);
+    options.signal?.throwIfAborted();
     let manifest;
     try {
       manifest = await readManagedSessionManifest(managedSessionId, ownerId);
     } catch {
+      options.signal?.throwIfAborted();
       return { id: managedSessionId, ownerId, state: "unavailable", unavailableReason: "session_metadata_unavailable" };
     }
+    options.signal?.throwIfAborted();
     if (!manifest) return undefined;
     const registration = await inspectRegistration(managedSessionId);
+    options.signal?.throwIfAborted();
     const mismatch = registration && (registration.ownerId !== ownerId
       || (manifest.workerPid !== undefined && registration.pid !== manifest.workerPid));
     const active = !mismatch && (registration !== undefined
@@ -603,10 +607,13 @@ export class PiAgentRuntime implements AgentRuntime {
     };
   }
 
-  async listManagedSessions(ownerId: string): Promise<ManagedSessionSummary[]> {
+  async listManagedSessions(ownerId: string, options: { signal?: AbortSignal } = {}): Promise<ManagedSessionSummary[]> {
     validateRuntimeOwnerId(ownerId);
+    options.signal?.throwIfAborted();
     const manifests = await listManagedSessionManifests(ownerId);
+    options.signal?.throwIfAborted();
     const summaries = await Promise.all(manifests.map(async (entry) => {
+      options.signal?.throwIfAborted();
       const manifest = entry.manifest;
       if (!manifest) {
         return {
@@ -619,6 +626,7 @@ export class PiAgentRuntime implements AgentRuntime {
         };
       }
       const registration = await readRegistration(entry.managedSessionId).catch(() => undefined);
+      options.signal?.throwIfAborted();
       const registrationOwnerMatches = registration?.ownerId === ownerId;
       const isActive = registrationOwnerMatches
         || (!registration && manifest.state === "active" && manifest.workerPid !== undefined
@@ -628,11 +636,12 @@ export class PiAgentRuntime implements AgentRuntime {
         ownerId,
         ...(registration && !registrationOwnerMatches
           ? { state: "unavailable" as const, unavailableReason: "session_metadata_unavailable" as const }
-          : await managedSessionAvailability(manifest, isActive)),
+          : await managedSessionAvailability(manifest, isActive, options)),
         ...(entry.createdAt ? { createdAt: entry.createdAt } : {}),
         ...(entry.updatedAt ? { updatedAt: entry.updatedAt } : {}),
       };
     }));
+    options.signal?.throwIfAborted();
     const knownIds = new Set(summaries.map(({ id }) => id));
     for (const registration of await listRegistrations()) {
       if (registration.ownerId !== ownerId || knownIds.has(registration.sessionId)) continue;
@@ -644,6 +653,7 @@ export class PiAgentRuntime implements AgentRuntime {
         ...(updatedAt ? { updatedAt } : {}),
       });
     }
+    options.signal?.throwIfAborted();
     return summaries;
   }
 
