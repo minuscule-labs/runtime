@@ -9,9 +9,6 @@
     "./extension": "./dist/src/extension.js"
   },
   "types": "./dist/src/index.d.ts",
-  "bin": {
-    "minu-runtime": "./dist/src/cli.js"
-  },
   "dependencies": {
     "@minu/runtime-core": "workspace:*",
     "commander": "^15.0.0"

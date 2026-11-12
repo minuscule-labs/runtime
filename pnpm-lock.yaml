@@ -11,12 +11,21 @@ importers:
       '@earendil-works/pi-coding-agent':
         specifier: ^0.84.3
         version: 0.84.3
+      '@minu/runtime':
+        specifier: workspace:*
+        version: link:packages/runtime
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
       typescript:
         specifier: ^5.9.0
         version: 5.9.3
+
+  packages/codex:
+    dependencies:
+      '@minu/runtime-core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/core: {}
 
@@ -28,6 +37,21 @@ importers:
       '@minu/runtime-core':
         specifier: workspace:*
         version: link:../core
+      commander:
+        specifier: ^15.0.0
+        version: 15.0.0
+
+  packages/runtime:
+    dependencies:
+      '@minu/runtime-codex':
+        specifier: workspace:*
+        version: link:../codex
+      '@minu/runtime-core':
+        specifier: workspace:*
+        version: link:../core
+      '@minu/runtime-pi':
+        specifier: workspace:*
+        version: link:../pi
       commander:
         specifier: ^15.0.0
         version: 15.0.0

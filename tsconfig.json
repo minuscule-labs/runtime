@@ -2,6 +2,8 @@
   "files": [],
   "references": [
     { "path": "packages/core" },
-    { "path": "packages/pi" }
+    { "path": "packages/pi" },
+    { "path": "packages/codex" },
+    { "path": "packages/runtime" }
   ]
 }
