@@ -24,7 +24,7 @@ import type {
   RuntimeSessionEvents,
   RuntimeSkillCapability,
 } from "@minu/runtime-core";
-import { sessionProfile, SESSION_PROFILE_LIMITS, sessionEvents, SESSION_EVENTS_LIMITS, runtimeInput } from "@minu/runtime-core";
+import { sessionProfile, SESSION_PROFILE_LIMITS, sessionEvents, SESSION_EVENTS_LIMITS, sessionIntegrations, SESSION_INTEGRATIONS_LIMITS, type RuntimeIntegrationSnapshot, runtimeInput } from "@minu/runtime-core";
 import { PiRpcProcess } from "./pi-rpc.js";
 import { processGroupExists, terminateManagedWorker } from "./worker-recovery.js";
 import { removeRegistration } from "./registry.js";
@@ -749,6 +749,12 @@ export class PiAgentRuntime implements AgentRuntime {
   async inspectSessionProfile(managedSessionId: string, ownerId: string, options: { signal?: AbortSignal } = {}): Promise<RuntimeSessionProfile | undefined> {
     return this.inspectManaged(managedSessionId, ownerId, options, {
       path: "/session-profile", limits: SESSION_PROFILE_LIMITS, decode: value => sessionProfile(value.profile),
+    });
+  }
+
+  async inspectSessionIntegrations(managedSessionId: string, ownerId: string, options: { signal?: AbortSignal } = {}): Promise<RuntimeIntegrationSnapshot | undefined> {
+    return this.inspectManaged(managedSessionId, ownerId, options, {
+      path: "/session-integrations", limits: SESSION_INTEGRATIONS_LIMITS, decode: value => sessionIntegrations(value.snapshot),
     });
   }
 

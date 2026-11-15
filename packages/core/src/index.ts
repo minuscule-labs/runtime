@@ -1,8 +1,10 @@
 import type { RuntimeSessionProfile } from "./session-profile.js";
+import type { RuntimeIntegrationSnapshot } from "./session-integrations.js";
 import type { RuntimeSessionEvents } from "./session-events.js";
 import type { RuntimeImageContent, RuntimeInputCapabilities } from "./input.js";
 export { runtimeInput, RuntimeInputError, RUNTIME_INPUT_LIMITS, type RuntimeImageContent, type RuntimeInputCapabilities } from "./input.js";
 export { sessionProfile, SESSION_PROFILE_LIMITS, type RuntimeSessionProfile } from "./session-profile.js";
+export { sessionIntegrations, unavailableIntegrationSnapshot, SESSION_INTEGRATIONS_LIMITS, INTEGRATION_ISSUE_CODES, type RuntimeIntegrationSnapshot, type RuntimeIntegration, type RuntimeIntegrationTool, type RuntimeIntegrationIssue, type RuntimeIntegrationCoverage, type RuntimeIntegrationSupport } from "./session-integrations.js";
 export { sessionEvents, SESSION_EVENT_CODES, SESSION_EVENTS_LIMITS, type RuntimeSessionEvents, type RuntimeSessionEvent, type RuntimeSessionEventCode } from "./session-events.js";
 
 export type AgentStatus = "idle" | "working" | "offline";
@@ -178,6 +180,8 @@ export interface AgentRuntime {
   sessionCapabilities?(sessionId: string): Promise<RuntimeSessionCapabilities>;
   /** Inspect an existing exact-owner managed worker. No start/resume/discovery or stored-data mutation. */
   inspectSessionProfile?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeSessionProfile | undefined>;
+  /** Read current integrations from the exact-owner existing worker. Missing method means unsupported, not absent integrations. */
+  inspectSessionIntegrations?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeIntegrationSnapshot | undefined>;
   /** Read bounded structured Runtime observations from the current exact-owner worker, without waking it. */
   inspectSessionEvents?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeSessionEvents | undefined>;
   /** Open an adapter-owned local diagnostic without returning its path or contents. */

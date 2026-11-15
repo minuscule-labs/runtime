@@ -4,6 +4,9 @@ import { StringDecoder } from "node:string_decoder";
 
 export type RpcEvent = Record<string, unknown>;
 
+/** Classifies Pi's explicit public unknown-command rejection; never used as diagnostic text. */
+export class PiRpcUnsupportedCommandError extends Error {}
+
 export interface PiRpcProcessOptions {
   sessionFile?: string;
   systemPromptFile?: string;
@@ -113,7 +116,9 @@ export class PiRpcProcess {
       if (!request) return;
       this.pending.delete(event.id);
       clearTimeout(request.timer);
-      if (event.success === false) request.reject(new Error(String(event.error ?? "Pi RPC request failed")));
+      if (event.success === false) request.reject(event.command === "get_integrations" && event.error === "Unknown command: get_integrations"
+        ? new PiRpcUnsupportedCommandError("Integration inspection unsupported")
+        : new Error(String(event.error ?? "Pi RPC request failed")));
       else request.resolve(event.data);
       return;
     }
