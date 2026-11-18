@@ -11,7 +11,9 @@
     "build": "tsc -b",
     "check": "tsc -b --pretty false",
     "test": "pnpm build && node --test packages/*/dist/test/*.test.js",
-    "runtime": "node packages/runtime/bin/minu-runtime.js"
+    "test:headless": "pnpm build && node test/run-headless-conformance.mjs",
+    "runtime": "node packages/runtime/bin/minu-runtime.js",
+    "runtime:claude": "node packages/claude-code/dist/src/cli.js"
   },
   "devDependencies": {
     "@minu/runtime": "workspace:*",

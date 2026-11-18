@@ -6,6 +6,7 @@ import type { AgentReasoningLevel, AgentStatus, RuntimeImageContent } from "@min
 import { normalizePiMessages } from "./messages.js";
 import { PiRpcProcess, type RpcEvent } from "./pi-rpc.js";
 import { createSessionProfileReader } from "./session-profile.js";
+import { createSessionIntegrationsReader } from "./session-integrations.js";
 import { removeRegistration, writeRegistration } from "./registry.js";
 import {
   readManagedSessionManifest,
@@ -130,7 +131,7 @@ function handleEvent(event: RpcEvent): void {
         timestamp,
       });
     }
-  } else if (event.type === "extension_error" || event.type === "rpc_parse_error") {
+  } else if (event.type === "extension_error" || event.type === "rpc_parse_error" || event.type === "rpc_interaction_error") {
     bridge?.publish({ type: "error", sessionId, message: String(event.error ?? event.type), timestamp });
   }
 }
@@ -260,6 +261,7 @@ async function main(): Promise<void> {
     ...(runtimeSessionId && runtimeOwnerId ? {
       managedSession: { id: runtimeSessionId, ownerId: runtimeOwnerId },
       getSessionProfile: createSessionProfileReader(rpc, sessionId),
+      getSessionIntegrations: createSessionIntegrationsReader(rpc, sessionId),
     } : {}),
     send: inject,
     supportsImages,

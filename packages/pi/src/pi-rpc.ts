@@ -4,6 +4,13 @@ import { StringDecoder } from "node:string_decoder";
 
 export type RpcEvent = Record<string, unknown>;
 
+/** Classifies Pi's explicit public unknown-command rejection; never used as diagnostic text. */
+export class PiRpcUnsupportedCommandError extends Error {}
+
+const UNSUPPORTED_INTERACTION = "Pi requested unsupported interactive input";
+// Only these documented RPC UI methods are fire-and-forget. New methods fail closed.
+const NONBLOCKING_UI_METHODS = new Set(["notify", "setStatus", "setWidget", "setTitle", "set_editor_text"]);
+
 export interface PiRpcProcessOptions {
   sessionFile?: string;
   systemPromptFile?: string;
@@ -23,6 +30,7 @@ export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<string, PendingRequest>();
   private buffer = "";
+  private failedInteraction = false;
   private readonly decoder = new StringDecoder("utf8");
   private eventHandler: (event: RpcEvent) => void = () => {};
 
@@ -63,6 +71,7 @@ export class PiRpcProcess {
   }
 
   async request(type: string, fields: Record<string, unknown> = {}, timeoutMs = 15_000): Promise<unknown> {
+    if (this.failedInteraction) throw new Error(UNSUPPORTED_INTERACTION);
     const id = randomUUID();
     const result = new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -91,8 +100,9 @@ export class PiRpcProcess {
   }
 
   private consume(chunk: Buffer): void {
+    if (this.failedInteraction) return;
     this.buffer += this.decoder.write(chunk);
-    while (true) {
+    while (!this.failedInteraction) {
       const newline = this.buffer.indexOf("\n");
       if (newline < 0) return;
       let line = this.buffer.slice(0, newline);
@@ -102,18 +112,35 @@ export class PiRpcProcess {
       try {
         this.handle(JSON.parse(line) as RpcEvent);
       } catch (error) {
-        this.eventHandler({ type: "rpc_parse_error", error: String(error), line });
+        // An observer failure must not expose the refused dialog through parse diagnostics.
+        if (!this.failedInteraction) this.eventHandler({ type: "rpc_parse_error", error: String(error), line });
       }
     }
   }
 
   private handle(event: RpcEvent): void {
+    if (event.type === "extension_ui_request"
+      && (typeof event.method !== "string" || !NONBLOCKING_UI_METHODS.has(event.method))) {
+      // Stop the exact owned process, not the extension alone: returning a guessed
+      // answer/cancellation can let native policy continue. Fence buffered frames too.
+      this.failedInteraction = true;
+      this.buffer = "";
+      this.failAll(new Error(UNSUPPORTED_INTERACTION));
+      try {
+        this.eventHandler({ type: "rpc_interaction_error", error: UNSUPPORTED_INTERACTION });
+      } finally {
+        void this.stop().catch(() => {});
+      }
+      return;
+    }
     if (event.type === "response" && typeof event.id === "string") {
       const request = this.pending.get(event.id);
       if (!request) return;
       this.pending.delete(event.id);
       clearTimeout(request.timer);
-      if (event.success === false) request.reject(new Error(String(event.error ?? "Pi RPC request failed")));
+      if (event.success === false) request.reject(event.command === "get_integrations" && event.error === "Unknown command: get_integrations"
+        ? new PiRpcUnsupportedCommandError("Integration inspection unsupported")
+        : new Error(String(event.error ?? "Pi RPC request failed")));
       else request.resolve(event.data);
       return;
     }

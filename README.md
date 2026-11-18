@@ -9,6 +9,7 @@ Runtime does not provide shared communication, durable session analytics, remote
 - `core` — normalized `AgentRuntime`, lifecycle, status, events, messages, and start configuration.
 - `pi` — Pi RPC worker, attached-TUI bridge, local registry, client, and legacy Pi CLI module.
 - `codex` — native Codex app-server adapter with managed execution, reconnect, and macOS idle suspend/exact-thread resume.
+- `claude-code` — native Claude SDK adapter, durable text-only controller and standalone CLI (implementation reviewed; real-auth acceptance pending).
 - `runtime` — `@minu/runtime` public adapter factory and the `minu-runtime` CLI.
 
 ## Shared API and CLI
@@ -286,6 +287,125 @@ for Runtime requirements, acceptance criteria and remaining work, and the
 All listed functionality is required; deferred delivery and optional API methods
 do not make product functionality optional.
 
+## Claude Code adapter (initial slice)
+
+`@minu/runtime-claude-code` implements Runtime using one long-lived Claude Agent
+SDK query and its native process per session. It pins SDK `0.3.321`, including its
+platform-specific Claude Code engine; a separate `claude` on PATH is not required.
+Install optional dependencies for your platform. Native authentication must already
+be configured, or supplied through the environment.
+
+```ts
+import { ClaudeCodeAgentRuntime } from "@minu/runtime-claude-code";
+
+const runtime = new ClaudeCodeAgentRuntime();
+const session = await runtime.start({
+  cwd: process.cwd(),
+  appendSystemPrompt: "You are a skeptical code reviewer.",
+});
+try {
+  await runtime.send(session.id, "Review README.md without changing files.");
+  console.log(await runtime.messages(session.id));
+} finally {
+  await runtime.stop(session.id);
+}
+```
+
+The initial adapter supports text turns, caller-stable turn IDs, normalized
+messages/events, sanitized activity and interruption. Input is sent literally,
+without slash-command dispatch or file-mention expansion. Appended personas retain
+the native Claude Code prompt; full `systemPrompt` replacement is mutually exclusive.
+The native default model is used. Explicit model/reasoning/skill selections, images
+and steering are rejected rather than silently ignored.
+
+By default only `Read`, `Grep` and `Glob` are exposed. Constructor `tools` can change
+that list; `canUseTool` can answer native permission requests. Without a handler,
+requests are denied. Permission mode is explicitly `default`, never bypass/auto or
+accept-edits. **The callback is not an all-tool gate:** native auto-allowed actions
+need not ask it. Exposing more tools is an explicit policy decision. This is not an
+OS sandbox, and read tools are not confined to the workspace. Interruption and stop
+do not undo tool side effects.
+
+User/project/local filesystem settings, configured hooks and MCP discovery are
+not inherited: the adapter requests SDK isolation, disables hooks and uses strict
+empty MCP/plugin configuration. Machine-admin policies and native authentication
+still apply. The subprocess otherwise inherits the host environment; constructor
+`env`, when supplied, replaces it entirely. No Pi extensions/settings are loaded.
+Native transcript persistence is disabled, not a secure-erasure or no-artifacts
+guarantee. Prompts and tool content can still reach the selected provider.
+
+Turn idempotency is instance-local within the most recent 1,000 retained turns
+(configurable with `turnRetentionLimit`). Messages live in memory for the session.
+Each event subscriber has a bounded queue; a slow consumer is disconnected without
+stalling the agent. Raw events and message text are not presentation-safe; only
+`activityEvents` has the fixed sanitized vocabulary. An interrupt acknowledgment
+is not completion: the turn remains busy until a native terminal result. Uncertain
+control failures take the session offline and stop it; no automatic replay occurs.
+`stop` confirms the exact native process exit or rejects, not independent exit of
+all tool descendants or a managed recovery fence.
+
+The in-process class has no managed lifecycle. `ClaudeCodeManagedRuntime` separately
+implements the durable text-only MVP below; forced recovery, destroy, rich live
+profiles/diagnostics and native TUI attachment remain outside that implementation.
+The existing `runtime` CLI and Channels/Conversations loading remain Pi-only.
+
+### Durable text-only MVP (real-auth acceptance pending)
+
+`ClaudeCodeManagedRuntime` takes one exact `ownerId`, explicit `storeRoot`, an
+existing owner-private canonical `nativeConfigRoot`, and explicit `nativeOptions.env`
+with matching `CLAUDE_CONFIG_DIR`. There is no inherited/default credential or state
+root. The harness still owns authentication and tools. Trusted executable/env
+settings must obey the [conditional process-family contract](docs/claude-code-process-family-contract.md);
+process groups are not OS containment or a filesystem sandbox.
+
+Supported path: managed create/readiness, literal text/streams/history/status,
+interrupt, owner inventory, reconnect to a living worker, healthy idle-only stop and
+explicit same-history resume. Stop observes the eligible fresh process-family's
+absence, requires exact unchanged metadata and materialization of an independently
+completed latest input, then fences/clears the worker under CAS. Resume requires
+`{ allowStopped: true }`. No missing-history fallback, unknown-outcome replay,
+legacy null-group migration or busy/unreachable recovery. Busy stop is refused. An interrupted but healthy worker needs a fresh confirmed
+completed turn before clean suspension; failed/uncertain sessions remain refused
+rather than guessing history eligibility.
+
+Caller turn results/idempotence are retained within a living worker, not rebuilt
+from transcript text after worker restart. Use new turn IDs after explicit resume;
+the known previous-epoch last ID is refused, not redispatched or fabricated.
+Supported history is the pinned bounded linear subset, not compaction/branching.
+One verified real authentication/provider path and production acceptance remain
+pending; synthetic-provider tests do not establish subscription compatibility.
+
+Build first, then use `pnpm runtime:claude` (or the package's `minu-claude-runtime`
+bin). Commands: `create`, `list`, `get`, `status`, `run`, `turn`, `history`, `interrupt`,
+`stop`, `resume`, `events`, `activity`. All require `--owner`, `--state` and
+`--native-root`; session commands also take `--id`, `turn` takes `--turn-id`, and
+`create` accepts `--cwd`. Credentials come from the explicit operator environment,
+never arguments. `run` reads a bounded UTF-8 JSON object from stdin only:
+
+```json
+{"turnId":"fresh-caller-id","input":"Literal user input"}
+```
+
+For example, `pnpm runtime:claude run --owner OWNER --state /private/state
+--native-root /private/native --id SESSION < turn.json` (one shell command).
+No automatic real-provider/authentication acceptance is authorized by these examples.
+The MVP does not complete or remove full R01–R41 requirements.
+
+Verification includes SDK protocol fixtures and a real bundled-engine integration
+with an isolated temporary home and localhost synthetic provider, covering multi-turn
+text, literal input, interruption and denied native writes. It does not establish
+real model quality, paid-provider authentication or successful tool-write behavior.
+
+CLI-only black-box tests exercise fresh-process reconnect, empty-session stop/resume,
+owner/configuration isolation, invalid input, private errors and event cancellation
+without model requests or adapter/store imports. Run them after building:
+
+```sh
+pnpm check
+node --test packages/claude-code/dist/test/cli-black-box.test.js
+```
+
+
 ## Contract
 
 ```ts
@@ -296,7 +416,8 @@ interface AgentRuntime {
   forceStopManaged?(managedSessionId: string, ownerId: string): Promise<void>;
   resume?(managedSessionId: string, ownerId: string, options?: { allowStopped?: boolean }): Promise<ManagedAgentSession>;
   destroy?(managedSessionId: string, ownerId: string): Promise<void>;
-  listManagedSessions?(ownerId: string): Promise<ManagedSessionSummary[]>;
+  getManagedSession?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<ManagedSessionSummary | undefined>;
+  listManagedSessions?(ownerId: string, options?: { signal?: AbortSignal }): Promise<ManagedSessionSummary[]>;
   capabilities?(config?: Pick<AgentStartConfig, "cwd">): Promise<RuntimeLaunchCapabilities>;
   send(sessionId: string, input: string, images?: RuntimeImageContent[]): Promise<void>;
   startTurn(sessionId: string, turnId: string, input: string, images?: RuntimeImageContent[]): Promise<AgentTurn>;
@@ -323,9 +444,13 @@ Runtime-owned sessions are preferred for agents created by applications. Attache
 
 ## Managed-session lifecycle
 
-Adapters may implement the optional owner-scoped `startManaged`, `suspend`, `resume`, `destroy`, and `listManagedSessions` operations. The consumer supplies a stable opaque `ownerId` for its installation. `ManagedAgentSession.id` is generated by Runtime, remains stable across worker restarts, and is the ID used by the normal send/status/events APIs; Pi-native IDs remain private adapter details. A managed ID can only be resumed, suspended, destroyed, or enumerated in its exact owner scope.
+Adapters may implement the optional owner-scoped `startManaged`, `suspend`, `resume`, `destroy`, `getManagedSession`, and `listManagedSessions` operations. The consumer supplies a stable opaque `ownerId` for its installation. `ManagedAgentSession.id` is generated by Runtime, remains stable across worker restarts, and is the ID used by the normal send/status/events APIs; Pi-native IDs remain private adapter details. A managed ID can only be resumed, suspended, destroyed, or enumerated in its exact owner scope.
 
-The Pi adapter persists versioned resume manifests and transcripts in owner-private storage. It uses Node's built-in SQLite transaction locks for crash-safe cross-process lifecycle serialization (managed sessions require Node.js 22.5 or newer). It starts Pi against a managed transcript file, permits suspend only while idle, and validates the transcript identity and every entry before resume; repeated resume returns the already-active session rather than launching another worker. Resume reopens the same transcript and preserves the managed ID even if Pi reports a different native ID. `listManagedSessions` returns only IDs, owner scope, sanitized state, and known timestamps; incomplete/corrupt registrations are reported as unavailable rather than silently omitted. For managed sessions, generic `stop` preserves resume metadata like `suspend`; use `destroy` to discard Runtime resume metadata. Destruction deliberately does not delete the Pi transcript. Legacy `start` and attached-TUI sessions retain their existing adapter-native addressing and do not gain managed lifecycle semantics.
+The Pi adapter persists versioned resume manifests and transcripts in owner-private storage. It uses Node's built-in SQLite transaction locks for crash-safe cross-process lifecycle serialization (managed sessions require Node.js 22.5 or newer). It starts Pi against a managed transcript file, permits suspend only while idle, and validates private-file ownership, transcript identity, and journal-entry ancestry before resume; repeated resume returns the already-active session rather than launching another worker. Pi owns entry payload and message-role interpretation: Runtime does not keep a second allowlist that rejects newer native entries such as context edits or usage records. Additional tree roots are allowed, while malformed JSON, broken ancestry, duplicate IDs, redirected files, and identity mismatches still fail closed. Resume reopens the same transcript and preserves the managed ID even if Pi reports a different native ID. `listManagedSessions` returns only IDs, owner scope, sanitized state, known timestamps, and an optional bounded `unavailableReason` (`session_metadata_unavailable` or `session_transcript_invalid`); incomplete/corrupt registrations are reported as unavailable rather than silently omitted. For managed sessions, generic `stop` preserves resume metadata like `suspend`; use `destroy` to discard Runtime resume metadata. Destruction deliberately does not delete the Pi transcript. Legacy `start` and attached-TUI sessions retain their existing adapter-native addressing and do not gain managed lifecycle semantics.
+
+`getManagedSession(id, ownerId)` is the hot-path lookup: it reads only that exact owner-scoped manifest and registration, never enumerates sessions, opens transcripts, or cleans up registrations. A `suspended` result means resume material is recorded, not that its contents have been validated; only `resume` validates the selected transcript under the lifecycle lock before launching a writer. Use `listManagedSessions` for inventory, not as a prerequisite for recovering one session. Both lookup APIs accept an optional cancellation signal.
+
+Full transcript validation, including resume and inventory reads, retains the emergency recovery build's backpressure: at most four validators per Runtime module and one per transcript path. Cancellation removes queued validation and stops active validation between chunks. An already-issued OS read is allowed to return, and its slot stays occupied until the handle closes; cancellation never permits an overlapping reader. Exact metadata-only status checks do not enter this transcript-validation queue.
 
 `forceStopManaged` is explicit recovery, not idle sleep: it stops a busy or unresponsive exact-owner worker without a healthy status/native RPC prerequisite and preserves its transcript. A persisted recovery fence rejects automatic/stale `resume` calls; only an explicit human resume uses `{ allowStopped: true }`, and a failed resume does not clear that fence. Successful completion means physical worker exit, not merely an HTTP acknowledgment or missing registration. New POSIX workers have a dedicated process group, verified against their exact managed ID, owner, worker executable and group before TERM/KILL escalation. Legacy shared-group workers receive only worker-targeted TERM and require observed descendant exit; unverifiable/unsupported shutdown fails closed. No broad process-name kills, transcript deletion, automatic replacement or tool-side-effect rollback occurs. Consumers must fence message delivery and settle their old routing tasks before resuming. Windows does not support process-signal fallback; an unreachable worker remains unconfirmed.
 
@@ -436,6 +561,19 @@ Owned Pi workers inherit their host's environment. Authorized API workflows can 
 pnpm install
 pnpm check
 pnpm test
+```
+
+The separate `pnpm test:headless` integration check applies the same refusal,
+nonblocking-activity and stop-cancellation assertions to Claude Code, Pi and Codex.
+It runs with a disposable allowlisted environment and synthetic protocol peers;
+no model/provider calls are made. All three built adapters are required—none is
+silently skipped. It supplements, not replaces, `pnpm test` and is not yet in CI.
+
+When Codex is being developed outside this checkout, supply its explicit built
+Runtime artifact root (containing `packages/codex/dist`):
+
+```bash
+MINU_RUNTIME_CODEX_TEST_ROOT=/absolute/built-runtime-root pnpm test:headless
 ```
 
 ## CLI

@@ -1,8 +1,10 @@
 import type { RuntimeSessionProfile } from "./session-profile.js";
+import type { RuntimeIntegrationSnapshot } from "./session-integrations.js";
 import type { RuntimeSessionEvents } from "./session-events.js";
 import type { RuntimeImageContent, RuntimeInputCapabilities } from "./input.js";
 export { runtimeInput, RuntimeInputError, RUNTIME_INPUT_LIMITS, type RuntimeImageContent, type RuntimeInputCapabilities } from "./input.js";
 export { sessionProfile, SESSION_PROFILE_LIMITS, type RuntimeSessionProfile } from "./session-profile.js";
+export { sessionIntegrations, unavailableIntegrationSnapshot, SESSION_INTEGRATIONS_LIMITS, INTEGRATION_ISSUE_CODES, type RuntimeIntegrationSnapshot, type RuntimeIntegration, type RuntimeIntegrationTool, type RuntimeIntegrationIssue, type RuntimeIntegrationCoverage, type RuntimeIntegrationSupport } from "./session-integrations.js";
 export { sessionEvents, SESSION_EVENT_CODES, SESSION_EVENTS_LIMITS, type RuntimeSessionEvents, type RuntimeSessionEvent, type RuntimeSessionEventCode } from "./session-events.js";
 
 export type AgentStatus = "idle" | "working" | "offline";
@@ -28,6 +30,8 @@ export interface ManagedSessionSummary {
   id: string;
   ownerId: string;
   state: ManagedSessionState;
+  /** Bounded cause only; never native paths, transcript content, or raw errors. */
+  unavailableReason?: "session_metadata_unavailable" | "session_transcript_invalid";
   createdAt?: string;
   updatedAt?: string;
 }
@@ -152,8 +156,11 @@ export interface AgentRuntime {
   resume?(managedSessionId: string, ownerId: string, options?: { allowStopped?: boolean }): Promise<ManagedAgentSession>;
   /** Stop the worker and discard Runtime resume metadata without deleting the transcript. */
   destroy?(managedSessionId: string, ownerId: string): Promise<void>;
+  /** Exact metadata-only lookup. Suspended means resume material is recorded, not validated;
+   * resume validates the selected transcript before launching a writer. Never enumerates other sessions. */
+  getManagedSession?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<ManagedSessionSummary | undefined>;
   /** Enumerate only sessions belonging to the exact owner scope. */
-  listManagedSessions?(ownerId: string): Promise<ManagedSessionSummary[]>;
+  listManagedSessions?(ownerId: string, options?: { signal?: AbortSignal }): Promise<ManagedSessionSummary[]>;
   /** Discover adapter launch options without exposing provider credentials. */
   capabilities?(config?: Pick<AgentStartConfig, "cwd">): Promise<RuntimeLaunchCapabilities>;
   /** Send input to an idle session and resolve after the resulting run settles. */
@@ -173,6 +180,8 @@ export interface AgentRuntime {
   sessionCapabilities?(sessionId: string): Promise<RuntimeSessionCapabilities>;
   /** Inspect an existing exact-owner managed worker. No start/resume/discovery or stored-data mutation. */
   inspectSessionProfile?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeSessionProfile | undefined>;
+  /** Read current integrations from the exact-owner existing worker. Missing method means unsupported, not absent integrations. */
+  inspectSessionIntegrations?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeIntegrationSnapshot | undefined>;
   /** Read bounded structured Runtime observations from the current exact-owner worker, without waking it. */
   inspectSessionEvents?(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeSessionEvents | undefined>;
   /** Open an adapter-owned local diagnostic without returning its path or contents. */

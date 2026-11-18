@@ -24,7 +24,7 @@ import type {
   RuntimeSessionEvents,
   RuntimeSkillCapability,
 } from "@minu/runtime-core";
-import { sessionProfile, SESSION_PROFILE_LIMITS, sessionEvents, SESSION_EVENTS_LIMITS, runtimeInput } from "@minu/runtime-core";
+import { sessionProfile, SESSION_PROFILE_LIMITS, sessionEvents, SESSION_EVENTS_LIMITS, sessionIntegrations, SESSION_INTEGRATIONS_LIMITS, type RuntimeIntegrationSnapshot, runtimeInput } from "@minu/runtime-core";
 import { PiRpcProcess } from "./pi-rpc.js";
 import { processGroupExists, terminateManagedWorker } from "./worker-recovery.js";
 import { removeRegistration } from "./registry.js";
@@ -32,7 +32,7 @@ import { inspectRegistration, listRegistrations, readRegistration, registryDirec
 import {
   createManagedSessionManifest,
   listManagedSessionManifests,
-  managedSessionState,
+  managedSessionAvailability,
   managedWorkerProcessExists,
   ManagedSessionBusyError,
   ManagedSessionNotFoundError,
@@ -576,21 +576,57 @@ export class PiAgentRuntime implements AgentRuntime {
     });
   }
 
-  async listManagedSessions(ownerId: string): Promise<ManagedSessionSummary[]> {
+  async getManagedSession(managedSessionId: string, ownerId: string, options: { signal?: AbortSignal } = {}): Promise<ManagedSessionSummary | undefined> {
+    validateManagedSessionIdentity(managedSessionId, ownerId);
+    options.signal?.throwIfAborted();
+    let manifest;
+    try {
+      manifest = await readManagedSessionManifest(managedSessionId, ownerId);
+    } catch {
+      options.signal?.throwIfAborted();
+      return { id: managedSessionId, ownerId, state: "unavailable", unavailableReason: "session_metadata_unavailable" };
+    }
+    options.signal?.throwIfAborted();
+    if (!manifest) return undefined;
+    const registration = await inspectRegistration(managedSessionId);
+    options.signal?.throwIfAborted();
+    const mismatch = registration && (registration.ownerId !== ownerId
+      || (manifest.workerPid !== undefined && registration.pid !== manifest.workerPid));
+    const active = !mismatch && (registration !== undefined
+      || (manifest.workerPid !== undefined && managedWorkerProcessExists(manifest.workerPid)));
+    // Status never opens the transcript. The selected transcript is validated by resume,
+    // under the same lifecycle lock that excludes a second writer.
+    return {
+      id: managedSessionId,
+      ownerId,
+      ...(mismatch || manifest.state === "destroying" || (!active && (!manifest.sessionFile || manifest.state === "starting"))
+        ? { state: "unavailable" as const, unavailableReason: "session_metadata_unavailable" as const }
+        : { state: active ? "active" as const : "suspended" as const }),
+      createdAt: manifest.createdAt,
+      updatedAt: manifest.updatedAt,
+    };
+  }
+
+  async listManagedSessions(ownerId: string, options: { signal?: AbortSignal } = {}): Promise<ManagedSessionSummary[]> {
     validateRuntimeOwnerId(ownerId);
+    options.signal?.throwIfAborted();
     const manifests = await listManagedSessionManifests(ownerId);
+    options.signal?.throwIfAborted();
     const summaries = await Promise.all(manifests.map(async (entry) => {
+      options.signal?.throwIfAborted();
       const manifest = entry.manifest;
       if (!manifest) {
         return {
           id: entry.managedSessionId,
           ownerId,
           state: "unavailable" as const,
+          unavailableReason: "session_metadata_unavailable" as const,
           createdAt: entry.createdAt,
           updatedAt: entry.updatedAt,
         };
       }
       const registration = await readRegistration(entry.managedSessionId).catch(() => undefined);
+      options.signal?.throwIfAborted();
       const registrationOwnerMatches = registration?.ownerId === ownerId;
       const isActive = registrationOwnerMatches
         || (!registration && manifest.state === "active" && manifest.workerPid !== undefined
@@ -598,13 +634,14 @@ export class PiAgentRuntime implements AgentRuntime {
       return {
         id: entry.managedSessionId,
         ownerId,
-        state: registration && !registrationOwnerMatches
-          ? "unavailable" as const
-          : await managedSessionState(manifest, isActive),
+        ...(registration && !registrationOwnerMatches
+          ? { state: "unavailable" as const, unavailableReason: "session_metadata_unavailable" as const }
+          : await managedSessionAvailability(manifest, isActive, options)),
         ...(entry.createdAt ? { createdAt: entry.createdAt } : {}),
         ...(entry.updatedAt ? { updatedAt: entry.updatedAt } : {}),
       };
     }));
+    options.signal?.throwIfAborted();
     const knownIds = new Set(summaries.map(({ id }) => id));
     for (const registration of await listRegistrations()) {
       if (registration.ownerId !== ownerId || knownIds.has(registration.sessionId)) continue;
@@ -616,6 +653,7 @@ export class PiAgentRuntime implements AgentRuntime {
         ...(updatedAt ? { updatedAt } : {}),
       });
     }
+    options.signal?.throwIfAborted();
     return summaries;
   }
 
@@ -711,6 +749,12 @@ export class PiAgentRuntime implements AgentRuntime {
   async inspectSessionProfile(managedSessionId: string, ownerId: string, options: { signal?: AbortSignal } = {}): Promise<RuntimeSessionProfile | undefined> {
     return this.inspectManaged(managedSessionId, ownerId, options, {
       path: "/session-profile", limits: SESSION_PROFILE_LIMITS, decode: value => sessionProfile(value.profile),
+    });
+  }
+
+  async inspectSessionIntegrations(managedSessionId: string, ownerId: string, options: { signal?: AbortSignal } = {}): Promise<RuntimeIntegrationSnapshot | undefined> {
+    return this.inspectManaged(managedSessionId, ownerId, options, {
+      path: "/session-integrations", limits: SESSION_INTEGRATIONS_LIMITS, decode: value => sessionIntegrations(value.snapshot),
     });
   }
 

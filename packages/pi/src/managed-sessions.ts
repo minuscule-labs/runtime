@@ -4,7 +4,7 @@ import { open, chmod, lstat, mkdir, readFile, readdir, realpath, rm, rename } fr
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type {
   AgentStartConfig,
-  ManagedSessionState,
+  ManagedSessionSummary,
 } from "@minu/runtime-core";
 import { registryDirectory } from "./registry.js";
 
@@ -12,14 +12,6 @@ const OWNER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const MANAGED_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const MANIFEST_STATES = ["starting", "active", "suspending", "suspended", "resuming", "destroying"] as const;
 type ManifestState = typeof MANIFEST_STATES[number];
-const SESSION_ENTRY_TYPES = new Set([
-  "message", "thinking_level_change", "model_change", "compaction", "branch_summary",
-  "custom", "custom_message", "label", "session_info",
-]);
-const SESSION_MESSAGE_ROLES = new Set([
-  // Pi persists startup prompt/tool snapshots and later prompt updates as system messages.
-  "system", "user", "assistant", "toolResult", "bashExecution", "custom", "branchSummary", "compactionSummary",
-]);
 const MAX_SESSION_ENTRY_LENGTH = 64 * 1024 * 1024;
 
 export interface ManagedSessionManifest {
@@ -43,6 +35,35 @@ export interface ManagedSessionManifest {
 }
 
 const processLocks = new Map<string, Promise<void>>();
+
+// Bound the remaining full-transcript work (resume and inventory), not metadata-only status reads.
+const activeTranscriptReads = new Set<string>();
+const transcriptReadQueue: Array<{ path: string; start(): void }> = [];
+function drainTranscriptReads(): void {
+  while (activeTranscriptReads.size < 4) {
+    const index = transcriptReadQueue.findIndex(entry => !activeTranscriptReads.has(entry.path));
+    if (index === -1) return;
+    transcriptReadQueue.splice(index, 1)[0]!.start();
+  }
+}
+function acquireTranscriptRead(path: string, signal?: AbortSignal): Promise<() => void> {
+  signal?.throwIfAborted();
+  return new Promise((resolveSlot, reject) => {
+    const entry = { path, start() {
+      signal?.removeEventListener("abort", abort);
+      activeTranscriptReads.add(path);
+      resolveSlot(() => { activeTranscriptReads.delete(path); drainTranscriptReads(); });
+    } };
+    const abort = () => {
+      const index = transcriptReadQueue.indexOf(entry);
+      if (index !== -1) transcriptReadQueue.splice(index, 1);
+      reject(signal!.reason);
+    };
+    transcriptReadQueue.push(entry);
+    signal?.addEventListener("abort", abort, { once: true });
+    drainTranscriptReads();
+  });
+}
 
 export class ManagedSessionBusyError extends Error {}
 export class ManagedSessionNotFoundError extends Error {}
@@ -355,12 +376,14 @@ export async function validateManagedSessionCwd(cwd: string): Promise<void> {
   }
 }
 
-export async function validatePiSessionFile(sessionFile: string, cwd: string, transcriptId: string): Promise<void> {
+export async function validatePiSessionFile(sessionFile: string, cwd: string, transcriptId: string, options: { signal?: AbortSignal } = {}): Promise<void> {
   if (!isAbsolute(sessionFile) || resolve(sessionFile) !== sessionFile) {
     throw new Error("Pi session transcript path is invalid");
   }
+  const release = await acquireTranscriptRead(sessionFile, options.signal);
   let handle;
   try {
+    options.signal?.throwIfAborted();
     await validateManagedSessionCwd(cwd);
     const metadata = await lstat(sessionFile);
     if (!metadata.isFile() || metadata.isSymbolicLink()
@@ -391,57 +414,21 @@ export async function validatePiSessionFile(sessionFile: string, cwd: string, tr
           throw new Error("session header does not match its managed identity");
         }
       } else {
-        if (typeof entry.type !== "string" || !SESSION_ENTRY_TYPES.has(entry.type)
+        // Pi owns entry payloads and message roles and can upgrade independently of Runtime.
+        // Validate the durable journal envelope, not a second, inevitably stale Pi schema.
+        if (typeof entry.type !== "string" || !entry.type.trim()
           || typeof entry.id !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(entry.id)
           || entryIds.has(entry.id)
-          || (entry.parentId !== null && typeof entry.parentId !== "string")
-          || (entryIds.size === 0 && entry.parentId !== null)
-          || (entryIds.size > 0 && (typeof entry.parentId !== "string" || !entryIds.has(entry.parentId)))
+          || (entry.parentId !== null && (typeof entry.parentId !== "string" || !entryIds.has(entry.parentId)))
           || typeof entry.timestamp !== "string" || !Number.isFinite(Date.parse(entry.timestamp))) {
           throw new Error("invalid session entry identity or ancestry");
         }
-        switch (entry.type) {
-          case "message": {
-            const message = entry.message;
-            if (!message || typeof message !== "object" || Array.isArray(message)
-              || typeof (message as Record<string, unknown>).role !== "string"
-              || !SESSION_MESSAGE_ROLES.has((message as Record<string, unknown>).role as string)) {
-              throw new Error("invalid message entry");
-            }
-            break;
-          }
-          case "thinking_level_change":
-            if (typeof entry.thinkingLevel !== "string") throw new Error("invalid thinking-level entry");
-            break;
-          case "model_change":
-            if (typeof entry.provider !== "string" || typeof entry.modelId !== "string") throw new Error("invalid model entry");
-            break;
-          case "compaction":
-            if (typeof entry.summary !== "string") throw new Error("invalid compaction entry");
-            break;
-          case "branch_summary":
-            if (typeof entry.fromId !== "string" || !entryIds.has(entry.fromId) || typeof entry.summary !== "string") {
-              throw new Error("invalid branch-summary entry");
-            }
-            break;
-          case "custom":
-            if (typeof entry.customType !== "string") throw new Error("invalid custom entry");
-            break;
-          case "custom_message":
-            if (typeof entry.customType !== "string" || typeof entry.display !== "boolean"
-              || (typeof entry.content !== "string" && !Array.isArray(entry.content))) {
-              throw new Error("invalid custom-message entry");
-            }
-            break;
-          case "label":
-            if (typeof entry.targetId !== "string" || !entryIds.has(entry.targetId)
-              || (entry.label !== undefined && typeof entry.label !== "string")) {
-              throw new Error("invalid label entry");
-            }
-            break;
-          case "session_info":
-            if (entry.name !== undefined && typeof entry.name !== "string") throw new Error("invalid session-info entry");
-            break;
+        // resetLeaf()/branchWithSummary(null, ...) legitimately create additional roots.
+        if (entry.type === "message") {
+          const message = entry.message;
+          if (!message || typeof message !== "object" || Array.isArray(message)
+            || typeof (message as Record<string, unknown>).role !== "string"
+            || !(message as Record<string, string>).role.trim()) throw new Error("invalid message entry");
         }
         entryIds.add(entry.id);
       }
@@ -449,7 +436,9 @@ export async function validatePiSessionFile(sessionFile: string, cwd: string, tr
     };
 
     while (true) {
+      options.signal?.throwIfAborted();
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      options.signal?.throwIfAborted();
       if (bytesRead === 0) break;
       pending += decoder.write(buffer.subarray(0, bytesRead));
       let newlineIndex = pending.indexOf("\n");
@@ -464,25 +453,29 @@ export async function validatePiSessionFile(sessionFile: string, cwd: string, tr
     if (pending.length > 0) validateLine(pending.replace(/\r$/, ""));
     if (lineNumber === 0) throw new Error("missing session header");
   } catch {
+    options.signal?.throwIfAborted();
     throw new Error("Managed Pi transcript is missing, redirected, or invalid");
   } finally {
-    await handle?.close();
+    try { await handle?.close(); } finally { release(); }
   }
 }
 
-export async function managedSessionState(
+export async function managedSessionAvailability(
   manifest: ManagedSessionManifest,
   isActive: boolean,
-): Promise<ManagedSessionState> {
-  if (isActive) return "active";
+  options: { signal?: AbortSignal } = {},
+): Promise<Pick<ManagedSessionSummary, "state" | "unavailableReason">> {
+  options.signal?.throwIfAborted();
+  if (isActive) return { state: "active" };
   if (!manifest.sessionFile || manifest.state === "starting" || manifest.state === "destroying") {
-    return "unavailable";
+    return { state: "unavailable", unavailableReason: "session_metadata_unavailable" };
   }
   try {
-    await validatePiSessionFile(manifest.sessionFile, manifest.cwd, manifest.transcriptId);
-    return "suspended";
+    await validatePiSessionFile(manifest.sessionFile, manifest.cwd, manifest.transcriptId, options);
+    return { state: "suspended" };
   } catch {
-    return "unavailable";
+    options.signal?.throwIfAborted();
+    return { state: "unavailable", unavailableReason: "session_transcript_invalid" };
   }
 }
 

@@ -10,7 +10,7 @@ import type {
   RuntimeSessionProfile,
   RuntimeImageContent,
 } from "@minu/runtime-core";
-import { sessionProfile, SESSION_PROFILE_LIMITS, SESSION_EVENTS_LIMITS, runtimeInput, RuntimeInputError, RUNTIME_INPUT_LIMITS } from "@minu/runtime-core";
+import { sessionProfile, SESSION_PROFILE_LIMITS, SESSION_EVENTS_LIMITS, sessionIntegrations, SESSION_INTEGRATIONS_LIMITS, type RuntimeIntegrationSnapshot, runtimeInput, RuntimeInputError, RUNTIME_INPUT_LIMITS } from "@minu/runtime-core";
 import { SessionEventLog } from "./session-events.js";
 
 const MAX_INPUT_BYTES = 1024 * 1024;
@@ -31,6 +31,7 @@ export interface PiBridgeServerOptions {
   getMessages?(): Promise<RuntimeMessage[]>;
   managedSession?: { id: string; ownerId: string };
   getSessionProfile?(signal: AbortSignal): Promise<RuntimeSessionProfile>;
+  getSessionIntegrations?(signal: AbortSignal): Promise<RuntimeIntegrationSnapshot>;
   stop?(): Promise<void> | void;
   /** Managed sessions reject stop unless idle, closing the send/stop race at admission. */
   stopRequiresIdle?: boolean;
@@ -78,7 +79,9 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
   let activeTurn: AgentTurn | undefined;
   let dispatchingTurn: AgentTurn | undefined;
   let stopRequested = false;
+  // Shared physical admission for native profile/integration RPC observations.
   let profileReading = false;
+  const observationWorkerId = randomUUID();
   let eventsReading = false;
   const eventLog = options.managedSession ? new SessionEventLog() : undefined;
 
@@ -191,6 +194,35 @@ export async function createPiBridgeServer(options: PiBridgeServerOptions): Prom
           liveSkillVerification: false,
         };
         json(response, 200, { capabilities });
+        return;
+      }
+
+      if (url.pathname === "/session-integrations") {
+        response.setHeader("cache-control", "no-store");
+        if (!options.managedSession || !options.getSessionIntegrations
+          || request.headers["x-minu-runtime-owner"] !== options.managedSession.ownerId
+          || request.headers["x-minu-runtime-session"] !== options.managedSession.id) {
+          json(response, 404, { error: "Session integrations unavailable" }); return;
+        }
+        if (request.method !== "GET") { json(response, 405, { error: "Read-only resource" }); return; }
+        if (url.search || profileReading || stopRequested || options.getStatus() === "offline") { json(response, 503, { error: "Session integrations unavailable" }); return; }
+        profileReading = true;
+        const controller = new AbortController();
+        const closed = () => controller.abort();
+        response.once("close", closed);
+        const timer = setTimeout(closed, SESSION_INTEGRATIONS_LIMITS.readMs);
+        const task = Promise.resolve().then(() => options.getSessionIntegrations!(controller.signal));
+        void task.then(() => { profileReading = false; }, () => { profileReading = false; });
+        try {
+          const value = await Promise.race([task, new Promise<never>((_, reject) => {
+            const aborted = () => reject(new Error("Session integrations unavailable"));
+            controller.signal.addEventListener("abort", aborted, { once: true });
+            if (controller.signal.aborted) aborted();
+          })]);
+          controller.signal.throwIfAborted();
+          if (!response.destroyed) json(response, 200, { snapshot: sessionIntegrations({ ...sessionIntegrations(value), workerId: observationWorkerId }) });
+        } catch { if (!response.destroyed) json(response, 503, { error: "Session integrations unavailable" }); }
+        finally { clearTimeout(timer); response.off("close", closed); }
         return;
       }
 

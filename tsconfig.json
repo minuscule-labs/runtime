@@ -3,6 +3,7 @@
   "references": [
     { "path": "packages/core" },
     { "path": "packages/pi" },
+    { "path": "packages/claude-code" },
     { "path": "packages/codex" },
     { "path": "packages/runtime" }
   ]
