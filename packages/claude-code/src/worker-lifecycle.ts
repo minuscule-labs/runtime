@@ -39,12 +39,18 @@ function cleanDispatch(m: ClaudeCodeManagedManifest): boolean {
   return m.native.state === "pending" ? m.lastDispatch.state === "none"
     : m.native.state === "bound" && m.lastDispatch.state === "settled" && m.lastDispatch.outcome === "completed";
 }
-/** Signal 0 ONLY: ESRCH means absent; permission/other errors never mean exited.
+/** Signal 0 ONLY: ESRCH means absent. EPERM leaves absence unproven, allowing
+ * the caller's bounded read-only wait to continue; it never authorizes clearing.
  * Used only for the qualified current fresh-origin group under the accepted contract.
  * No nonzero signals, recovered-PID control, process-name search or fallback. */
 function groupAbsent(group: number): boolean {
   try { process.kill(-group, 0); return false; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return true; throw unavailable(); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return true;
+    if (code === "EPERM") return false;
+    throw unavailable();
+  }
 }
 
 /** Healthy normal stop only. No lease across HTTP, no forced recovery or replay.

@@ -1,6 +1,32 @@
 # Claude Code Runtime implementation
 
-## Delivery checkpoint — draft PR preparation
+## Current rebase and stop correction — owner messages 146 and 148
+
+The feature branch is rebased onto `main` at `f5eb857`, preserving both Pi's
+unsupported integration-command classification and the headless UI refusal fence.
+Owner message 148 approved committing the correction and updating only this feature
+branch/PR with a lease-protected force push; no default-branch push is authorized.
+
+The stop failure is now reproduced/classified: after acknowledged quiesce, Darwin
+can report EPERM on a signal-0 group probe before a later ESRCH. Under boundary-test
+load, six of twelve fresh CLI stops failed at that probe before the correction.
+EPERM now leaves absence unproven and continues only the existing bounded read-only
+wait. It does NOT grant clearing. Fresh ESRCH, unchanged metadata/history and all
+existing admission/fence/deadline checks remain mandatory; stop is never replayed.
+Persistent EPERM times out without mutation, and other probe errors still refuse.
+Previously preserved failed fixtures are not repaired, cleared or retried.
+
+Three focused regressions pass (two failed before the code correction). The same
+loaded reproduction now passes 12/12, including four actual EPERM-to-ESRCH cases;
+267 boundary tests also pass. Final rebased workspace run: **614 passed, 2 skipped,
+0 failures** (616 total). The skips are main's existing explicit Pi native-artifact
+integration tests, whose opt-in commands were not supplied; no Claude case was
+excluded. Typecheck passed. Earlier failing results below remain historical, not
+silently erased. No real credentials or paid/external provider calls were used.
+This correction has local verification, not a new independent review or real-auth
+acceptance; the real authentication/model/tool release gate remains open.
+
+## Previous delivery checkpoint — draft PR preparation
 
 Owner message 140 authorizes creating a PR from `feat/claude-code-adapter` to `main`.
 The scope is the reviewed intermediate Claude implementation, its related shared

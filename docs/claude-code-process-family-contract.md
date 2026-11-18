@@ -19,6 +19,9 @@ still requires owner-approved source/scenario/budget; neither approval waives it
 Publishing a feature PR is not production or release acceptance. Existing populated
 `group:null` workers are not migrated or treated as eligible exit domains.
 
+The local rebase/EPERM-wait correction and its current verification are recorded in
+the plan; those later changes are not covered by the earlier independent approvals.
+
 This contract is a documented milestone boundary, not a new runtime flag/schema or
 removal of R01–R41 from the full delivery target. See
 [implementation plan](claude-code-adapter-plan.md).
@@ -69,8 +72,11 @@ An eligible normal-retirement implementation must combine:
    ACK/socket closure/offline status. The original creator's retained ChildProcess
    and a controller after restart have different available evidence. Normal controller
    observation uses only signal 0 on the current qualified, trusted fresh-origin group;
-   ESRCH is absence, while permission/unknown errors remain unavailable. Trusted origin
-   is a private-metadata/controlled-launch invariant, not codec validity or OS attestation.
+   Only ESRCH proves absence. EPERM leaves absence unproven: during the existing
+   bounded read-only wait it can be followed by a fresh probe, never another stop.
+   Persistent EPERM, an EPERM during final admission, and other probe errors cannot
+   authorize clearing. Trusted origin is a private-metadata/controlled-launch
+   invariant, not codec validity or OS attestation.
 4. Fresh exact-snapshot/revision/fence checks under the lifecycle lease before any
    permitted metadata clear. Do not silently rebase after observing absence.
 5. Separate exact native-history eligibility/validation before resume. A safe parsed

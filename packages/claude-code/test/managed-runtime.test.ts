@@ -137,6 +137,62 @@ for (const action of ["stop", "resume"]) test(`hidden uncompleted input plus sna
   assert.equal((next as unknown as { ownedChildren: Map<string, ChildProcess> }).ownedChildren.size, 0, "rejection must not launch replacement");
 });
 
+test("transient group-probe EPERM waits for genuine absence without replaying quiesce or clearing early", { timeout: 10_000 }, async t => {
+  const f = await fixture(t), session = await f.runtime.start({ cwd: f.cwd }), before = (await f.read(session.id))!;
+  assert.equal(before.worker.state, "live"); if (before.worker.state !== "live") return;
+  const group = before.worker.registration.pid;
+  assert.equal(before.worker.registration.processGroupId, group);
+  const kill = process.kill, quiesce = ClaudeCodeWorkerClient.prototype.requestQuiesceIdle;
+  let allowProof = false, absenceProofs = 0, requests = 0, settled = false, observed!: () => void;
+  const probe = new Promise<void>(resolve => { observed = resolve; });
+  process.kill = (pid, signal) => {
+    if (pid === -group && signal === 0) {
+      if (!allowProof) { observed(); throw Object.assign(new Error("Unproven process group"), { code: "EPERM" }); }
+      try { return kill(pid, signal); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") absenceProofs++; throw error; }
+    }
+    return kill(pid, signal);
+  };
+  ClaudeCodeWorkerClient.prototype.requestQuiesceIdle = async function(...args) { requests++; return quiesce.apply(this, args); };
+  const stopping = f.runtime.stop(session.id).then(() => true, () => false).finally(() => { settled = true; });
+  try {
+    await probe;
+    assert.deepEqual(await f.read(session.id), before, "EPERM must not grant any metadata mutation");
+    assert.equal(settled, false, "Unproven absence should remain pending within the deadline");
+    allowProof = true;
+    assert.equal(await stopping, true);
+    const stopped = (await f.read(session.id))!;
+    assert.equal(stopped.worker.state, "none"); assert.equal(stopped.requiresExplicitResume, true);
+    assert.deepEqual(stopped.native, before.native); assert.deepEqual(stopped.lastDispatch, before.lastDispatch);
+    assert.notEqual(stopped.generation, before.generation);
+    assert.ok(absenceProofs >= 3, "Fresh ESRCH is required outside and twice inside final admission");
+    assert.equal(requests, 1, "Waiting for proof must not replay stop");
+  } finally {
+    allowProof = true; process.kill = kill; ClaudeCodeWorkerClient.prototype.requestQuiesceIdle = quiesce;
+    await stopping;
+  }
+});
+
+for (const code of ["EPERM", "EIO"]) test(`persistent group-probe ${code} cannot clear metadata or grant resume`, { timeout: 10_000 }, async t => {
+  const f = await fixture(t), session = await f.runtime.start({ cwd: f.cwd }), before = (await f.read(session.id))!;
+  assert.equal(before.worker.state, "live"); if (before.worker.state !== "live") return;
+  const group = before.worker.registration.pid, kill = process.kill;
+  assert.equal(before.worker.registration.processGroupId, group);
+  const quiesce = ClaudeCodeWorkerClient.prototype.requestQuiesceIdle; let probes = 0, requests = 0;
+  process.kill = (pid, signal) => {
+    if (pid === -group && signal === 0) { probes++; throw Object.assign(new Error("Unproven process group"), { code }); }
+    return kill(pid, signal);
+  };
+  ClaudeCodeWorkerClient.prototype.requestQuiesceIdle = async function(...args) { requests++; return quiesce.apply(this, args); };
+  try {
+    await assert.rejects(suspendClaudeCodeWorker(f.store, session.id, "owner", f.options.workerExecutable!, 2_000));
+    assert.deepEqual(await f.read(session.id), before);
+    assert.equal(requests, 1); assert.ok(probes >= (code === "EPERM" ? 2 : 1));
+    await assert.rejects(f.controller().resume(session.id, "owner", { allowStopped: true }));
+    assert.deepEqual(await f.read(session.id), before);
+  } finally { process.kill = kill; ClaudeCodeWorkerClient.prototype.requestQuiesceIdle = quiesce; }
+});
+
 test("late clear confirmation preserves the actual committed checkpoint but cannot report deadline success", async t => {
   const f = await fixture(t), session = await f.runtime.start({ cwd: f.cwd });
   const lock = f.store.withSessionLock.bind(f.store); let clears = 0, committed: Awaited<ReturnType<typeof f.read>>;
