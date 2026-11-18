@@ -7,8 +7,285 @@ Runtime does not provide shared communication, durable session analytics, remote
 ## Packages
 
 - `core` — normalized `AgentRuntime`, lifecycle, status, events, messages, and start configuration.
-- `pi` — Pi RPC worker, attached-TUI bridge, local registry, client, and standalone CLI.
+- `pi` — Pi RPC worker, attached-TUI bridge, local registry, client, and legacy Pi CLI module.
+- `codex` — native Codex app-server adapter with managed execution, reconnect, and macOS idle suspend/exact-thread resume.
 - `claude-code` — native Claude SDK adapter, durable text-only controller and standalone CLI (implementation reviewed; real-auth acceptance pending).
+- `runtime` — `@minu/runtime` public adapter factory and the `minu-runtime` CLI.
+
+## Shared API and CLI
+
+```ts
+import { createRuntime } from "@minu/runtime";
+const pi = createRuntime(); // unchanged Pi default; never an error fallback
+const codex = createRuntime("codex", { managedRoot: "/absolute/private/managed" });
+// Persist the returned session's runtime together with its ID.
+// For an existing living worker only (no launch or cold resume):
+await codex.connectManaged(sessionId, ownerId);
+```
+
+After `pnpm install && pnpm build`, `pnpm runtime` and `minu-runtime` use the shared
+entry point. Bare legacy Pi IDs and existing Pi CLI commands retain Pi behavior.
+The old `@minu/runtime-pi/cli` module remains available; the shared package now owns
+the command binary. Selection is explicit, without global preference changes or
+fallback between adapters. Codex CLI IDs are qualified as `codex:<id>` so copying
+an ID into a later command preserves its adapter; conflicting `--adapter` rejects.
+Unqualified Codex IDs require `--adapter codex`.
+
+```sh
+pnpm runtime --adapter codex --owner cli start --cwd "$PWD"
+# Copy the returned codex:<id> into later commands:
+pnpm runtime --owner cli status codex:<id>
+pnpm runtime --owner cli send codex:<id> "Review README.md"
+pnpm runtime --owner cli suspend codex:<id>
+pnpm runtime --owner cli resume codex:<id>
+pnpm runtime --owner cli destroy codex:<id>
+```
+
+Every Codex session operation requires the exact explicit `--owner`. Optional
+`--managed-root` selects its private metadata root. Creation is managed/lazy;
+ordinary status/control/history commands only connect to living workers and never
+implicitly cold-resume. `resume` is explicit. Existing macOS/v5 suspend/destroy
+eligibility limits still apply; `stop` is not verified suspension or force recovery.
+
+The CLI also exposes `capabilities`, model/provider/reasoning/skill launch choices,
+`start-turn`/`turn`, repeated `--image <file>` inputs (including image-only turns),
+`steer`, `interrupt`, `watch`, `messages`, `profile`, `observations`, and explicit
+`diagnostic`. Images use Core bounds and regular local PNG/JPEG/GIF/WebP files.
+Caller turn IDs retain the worker-lifetime boundary; an absent turn is not permission
+to replay. Conversations loading/packaging and selection policy remain separate,
+uncompleted integration work.
+
+## Native Codex adapter
+
+`@minu/runtime-codex` implements the existing Runtime interface using one dedicated
+`codex app-server --listen stdio://` process per owned session. The Codex executable
+must be installed and authenticated separately. Protocol/resume checks used Codex
+CLI `0.160.0`; `0.167.0` also passed the managed suspend/resume/history loop against a controlled loopback provider. Full native model/tool
+acceptance and compatibility across versions remain open; see the implementation plan.
+
+```ts
+import { CodexAgentRuntime } from "@minu/runtime-codex";
+
+const runtime = new CodexAgentRuntime(); // read-only sandbox
+const session = await runtime.start({
+  cwd: process.cwd(),
+  appendSystemPrompt: "You are a skeptical code reviewer.",
+});
+try {
+  await runtime.send(session.id, "Review README.md without changing files.");
+  console.log(await runtime.messages(session.id));
+} finally {
+  await runtime.stop(session.id);
+}
+```
+
+This adapter supports text and bounded ordered image turns, caller-stable turn IDs,
+normalized messages/events, sanitized activity, steering and interruption. Exact
+model/reasoning selections are checked against the launch response and known native
+model metadata; unsupported or mismatched selections fail rather than silently
+falling back. Native `none` reasoning maps to Runtime `off`; `max` is accepted only
+for native models that advertise it. Full prompt replacement maps
+to Codex base instructions, and appended personas map to developer instructions.
+
+Execution defaults to a read-only native sandbox. To allow native workspace writes,
+construct with `{ sandbox: "workspace-write" }`. Approval policy is `never`: the
+adapter does not grant escalation or bypass the sandbox. Unexpected server requests
+for approvals, user answers or other interactive operations fail the turn and stop
+that session instead of hanging or inventing approval. A request deadline likewise
+takes the session offline because dispatch outcome may be uncertain; do not blindly
+retry in a new session. Interruption acknowledgment alone is not turn completion,
+and interruption/stop do not roll back tool side effects.
+
+Codex inherits the host environment and its own native configuration, authentication,
+hooks, skills and MCP servers—not Pi's extensions/settings. Configured native
+integrations may execute code or contact external services; a shell sandbox is not
+a blanket authorization policy for external tools. Codex may persist prompts and
+responses in its own history. Stopping Runtime does not delete that history.
+Raw messages/events contain agent/tool content and are not presentation-safe;
+only `activityEvents` exposes the fixed sanitized activity vocabulary.
+
+### Native launch and input capabilities
+
+`capabilities({ cwd })` explicitly discovers native models/reasoning and opaque skill
+IDs. One temporary app-server and one ephemeral read-only/approval-never thread
+resolve effective defaults; results return only after confirmed shutdown. Discovery
+dispatches no user input/model/tool call, registers no managed session, mutates no
+shared settings and creates no persisted conversation. Failures stay unavailable;
+there is no guessed provider, retry or replacement settings resolver. A configured
+custom model need not appear in the native catalog; its verified effective model is
+still returned, with unknown reasoning defaults omitted.
+
+Select skills using discovered `skillIds`; `[]` disables all discovered skills,
+including builtins, through per-thread native config. Omission preserves harness
+defaults. IDs are path hashes, not paths; unknown IDs fail. The selection is resolved
+again on native allocation/resume without changing shared native configuration.
+
+`send`/`startTurn` accept Core image objects: PNG/JPEG/GIF/WebP with canonical base64,
+at most four images, 10 MiB each and 20 MiB combined. Ordered MIME/pixels participate
+in turn identity; polling/history/events never copy image parts. Native failure
+diagnostics are generic, including text-only failures after earlier image turns. Native transport/history remain bounded at 34 MiB; larger saved
+histories reject rather than silently truncate. Image-only input is allowed.
+
+`inputCapabilities` reads native metadata verified for the actual opened model;
+every turn pins that model, and rerouting seals the session. It sends no catalog RPC
+that could time out and stop existing work. Known text-only models
+report false; missing metadata and unallocated/offline native sessions report
+unavailability without allocation. Images require verified vision metadata. Custom
+provider text and exact native-acknowledged reasoning remain usable without catalog
+metadata; known unsupported reasoning is rejected rather than silently falling back. `sessionCapabilities` uses the authenticated worker; it does
+not mistake global skill discovery for live per-thread skill verification, which
+remains false. Neither live query uses the ephemeral discovery thread.
+
+### Existing-worker observations and diagnostics
+
+`inspectSessionProfile(id, ownerId, { signal })` and `inspectSessionEvents` read the
+exact owner's current ready worker without launching/resuming Native work or binding
+control routing in a fresh adapter. Reads are bounded to two seconds and fixed Core
+byte limits. Unknown, older, fenced, corrupt or unreachable workers return `undefined`;
+caller cancellation throws `AbortError`. One physical read per owner/session and 16
+per adapter are retained until their work settles, including canceled filesystem reads.
+
+Profiles use the actual native thread's acknowledged model/provider/reasoning, never
+saved launch settings or discovery defaults. Pending native allocation has unverified
+fields; identifiers that cannot be safely represented are `not_verified`. Skills stay
+`not_verified`: global discovery is not live proof of commands/instructions loaded
+in a thread. Profile observation sends no native model/read/turn requests.
+
+Structured observations contain only Core bridge codes, sequence/timestamps and
+truthful eviction data: the current worker's last 200 records, with no continuity
+across restarts. Dispatch codes describe Runtime admission/dispatch calls—not native
+logs, model/tool payloads or proof that a downstream consumer received anything.
+
+`openDiagnostic(id)` is an explicit action for an owner-authorized living managed
+worker. It writes only projected profile/event snapshots into a bounded 0600 file in
+an owner-private `.diagnostics` directory, separate from resume metadata/native
+history. It refuses unsafe files/links/permissions and rechecks authority before
+launching. macOS currently uses only verified root-owned canonical system `open` and
+TextEdit, with fixed arguments/no shell. Unsupported/headless hosts reject honestly.
+Success acknowledges the viewer launcher's zero exit—not that a person read a window.
+Observation never opens a viewer; tests stub that boundary and do not launch apps.
+
+### Owner-scoped managed sessions
+
+```ts
+const ownerId = "my-runtime-installation";
+const managed = await runtime.startManaged({ cwd: process.cwd() }, ownerId);
+await runtime.send(managed.id, "Review README.md without changing files.");
+
+// macOS: idle-only, verified history-preserving suspension.
+await runtime.suspend(managed.id, ownerId);
+// A new consumer explicitly authorizes the same owner and exact native thread.
+const nextConsumer = new CodexAgentRuntime();
+const same = await nextConsumer.resume(managed.id, ownerId);
+console.log(await nextConsumer.messages(same.id));
+```
+
+`startManaged` persists a stable owner-scoped ID/configuration and opens a reachable
+pending worker. It does **not** launch Codex or validate native model/authentication
+until valid first input. `managedRoot` optionally selects an absolute, canonical,
+owner-private storage root; the default is `~/.minu/runtime-codex/managed`. Consumers
+using a custom root must use the same root to reconnect.
+
+New macOS managed sessions use v5 records. `suspend` seals idle admission, records
+owned native shutdown, checks the original worker's absence using fresh matching
+Darwin host/boot observations, and verifies persisted native history against a sealed
+checkpoint. Inspection uses a temporary owned app-server with no thread creation or
+input dispatch. Only a complete verified receipt grants clean cold-resume eligibility.
+Busy, missing-history, permission, provenance and uncertain outcomes fail closed.
+Matching OS observations use Runtime's local-host assumption, not namespace attestation.
+Post-shutdown readback verifies recoverable history at that boundary; power-loss
+durability and tool-descendant/group shutdown are not inferred.
+
+`resume` authenticates a living worker, launches a never-attempted pending identity,
+or reopens a cleanly suspended session through one fenced resume epoch. The epoch
+retains its immediate predecessor's retirement/history evidence and preserves the
+exact native thread, workspace and saved execution policy. Bound resume never starts
+a replacement thread, replays prior input or clears a recovery fence—even with
+`allowStopped: true`. Missing/corrupt history or interrupted resume stays unavailable;
+there is no automatic retry. A retained failed turn remains readable from its living
+worker without authorizing new work.
+
+Existing v4 sessions are not migrated or enrolled. Other platforms retain v4
+create/turn/reconnect and explicitly reject suspend/cold resume for now. macOS
+provenance failures do not silently downgrade or authorize teardown of adopted work. Unknown IDs do not trigger owner discovery:
+call `startManaged` or exact-owner `resume` before ID-only controls in each adapter
+instance. Different owners or in-process sessions cannot overwrite a local binding
+with the same ID.
+
+`listManagedSessions` does not start native processes or bind control routing.
+`active` means authenticated worker status is idle/working, not verified model
+readiness; `suspended` denotes verified clean suspension or never-attempted saved
+pending configuration without a worker. Inventory is read-only; cold resume rechecks
+native history before readiness. Fenced, uncertain, offline and unreachable registrations are
+`unavailable`. Corrupt/unsafe/incomplete records cause an explicit sanitized failure,
+not silent omission or repair. Summaries exclude private connection/native metadata.
+
+Managed text/turn/status/history/steer/interrupt/normal-stop calls route to that
+worker. Missing retained turns return `undefined`; unreachable observations fail
+rather than fabricate history/results. A known unreachable managed session reports
+`offline`; an unknown/unbound ID rejects. `send` waits for settlement and never
+replays on lost acknowledgments or observation failure. Prefer caller-stable
+`startTurn` IDs within that living worker's retention window. After cold resume,
+a missing old caller-turn ID is not permission to replay uncertain input.
+
+Normal managed `stop` confirms the worker's native-stop response and preserves
+metadata, but does not create a clean-suspension receipt: use `suspend` for later
+cold resume. Neither operation proves tool-descendant/group exit or establishes a
+recovery fence. Messages are hydrated from native history after clean resume.
+Caller-turn lookup/idempotency remains bounded to the original worker's retention
+window; native history is not a durable caller-turn or exactly-once tool ledger.
+`destroy(id, ownerId)` reuses verified idle suspension, then removes only Runtime
+resume metadata under the same revision-checked lifecycle lock. Codex history is
+never deleted. Never-launched pending metadata can also be removed, including v4;
+active v4/unsupported-platform, busy, fenced, stopped-without-receipt or otherwise
+uncertain material rejects without recovery or force-stop. Concurrent cold resume
+and destruction cannot both mutate the same generation. Publication/lock-return
+failure remains uncertain, even when canonical metadata is already gone. Lifecycle
+lock files are retained; unexpected files in the resume directory prevent deletion.
+
+Managed `events` observes that authenticated living worker over bounded HTTP
+streaming. Its first event is a current status snapshot; await that snapshot before
+relying on observation of subsequent input. Opening/cancelling/losing a stream
+never allocates Codex, replays input or stops the worker. Streams are live-only:
+reconnect does not replay missed events or establish durable history continuity.
+`activityEvents` reuses the phase/timestamp-only projection and is caller-abortable.
+Observation failures reject with a fixed generic error and no raw cause; cancellation
+still completes cleanly. Raw events/errors remain diagnostic, not presentation-safe.
+Safe activity is advertised only after a live stream handshake; older reachable
+workers lacking the endpoint remain unverified. Images remain unavailable; no
+saved config is presented as a live profile or native capability proof.
+
+There are at most 16 subscriptions per worker, with 256 queued frames / 2 MiB of
+wire-equivalent data per subscriber and 256 KiB per frame. Network drain waits are
+bounded to two seconds; overflow, malformed/wrong-session frames, lost authority
+or an unclean disconnect fail explicitly, never silently drop and continue. An
+idle subscription rechecks authority every 250 ms, and every delivered event is
+re-authorized. Cancellation releases blocked reads/handshakes without waiting for
+an event. The ten-second handshake deadline does not limit an established stream.
+Use one outstanding `next()` per iterator. Normal stop closes streams, which may
+report a gap; use retained turn lookup—not stream closure, interrupt acknowledgment
+or `offline` status—as evidence of actual turn settlement. Worker loss still ends
+the retention window; there is no durable stream/caller-turn ledger.
+
+**Still required and not yet implemented:** explicit force-stop recovery,
+cross-platform suspend/cold resume and legacy migration policy, native TUI
+attachment and Conversations/CLI selection. Native launch/input capabilities are
+independently approved; profile/structured observations and managed local diagnostics
+await behavior-level independent review. Non-macOS viewers and direct/unmanaged
+diagnostic opening are not implemented. The existing `minu-runtime` CLI and
+Conversations loader still use Pi.
+
+In-process session state/history remain in their adapter instance. Managed retained
+turns survive consumer restart only while the same worker lives. Both modes retain
+the most recent 1,000 turns by default (`turnRetentionLimit`), not a durable
+caller-turn ledger or exactly-once tool guarantee. In-process event subscribers
+have bounded queues; slow readers are disconnected without stopping native work.
+
+See the [required functionality checklist](docs/runtime-functionality-matrix.md)
+for Runtime requirements, acceptance criteria and remaining work, and the
+[phased implementation plan](docs/codex-adapter-plan.md) for sequencing.
+All listed functionality is required; deferred delivery and optional API methods
+do not make product functionality optional.
 
 ## Claude Code adapter (initial slice)
 
@@ -127,6 +404,7 @@ without model requests or adapter/store imports. Run them after building:
 pnpm check
 node --test packages/claude-code/dist/test/cli-black-box.test.js
 ```
+
 
 ## Contract
 

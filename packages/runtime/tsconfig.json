@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "composite": true, "declaration": true, "outDir": "dist", "rootDir": ".",
+    "module": "NodeNext", "moduleResolution": "NodeNext", "target": "ES2022",
+    "strict": true, "skipLibCheck": true, "types": ["node"]
+  },
+  "references": [{ "path": "../core" }, { "path": "../pi" }, { "path": "../codex" }],
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

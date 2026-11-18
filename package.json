@@ -12,10 +12,11 @@
     "check": "tsc -b --pretty false",
     "test": "pnpm build && node --test packages/*/dist/test/*.test.js",
     "test:headless": "pnpm build && node test/run-headless-conformance.mjs",
-    "runtime": "node packages/pi/dist/src/cli.js",
+    "runtime": "node packages/runtime/bin/minu-runtime.js",
     "runtime:claude": "node packages/claude-code/dist/src/cli.js"
   },
   "devDependencies": {
+    "@minu/runtime": "workspace:*",
     "@earendil-works/pi-coding-agent": "^0.84.3",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
