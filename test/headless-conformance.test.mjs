@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { access, copyFile, chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -86,8 +87,10 @@ async function open(adapter, scenario) {
       const body = await readFile(peer, "utf8");
       const method = "item/commandExecution/requestApproval";
       assert.equal(body.split(method).length, 2, "Codex fixture's known request method changed");
+      // The copy leaves the package, so pin its bare workspace import to the snapshot's own core.
+      const core = pathToFileURL(createRequire(join(codexRoot, "packages/codex/package.json")).resolve("@minu/runtime-core")).href;
       peer = join(directory, "app-server.mjs");
-      await writeFile(peer, body.replace(method, "future/interactive"));
+      await writeFile(peer, body.replace(method, "future/interactive").replaceAll('from "@minu/runtime-core"', `from ${JSON.stringify(core)}`));
     }
     runtime = new CodexAgentRuntime({ command: process.execPath,
       args: [peer, ["question", "unknown"].includes(scenario) ? "interactive" : scenario === "stop" ? "held" : "normal", logFile],
