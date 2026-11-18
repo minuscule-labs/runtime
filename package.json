@@ -11,7 +11,9 @@
     "build": "tsc -b",
     "check": "tsc -b --pretty false",
     "test": "pnpm build && node --test packages/*/dist/test/*.test.js",
-    "runtime": "node packages/pi/dist/src/cli.js"
+    "test:headless": "pnpm build && node test/run-headless-conformance.mjs",
+    "runtime": "node packages/pi/dist/src/cli.js",
+    "runtime:claude": "node packages/claude-code/dist/src/cli.js"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.3",
