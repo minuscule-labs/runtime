@@ -131,7 +131,7 @@ function handleEvent(event: RpcEvent): void {
         timestamp,
       });
     }
-  } else if (event.type === "extension_error" || event.type === "rpc_parse_error") {
+  } else if (event.type === "extension_error" || event.type === "rpc_parse_error" || event.type === "rpc_interaction_error") {
     bridge?.publish({ type: "error", sessionId, message: String(event.error ?? event.type), timestamp });
   }
 }
