@@ -243,7 +243,7 @@ test("unsupported launch/input/control options fail explicitly before model work
   await assert.rejects(live.startTurn(session.id, "empty", "  "), /required/);
   await assert.rejects(live.startTurn(session.id, "oversize", "x".repeat(1024 * 1024 + 1)), /exceeds/);
   await assert.rejects(live.startTurn(session.id, "", "text"), /Turn id/);
-  await assert.rejects(live.steer(session.id, "steer"), /not supported/);
+  await assert.rejects(live.steer(session.id, "steer"), /no running turn/, "steering needs a running turn");
   assert.equal(await live.status(session.id), "idle");
   assert.equal("startManaged" in live, false);
 });

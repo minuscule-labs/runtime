@@ -46,7 +46,9 @@ export interface ClaudeCodeDispatchIdentity {
 export type ClaudeCodeDispatchState =
   | { state: "none" }
   | (ClaudeCodeDispatchIdentity & { state: "dispatching"; generation: string })
-  | (ClaudeCodeDispatchIdentity & { state: "settled"; generation: string; outcome: "completed" | "failed" | "interrupted" });
+  | (ClaudeCodeDispatchIdentity & { state: "settled"; generation: string; outcome: "completed" | "failed" | "interrupted";
+    /** sha256 of each steering message sent during this dispatch; lets history eligibility accept exactly those deliveries. */
+    steers?: string[] });
 
 export interface ClaudeCodeWorkerProcess { pid: number; processGroupId: number | null }
 /** v4 launches carry the exact argv identity markers (`marked`) and the boot they started in. Neither
@@ -101,7 +103,7 @@ export interface ClaudeCodeManifestLease {
   beginDispatch(expectedRevision: number, generation: string, identity: ClaudeCodeDispatchIdentity): Promise<ClaudeCodeManagedManifest>;
   /** Only the current, unfenced generation and exact native/caller input may record a terminal result. */
   settleDispatch(expectedRevision: number, generation: string, identity: ClaudeCodeDispatchIdentity,
-    outcome: "completed" | "failed" | "interrupted"): Promise<ClaudeCodeManagedManifest>;
+    outcome: "completed" | "failed" | "interrupted", steers?: string[]): Promise<ClaudeCodeManagedManifest>;
   reserveWorker(expectedRevision: number, generation: string, reservationId: string, workerExecutable: string,
     launch?: ClaudeCodeWorkerLaunchIdentity): Promise<ClaudeCodeManagedManifest>;
   /** Commit before fork. A starting reservation with no recorded PID remains uncertain. */
@@ -151,7 +153,9 @@ function validDispatch(value: unknown): value is ClaudeCodeDispatchState {
   return dispatchIdentity(value) && typeof value.generation === "string" && ID.test(value.generation)
     && (value.state === "dispatching" ? keys(value, ["state", "turnId", "fingerprint", "nativeMessageId", "generation"])
       : value.state === "settled" && ["completed", "failed", "interrupted"].includes(value.outcome as string)
-        && keys(value, ["state", "turnId", "fingerprint", "nativeMessageId", "generation", "outcome"]));
+        && keys(value, ["state", "turnId", "fingerprint", "nativeMessageId", "generation", "outcome", "steers"])
+        && (value.steers === undefined || (Array.isArray(value.steers) && value.steers.length <= 64
+          && value.steers.every(item => typeof item === "string" && /^[a-f0-9]{64}$/.test(item)))));
 }
 function sameDispatch(left: ClaudeCodeDispatchIdentity, right: ClaudeCodeDispatchIdentity): boolean {
   return left.turnId === right.turnId && left.fingerprint === right.fingerprint && left.nativeMessageId === right.nativeMessageId;
@@ -295,7 +299,7 @@ export class ClaudeCodeManagedStore {
         beginNativeCreation: (revision, sessionId) => mutate(() => this.bindLocked(id, ownerId, revision, sessionId, false)),
         bindNativeSession: (revision, sessionId) => mutate(() => this.bindLocked(id, ownerId, revision, sessionId, true)),
         beginDispatch: (revision, generation, identity) => mutate(() => this.dispatchLocked(id, ownerId, revision, generation, identity)),
-        settleDispatch: (revision, generation, identity, outcome) => mutate(() => this.dispatchLocked(id, ownerId, revision, generation, identity, { outcome })),
+        settleDispatch: (revision, generation, identity, outcome, steers) => mutate(() => this.dispatchLocked(id, ownerId, revision, generation, identity, { outcome, ...(steers?.length ? { steers } : {}) })),
         reserveWorker: (revision, generation, reservationId, workerExecutable, launch) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "reserve", reservationId, workerExecutable, ...(launch ? { launch } : {}) })),
         beginWorkerStart: (revision, generation, reservationId) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "begin", reservationId })),
         recordWorkerProcess: (revision, generation, reservationId, pid, processGroupId) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "process", reservationId, pid, processGroupId })),
@@ -396,7 +400,7 @@ export class ClaudeCodeManagedStore {
   }
   private async dispatchLocked(
     id: string, ownerId: string, revision: number, generation: string, identity: ClaudeCodeDispatchIdentity,
-    completion?: { outcome: "completed" | "failed" | "interrupted" },
+    completion?: { outcome: "completed" | "failed" | "interrupted"; steers?: string[] },
   ): Promise<ClaudeCodeManagedManifest> {
     const outcome = completion?.outcome;
     const snapshot = JSON.parse(JSON.stringify(identity)) as ClaudeCodeDispatchIdentity;
@@ -420,7 +424,7 @@ export class ClaudeCodeManagedStore {
     }
     const lastDispatch: ClaudeCodeDispatchState = outcome === undefined
       ? { ...snapshot, state: "dispatching", generation }
-      : { ...snapshot, state: "settled", generation, outcome };
+      : { ...snapshot, state: "settled", generation, outcome, ...(completion!.steers?.length ? { steers: [...new Set(completion!.steers)] } : {}) };
     return this.publishUpdate({ ...current, revision: current.revision + 1, lastDispatch });
   }
   private async removeLocked(id: string, ownerId: string, revision: number): Promise<ClaudeCodeManagedManifest> {

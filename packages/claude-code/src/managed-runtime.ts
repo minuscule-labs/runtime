@@ -227,16 +227,16 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
   }
   startTurn(id: string, turnId: string, input: string, images?: RuntimeImageContent[]) {
     return this.guard(async () => {
-      const parts = runtimeInput(input, images); if (parts.images.length || Buffer.from(parts.input).toString() !== parts.input) throw unavailable();
+      const parts = runtimeInput(input, images); if (Buffer.from(parts.input).toString() !== parts.input) throw unavailable();
       if (typeof turnId !== "string" || Buffer.from(turnId).toString() !== turnId) throw unavailable();
       const live = await this.live(id), previous = live.manifest.lastDispatch;
       if (previous.state !== "none" && previous.turnId === turnId && previous.generation !== live.manifest.generation) throw unavailable();
-      return this.inputClient(live.registration).startTurn(turnId, parts.input);
+      return this.inputClient(live.registration).startTurn(turnId, parts.input, parts.images.length ? parts.images : undefined);
     });
   }
   send(id: string, input: string, images?: RuntimeImageContent[]) {
-    return this.guard(async () => { const parts = runtimeInput(input, images); if (parts.images.length || Buffer.from(parts.input).toString() !== parts.input) throw unavailable();
-      const live = await this.live(id); await this.inputClient(live.registration).send(parts.input); });
+    return this.guard(async () => { const parts = runtimeInput(input, images); if (Buffer.from(parts.input).toString() !== parts.input) throw unavailable();
+      const live = await this.live(id); await this.inputClient(live.registration).send(parts.input, parts.images.length ? parts.images : undefined); });
   }
   turn(id: string, turnId: string) { return this.guard(async () => (await this.live(id)).client.turn(turnId)); }
   status(id: string) { return this.guard(async () => {
@@ -246,7 +246,14 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
   }); }
   inputCapabilities(id: string) { return this.guard(async () => (await this.live(id)).client.inputCapabilities()); }
   sessionCapabilities(id: string) { return this.guard(async () => (await this.live(id)).client.sessionCapabilities().then(value => { if (!value) throw unavailable(); return value; })); }
-  steer(_id: string, _input: string): Promise<void> { return Promise.reject(new Error("Claude Code managed steering is unsupported")); }
+  /** Queues a message into the running turn; refused unless a dispatch is in flight (never starts or replays a turn). */
+  steer(id: string, input: string): Promise<void> {
+    return this.guard(async () => {
+      const text = runtimeInput(input, undefined).input, live = await this.live(id), dispatch = live.manifest.lastDispatch;
+      if (dispatch.state !== "dispatching") throw unavailable();
+      await live.client.steer(dispatch.turnId, text);
+    });
+  }
   interrupt(id: string) {
     return this.guard(async () => { const live = await this.live(id), dispatch = live.manifest.lastDispatch;
       if (dispatch.state === "dispatching") await live.client.interrupt(dispatch.turnId);

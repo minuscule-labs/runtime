@@ -16,6 +16,7 @@ import { Queue } from "./queue.js";
 import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeSelectionOptions, claudeCodeSkillOptions, claudeCodeSupportsImages,
   validateClaudeCodeSelection, verifyClaudeCodeSelection } from "./launch-options.js";
 import { probeClaudeCode } from "./probe.js";
+import { claudeCodeVersionSupported } from "./native-history.js";
 import { claudeCodePermissionOptions, resolveClaudeCodePermissions, type ClaudeCodePermissionPolicy, type ClaudeCodePermissions } from "./permissions.js";
 import { claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
 
@@ -71,8 +72,15 @@ function deferred() {
   return { promise, resolve };
 }
 
+/** A steering message queued into the live streaming input of the running turn. */
+interface Steer { steer: true; uuid: string; text: string; execution: Execution }
+
 interface Execution {
   turn: AgentTurn;
+  images: RuntimeImageContent[];
+  /** Native message ids / sha256 of steering messages delivered during this turn (their result frames may carry the id). */
+  steerIds: Set<string>;
+  steerFingerprints: string[];
   digest: string;
   nativeId: ReturnType<typeof randomUUID>;
   sending: boolean;
@@ -97,7 +105,7 @@ interface SessionState {
   process?: ChildProcess;
   exited: ReturnType<typeof deferred>;
   abort: AbortController;
-  inputs: Queue<Execution>;
+  inputs: Queue<Execution | Steer>;
   turns: Map<string, Execution>;
   active?: Execution;
   control?: Promise<void>;
@@ -232,7 +240,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
         }
       }
       const snapshot = await inspectClaudeCodeHistory({ nativeSessionId: native.nativeSessionId,
-        canonicalCwd: cwd, nativeConfigRoot: root, nativeRoot: native.nativeRoot, signal: native.signal });
+        canonicalCwd: cwd, nativeConfigRoot: root, nativeRoot: native.nativeRoot, acceptQueuedDeliveries: native.nativeRoot, signal: native.signal });
       if (native.mode === "resume") {
         if (snapshot.state !== "present") throw new Error("Mapped Claude Code native history is missing");
         history = snapshot.messages;
@@ -247,7 +255,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       session: { id, runtime: "claude-code", ownership: "owned", cwd },
       nativeId: native?.nativeSessionId ?? id, persistent: !!native, policy, images: false,
       status: "idle", abort: new AbortController(), exited: deferred(),
-      inputs: new Queue<Execution>(this.retention), turns: new Map(), messages: history.map(message => ({ ...message })), tools: new Map(),
+      inputs: new Queue<Execution | Steer>(this.retention), turns: new Map(), messages: history.map(message => ({ ...message })), tools: new Map(),
       events: new Set(), activities: new Set(),
     };
     const canceled = () => state.abort.abort(native?.signal?.reason);
@@ -303,7 +311,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       const discovery = claudeCodeDiscovery(initialized);
       verifyClaudeCodeSelection(config, discovery);
       state.images = claudeCodeSupportsImages(config, discovery);
-      if (native && initialized.claude_code_version !== "2.1.321") throw new Error("Unsupported persistent Claude Code version");
+      if (native && !claudeCodeVersionSupported(initialized.claude_code_version)) throw new Error("Unsupported persistent Claude Code version");
       if (state.status === "offline") throw new Error("Claude Code exited during startup");
       this.sessions.set(id, state);
       return { ...state.session };
@@ -357,12 +365,24 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   }
 
   private async *prompts(state: SessionState): AsyncGenerator<SDKUserMessage> {
-    for await (const execution of state.inputs) {
-      if (state.status === "offline" || state.active !== execution) continue;
+    for await (const item of state.inputs) {
+      if (state.status === "offline") continue;
+      if ("steer" in item) {
+        // Delivered by the engine at its next native boundary, inside the running turn.
+        if (state.active !== item.execution) continue;
+        yield { type: "user", session_id: state.nativeId, parent_tool_use_id: null, uuid: item.uuid as ReturnType<typeof randomUUID>,
+          priority: "next", message: { role: "user", content: item.text } };
+        continue;
+      }
+      const execution = item;
+      if (state.active !== execution) continue;
       execution.sending = true;
       yield {
         type: "user", session_id: state.nativeId, parent_tool_use_id: null,
-        uuid: execution.nativeId, message: { role: "user", content: execution.turn.input },
+        uuid: execution.nativeId, message: { role: "user", content: execution.images.length ? [
+          ...(execution.turn.input ? [{ type: "text" as const, text: execution.turn.input }] : []),
+          ...execution.images.map(image => ({ type: "image" as const, source: { type: "base64" as const, media_type: image.mimeType, data: image.data } })),
+        ] : execution.turn.input },
       };
       // The SDK requests the next item only after the previous transport write settles.
       execution.written.resolve();
@@ -387,12 +407,12 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   protected async acceptTurn(sessionId: string, turnId: string, input: string, images?: RuntimeImageContent[], nativeMessageId?: string): Promise<AgentTurn> {
     if (nativeMessageId !== undefined && !NATIVE_UUID.test(nativeMessageId)) throw new Error("Invalid native message identity");
     const normalized = runtimeInput(input, images);
-    if (normalized.images.length) throw new Error("Claude Code image input is not supported yet");
     if (typeof turnId !== "string" || !turnId.trim() || Buffer.byteLength(turnId) > 256) {
       throw new Error("Turn id must be nonempty and at most 256 bytes");
     }
     const state = this.get(sessionId);
-    const digest = createHash("sha256").update(normalized.input).digest("hex");
+    if (normalized.images.length && !state.images) throw new Error("Claude Code image input is not supported by the selected model");
+    const digest = createHash("sha256").update(JSON.stringify([normalized.input, normalized.images.map(image => createHash("sha256").update(image.data).digest("hex"))])).digest("hex");
     const existing = state.turns.get(turnId);
     if (existing) {
       if (existing.digest !== digest) throw new Error("Turn id conflicts with previously accepted input");
@@ -405,12 +425,14 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     const now = new Date().toISOString();
     const execution: Execution = {
       turn: { id: turnId, status: "running", input: normalized.input, createdAt: now, updatedAt: now },
+      images: normalized.images, steerIds: new Set(), steerFingerprints: [],
       digest, nativeId: (nativeMessageId ?? randomUUID()) as ReturnType<typeof randomUUID>, sending: false, written: deferred(), done: deferred(),
       interruptRequested: false, permissionAbort: new AbortController(), evidence: "uncertain",
     };
     state.turns.set(turnId, execution);
     state.active = execution;
-    state.messages.push({ role: "user", content: input, timestamp: Date.now() });
+    // Same projection as native history: pixels never enter text, only a placeholder.
+    state.messages.push({ role: "user", content: [input, ...normalized.images.map(() => "[image]")].filter(Boolean).join("\n"), timestamp: Date.now() });
     this.setStatus(state, "working");
     this.emit(state, { type: "turn_started", operationId: turnId });
     this.activity(state, "working");
@@ -428,9 +450,24 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     return this.get(sessionId).turns.get(turnId)?.evidence;
   }
 
-  async steer(sessionId: string, _input: string): Promise<void> {
-    this.get(sessionId);
-    throw new Error("Claude Code steering is not supported yet; interrupt before sending another turn");
+  /** Queues a user message into the live streaming input while a turn is running; the engine folds it in at its next
+   * native boundary (the turn still has one result). Never starts a turn and never replays. */
+  async steer(sessionId: string, input: string): Promise<void> {
+    const state = this.get(sessionId), text = runtimeInput(input, undefined).input;
+    const execution = state.active;
+    if (state.status === "offline") throw new Error("Claude Code session is offline");
+    if (!execution || state.status !== "working" || execution.interruptRequested || state.control || !execution.sending) {
+      throw new Error("Claude Code session has no running turn to steer");
+    }
+    const uuid = randomUUID();
+    execution.steerIds.add(uuid); execution.steerFingerprints.push(createHash("sha256").update(text).digest("hex"));
+    state.messages.push({ role: "user", content: text, timestamp: Date.now() });
+    state.inputs.push({ steer: true, uuid, text, execution });
+  }
+
+  /** Observation only: steering messages sent during that turn (sha256), for exact history eligibility. */
+  protected steerFingerprints(sessionId: string, turnId: string): string[] {
+    return [...(this.get(sessionId).turns.get(turnId)?.steerFingerprints ?? [])];
   }
 
   async interrupt(sessionId: string): Promise<void> {
@@ -542,7 +579,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
           throw new Error("Claude Code session identity mismatch");
         }
         if (state.persistent && message.type === "system" && message.subtype === "init"
-          && (message.cwd !== state.session.cwd || message.claude_code_version !== "2.1.321" || message.permissionMode !== state.policy.permissionMode)) {
+          && (message.cwd !== state.session.cwd || !claudeCodeVersionSupported(message.claude_code_version) || message.permissionMode !== state.policy.permissionMode)) {
           throw new Error("Persistent Claude Code launch metadata mismatch");
         }
         this.observe(state, message);
@@ -566,7 +603,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     }
     if ("parent_tool_use_id" in message && message.parent_tool_use_id) return;
     if ("user_message_uuid" in message && message.user_message_uuid
-      && message.user_message_uuid !== execution.nativeId) throw new Error("Native turn identity mismatch");
+      && message.user_message_uuid !== execution.nativeId && !execution.steerIds.has(message.user_message_uuid)) throw new Error("Native turn identity mismatch");
     if (message.type === "stream_event") {
       const event = message.event;
       if (event.type === "content_block_delta" && event.delta.type === "text_delta") {

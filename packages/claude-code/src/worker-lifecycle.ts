@@ -24,23 +24,30 @@ export function claudeCodeLiveWorker(m: ClaudeCodeManagedManifest, workerExecuta
   return { scope, registration: m.worker.registration, bytes: encodeClaudeCodeWorkerRegistration(m.worker.registration, scope) };
 }
 
-/** Call under the session lease with no native writer. Does NOT derive settlement:
- * only an independently committed completed dispatch may request this extra check.
- * Failed/interrupted/uncertain latest inputs remain unavailable in the MVP. */
+/** Call under the session lease with no native writer (after PROVEN ABSENCE: the real engine finalizes its transcript only
+ * after exit). Does NOT derive settlement: only a committed dispatch outcome requests this check.
+ * - completed: exact input match, terminal end_turn, final leaf, drained queue (and exactly the recorded steering).
+ * - failed/interrupted: structure only. The transcript legitimately ends mid-turn, so there is no tail to match; it must still
+ *   parse (or be absent: nothing was materialized). Stop never validates total size. */
 export async function claudeCodeCleanHistory(m: ClaudeCodeManagedManifest) {
   requireClaudeCodePolicy(m);
   if (m.native.state === "pending" && m.lastDispatch.state === "none") return [];
-  if (m.native.state !== "bound" || m.lastDispatch.state !== "settled" || m.lastDispatch.outcome !== "completed") throw unavailable();
-  const history = await inspectClaudeCodeHistory({ nativeSessionId: m.native.sessionId, canonicalCwd: m.launchConfig.cwd,
-    nativeConfigRoot: m.policy.nativeConfigRoot, nativeRoot: true, completedInput: {
-      nativeMessageId: m.lastDispatch.nativeMessageId, fingerprint: m.lastDispatch.fingerprint,
-    } });
+  if (m.native.state !== "bound" || m.lastDispatch.state !== "settled") throw unavailable();
+  const common = { nativeSessionId: m.native.sessionId, canonicalCwd: m.launchConfig.cwd, nativeConfigRoot: m.policy.nativeConfigRoot, nativeRoot: true, acceptQueuedDeliveries: true };
+  if (m.lastDispatch.outcome !== "completed") {
+    const history = await inspectClaudeCodeHistory(common);
+    return history.state === "present" ? history.messages : [];
+  }
+  const history = await inspectClaudeCodeHistory({ ...common, completedInput: {
+    nativeMessageId: m.lastDispatch.nativeMessageId, fingerprint: m.lastDispatch.fingerprint,
+    ...(m.lastDispatch.steers ? { steers: m.lastDispatch.steers } : {}),
+  } });
   if (history.state !== "present") throw unavailable();
   return history.messages;
 }
 function cleanDispatch(m: ClaudeCodeManagedManifest): boolean {
   return m.native.state === "pending" ? m.lastDispatch.state === "none"
-    : m.native.state === "bound" && m.lastDispatch.state === "settled" && m.lastDispatch.outcome === "completed";
+    : m.native.state === "bound" && m.lastDispatch.state === "settled";
 }
 /** Signal 0 ONLY: ESRCH means absent. EPERM leaves absence unproven, allowing
  * the caller's bounded read-only wait to continue; it never authorizes clearing.

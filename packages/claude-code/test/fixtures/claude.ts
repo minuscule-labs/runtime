@@ -17,8 +17,11 @@ const flag = (name: string) => process.argv.find(arg => arg.startsWith(`${name}=
 const output = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const base = () => ({ session_id: current.session_id, uuid: crypto.randomUUID() });
 function result(text: string, extra: Record<string, unknown> = {}) {
+  // A folded-in steering message makes the engine stamp ITS uuid on the turn's result frames (observed from the real engine).
+  const steered = current.steerUuid;
+  current.done = true;
   output({ ...base(), type: "result", subtype: "success", is_error: false,
-    result: text, user_message_uuid: current.uuid, ...extra });
+    result: text, user_message_uuid: steered ?? current.uuid, ...extra });
 }
 function assistant(content: unknown[], parent: string | null = null) {
   output({ ...base(), type: "assistant", parent_tool_use_id: parent, message: { role: "assistant", content } });
@@ -53,12 +56,23 @@ lines.on("line", (line) => {
     return;
   }
   if (message.type !== "user") return;
+  if (message.priority === "next" && current && !current.done) {
+    // Steering: folded into the running turn at its next boundary, never a new turn.
+    current.steerUuid = message.uuid;
+    const text = typeof message.message.content === "string" ? message.message.content : message.message.content[0].text;
+    if (process.env.MINU_CLAUDE_FIXTURE_STEERS) appendFileSync(process.env.MINU_CLAUDE_FIXTURE_STEERS, JSON.stringify({ text, uuid: message.uuid }) + "\n", { mode: 0o600 });
+    if (current.waitSteer) { assistant([{ type: "text", text: `steered: ${text}` }]); result(`steered: ${text}`); }
+    return;
+  }
   current = message;
-  const input = typeof message.message.content === "string" ? message.message.content : message.message.content[0].text;
+  const blocks = Array.isArray(message.message.content) ? message.message.content : [];
+  const input = typeof message.message.content === "string" ? message.message.content : (blocks.find((block: any) => block.type === "text")?.text ?? "");
+  if (process.env.MINU_CLAUDE_FIXTURE_IMAGES) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_IMAGES, JSON.stringify(blocks.filter((block: any) => block.type === "image")));
   if (process.env.MINU_CLAUDE_FIXTURE_INPUT) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_INPUT, input);
   output({ ...base(), type: "system", subtype: "init", permissionMode: flag("--permission-mode") ?? "default",
     cwd: mode === "wrong-workspace-init" ? "/" : process.cwd(), model: "fixture-model", claude_code_version: "2.1.321" });
   if (input === "hold") return;
+  if (input === "wait-steer") { current.waitSteer = true; return; }
   if (input === "crash") process.exit(3);
   if (input === "wrong-session") { result("wrong", { session_id: crypto.randomUUID() }); return; }
   if (input === "wrong-turn") { result("wrong", { user_message_uuid: crypto.randomUUID() }); return; }

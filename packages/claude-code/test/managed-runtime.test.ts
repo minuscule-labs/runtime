@@ -96,14 +96,26 @@ test("first input permits healthy lazy native initialization beyond short status
   assert.equal(await runtime.status(session.id), "idle"); await runtime.stop(session.id);
 });
 
-test("busy/interrupted latest dispatch cannot be cleared; a subsequent confirmed clean turn makes normal stop eligible", async t => {
+test("a busy dispatch cannot be stopped normally; after an interrupted or failed turn stop and resume work once idle", async t => {
   const f = await fixture(t), session = await f.runtime.start({ cwd: f.cwd });
   await f.runtime.startTurn(session.id, "busy", "hold"); const busy = await f.read(session.id);
-  await assert.rejects(f.runtime.stop(session.id)); assert.deepEqual(await f.read(session.id), busy);
+  await assert.rejects(f.runtime.stop(session.id)); assert.deepEqual(await f.read(session.id), busy, "a working session is still refused");
   assert.equal(await f.runtime.status(session.id), "working"); await f.runtime.interrupt(session.id);
   await until(() => f.runtime.turn(session.id, "busy"), value => value?.status === "interrupted");
-  const interrupted = await f.read(session.id); await assert.rejects(f.runtime.stop(session.id)); assert.deepEqual(await f.read(session.id), interrupted);
-  await f.runtime.send(session.id, "clean completion"); await f.runtime.stop(session.id);
+  assert.equal(await f.runtime.status(session.id), "idle");
+  // The MVP refused here (only a completed last dispatch was stoppable). Now an idle session stops cleanly.
+  await f.runtime.stop(session.id);
+  const stopped = (await f.read(session.id))!;
+  assert.equal(stopped.worker.state, "none"); assert.equal(stopped.requiresExplicitResume, true);
+  assert.equal(stopped.lastDispatch.state, "settled"); if (stopped.lastDispatch.state === "settled") assert.equal(stopped.lastDispatch.outcome, "interrupted");
+  const next = f.controller(); await next.resume(session.id, "owner", { allowStopped: true });
+  await next.startTurn(session.id, "failing", "fail");
+  await until(() => next.turn(session.id, "failing"), value => value?.status === "failed");
+  await next.stop(session.id);
+  const failed = (await f.read(session.id))!; assert.equal(failed.worker.state, "none");
+  if (failed.lastDispatch.state === "settled") assert.equal(failed.lastDispatch.outcome, "failed");
+  const again = f.controller(); await again.resume(session.id, "owner", { allowStopped: true });
+  await again.send(session.id, "clean completion"); await again.stop(session.id);
   assert.equal((await f.read(session.id))!.worker.state, "none");
 });
 

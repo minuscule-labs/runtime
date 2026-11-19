@@ -29,7 +29,19 @@ readline.createInterface = ((...args: Parameters<typeof create>) => {
   lines.prependListener("line", line => {
     const m = JSON.parse(line);
     if (m.type !== "user") return;
-    sessionId = m.session_id; input = m.message.content;
+    if (m.priority === "next" && path) {
+      // Steering, as the real engine records it (observed): enqueue + remove, then a queued_command attachment mid-turn.
+      const prompt = typeof m.message.content === "string" ? m.message.content : "";
+      const at = new Date().toISOString();
+      save({ type: "queue-operation", operation: "enqueue", timestamp: at, sessionId, content: prompt });
+      save({ type: "queue-operation", operation: "remove", timestamp: at, sessionId, content: prompt });
+      const uuid = randomUUID();
+      save({ type: "attachment", attachment: { type: "queued_command", prompt, source_uuid: m.uuid, delivery_id: randomUUID(), commandMode: "prompt", timestamp: at },
+        uuid, parentUuid: parent, isSidechain: false, sessionId, cwd: process.cwd(), version: "2.1.321", timestamp: at });
+      parent = uuid;
+      return;
+    }
+    sessionId = m.session_id; input = typeof m.message.content === "string" ? m.message.content : m.message.content.find((block: any) => block.type === "text")?.text ?? "";
     const directory = join(process.env.CLAUDE_CONFIG_DIR!, "projects", claudeCodeNativeProjectKey(process.cwd()));
     mkdirSync(directory, { recursive: true, mode: 0o700 }); path = join(directory, sessionId + ".jsonl");
     if (existsSync(path)) {

@@ -380,7 +380,9 @@ const mutations: [string, (f: Awaited<ReturnType<typeof fixture>>) => Record<str
   ["bad reasoning", f => [f.row("assistant", [{ type: "thinking", thinking: 42 }])], "invalid_history"],
   ["orphan tool result", f => [f.row("user", [{ type: "tool_result", tool_use_id: "absent", content: "no" }])], "invalid_history"],
   ["bad tool input", f => [f.row("assistant", [{ type: "tool_use", id: "tool", name: "Read", input: "no" }])], "invalid_history"],
-  ["unsupported version", f => [{ ...f.row(), version: "2.2.0" }], "unsupported_format"],
+  ["unsupported version (major)", f => [{ ...f.row(), version: "3.0.0" }], "unsupported_format"],
+  ["unsupported version (below range)", f => [{ ...f.row(), version: "2.1.299" }], "unsupported_format"],
+  ["malformed version", f => [{ ...f.row(), version: "latest" }], "unsupported_format"],
   ["compaction", f => [f.row(), { type: "system", subtype: "compact_boundary", sessionId: f.id }], "unsupported_format"],
   ["unknown record", f => [f.row(), { type: "future-record", sessionId: f.id }], "unsupported_format"],
   ["wrong last-prompt leaf", f => [f.row(), { type: "last-prompt", sessionId: f.id, leafUuid: randomUUID() }], "invalid_history"],
@@ -412,6 +414,16 @@ test("truncated final records and metadata-only evidence cannot certify present 
   } finally { await f.cleanup(); }
 });
 
+test("the supported version range (>=2.1.300 <3) accepts newer minor/patch engines", async () => {
+  const f = await fixture();
+  try {
+    for (const version of ["2.1.300", "2.1.321", "2.1.999", "2.2.0", "2.9.4"]) {
+      await f.save([{ ...f.row(), version }]);
+      assert.equal((await inspectClaudeCodeHistory(f.options)).state, "present", version);
+    }
+  } finally { await f.cleanup(); }
+});
+
 test("normalization excludes private metadata, hidden prompts, image bytes, reasoning and synthetic fillers", async () => {
   const f = await fixture();
   try {
@@ -425,7 +437,7 @@ test("normalization excludes private metadata, hidden prompts, image bytes, reas
     const result = await inspectClaudeCodeHistory(f.options);
     assert.equal(result.state, "present");
     if (result.state !== "present") return;
-    assert.deepEqual(result.messages.map(m => [m.role, m.content]), [["user", "visible"], ["assistant", "answer"], ["tool", "tool text"]]);
+    assert.deepEqual(result.messages.map(m => [m.role, m.content]), [["user", "visible\n[image]"], ["assistant", "answer"], ["tool", "tool text\n[image]"]]);
     assert.equal(result.messages[2].toolName, "Read");
     assert.doesNotMatch(JSON.stringify(result), /PRIVATE_|No response requested|sessionId|cwd/);
   } finally { await f.cleanup(); }
