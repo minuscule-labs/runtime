@@ -1,8 +1,16 @@
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { promisify } from "node:util";
 
-const execute = promisify(execFile);
+// spawn, not execFile: bounded stdout from a fixed argv, and independent of any execFile test double.
+const execute = (file: string, args: string[], options: { timeout: number; env?: NodeJS.ProcessEnv }) =>
+  new Promise<{ stdout: string }>((resolve, reject) => {
+    const child = spawn(file, args, { env: options.env ?? process.env, stdio: ["ignore", "pipe", "ignore"] });
+    let stdout = "";
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("Process query timed out")); }, options.timeout);
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk; if (stdout.length > 64 * 1024) child.kill("SIGKILL"); });
+    child.once("error", error => { clearTimeout(timer); reject(error); });
+    child.once("close", code => { clearTimeout(timer); code === 0 && stdout.length <= 64 * 1024 ? resolve({ stdout }) : reject(new Error("Process query failed")); });
+  });
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 type Kill = (pid: number, signal: NodeJS.Signals | 0) => unknown;
 
