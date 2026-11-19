@@ -248,9 +248,10 @@ async function parse(bytes: Buffer, options: ClaudeCodeHistoryOptions): Promise<
         } else reject("invalid_history");
       }
       if (row.type === "last-prompt") {
-        // The engine appends this asynchronously, so mid-file it may name an earlier row than the chain tip; it must still name a
-        // row of this chain. The completed-input check below requires the LAST one to be the terminal leaf.
-        if (typeof row.leafUuid !== "string" || !seen.has(row.leafUuid)) reject("invalid_history");
+        // The engine writes this asynchronously and may name the NOT-YET-WRITTEN final assistant row (its uuid is allocated early),
+        // an earlier row, or the chain tip. Existence in the chain is therefore judged at the end of the file; the completed-input
+        // check additionally requires the LAST one to name the committed input or a later row of that dispatch.
+        if (typeof row.leafUuid !== "string") reject("invalid_history");
         lastPrompt = row.leafUuid as string;
       }
       if (row.type === "tools-used") {
@@ -383,6 +384,7 @@ async function parse(bytes: Buffer, options: ClaudeCodeHistoryOptions): Promise<
     }
     flush();
   }
+  if (lastPrompt !== undefined && !seen.has(lastPrompt)) reject("invalid_history");
   if (!users || (options.completedInput && (!matchedInput || !terminal || terminal !== parent || lastPrompt === undefined || order.get(lastPrompt)! < matchedOrdinal || toolNames.size || queued !== undefined || dequeued !== undefined || steerQueued !== undefined || steerRemoved !== undefined))) reject("invalid_history");
   return { messages, records: lines.length };
 }

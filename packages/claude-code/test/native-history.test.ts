@@ -144,8 +144,8 @@ test("a final last-prompt may name an ancestor when everything after it is the c
     const completedInput = { nativeMessageId: user.uuid, fingerprint: createHash("sha256").update("hello").digest("hex") };
     const last = (leafUuid: string) => ({ type: "last-prompt", sessionId: f.id, leafUuid });
     const latch = { type: "atis-latch", sessionId: f.id };
-    // A leaf can only name a row already written, so mid-response placements use the rows before them.
-    for (const leaf of [user.uuid, call.uuid]) {
+    // The real engine names its FINAL assistant row before writing it, so any later row of the chain is a valid leaf here too.
+    for (const leaf of [user.uuid, call.uuid, result.uuid, answer.uuid]) {
       await f.save([user, call, last(leaf), latch, result, answer]);
       assert.equal((await inspectClaudeCodeHistory({ ...f.options, completedInput })).state, "present", `leaf ${leaf}`);
     }
