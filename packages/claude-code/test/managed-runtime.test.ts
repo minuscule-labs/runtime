@@ -250,7 +250,7 @@ test("generation/human fence after quiesce wins over physical absence; exact cha
 test("bundled native managed stop/resume preserves materialized history without replay (two local requests)", { timeout: 45_000 }, async t => {
   const f = await fixture(t), provider = await nativeHistoryProvider(2, true); f.preserve();
   t.after(() => provider.close());
-  delete f.options.nativeOptions!.executable;
+  f.options.nativeOptions!.executable = "bundled";
   Object.assign(f.options.nativeOptions!.env!, { ANTHROPIC_BASE_URL: provider.url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", NO_PROXY: "127.0.0.1,localhost" });
   Object.assign(f.options.nativeOptions!, { startupTimeoutMs: 10_000, controlTimeoutMs: 5_000, shutdownTimeoutMs: 5_000 });
   f.options.timeoutMs = 15_000;

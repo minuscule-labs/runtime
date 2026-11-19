@@ -1,6 +1,7 @@
-import { lstat, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, lstat, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 
 /** Distinguishable (and non-secret) so callers can show a "not logged in" state. Never carries account details. */
 export class ClaudeCodeAuthRequiredError extends Error {
@@ -58,4 +59,22 @@ export function claudeCodeAccountStatus(account: unknown): { authenticated: bool
   const credential = text("tokenSource") ?? text("email") ?? (text("apiKeySource") !== "none" ? text("apiKeySource") : undefined);
   const authenticated = (provider !== undefined && provider !== "firstParty") || credential !== undefined;
   return { authenticated, ...(authenticated ? { accountType: text("subscriptionType") ?? provider ?? "api" } : {}) };
+}
+
+/** Simple, like Pi (`PI_COMMAND ?? "pi"`): use the installed `claude`. `undefined` searches PATH of the effective environment,
+ * "bundled" selects the SDK's pinned engine, anything else is an explicit absolute path. Nothing is pinned or recorded. */
+export async function resolveClaudeCodeExecutable(
+  executable: string | undefined, env: Record<string, string | undefined>,
+): Promise<string | undefined> {
+  if (executable === "bundled") return undefined;
+  if (executable !== undefined) return executable;
+  for (const directory of (env.PATH ?? "").split(delimiter)) {
+    if (!directory || !isAbsolute(directory)) continue;
+    const candidate = join(directory, "claude");
+    try {
+      const metadata = await stat(candidate);
+      if (metadata.isFile()) { await access(candidate, constants.X_OK); return candidate; }
+    } catch { /* Not here. */ }
+  }
+  throw new Error("Claude Code executable not found: install `claude`, or pass executable (a path, or \"bundled\")");
 }

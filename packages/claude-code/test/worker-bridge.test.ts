@@ -50,7 +50,7 @@ async function fixture(t: TestContext, nativeProvider?: string) {
     }
   });
   const ready = once(child, "message");
-  child.send({ type: "start", cwd: directory, executable: nativeProvider ? undefined : fileURLToPath(new URL("./fixtures/claude.js", import.meta.url)),
+  child.send({ type: "start", cwd: directory, executable: nativeProvider ? "bundled" : fileURLToPath(new URL("./fixtures/claude.js", import.meta.url)),
     identity: { sessionId: "logical-runtime-id", ownerId: "owner-a", generation: "generation-a" } });
   const [message] = await Promise.race([ready, exited.then(() => { throw new Error("Worker exited before ready"); })]);
   assert.equal(message.type, "ready");

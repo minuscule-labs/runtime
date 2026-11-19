@@ -177,8 +177,8 @@ The goal is functional parity with the Pi adapter; further capabilities are eval
   "full"` plus real-engine Write/Bash turns); A10 (owner-per-call managed API on `ClaudeCodeAgentRuntime`); A11
   (`inspectSessionProfile`, `inspectSessionEvents`, `inspectSessionIntegrations`, integrations via `mcpServerStatus()`).
 - **Deferred (still specified above):** A8 (contract v3 and README), the larger A5 (64 MiB caps, projection bound,
-  fixture corpus), executable resolution and path pinning (the SDK's bundled engine stays the default; `executable` is an
-  explicit path), A4's per-session `isolateConfiguration` manifest field beyond `policy.configuration`.
+  fixture corpus), executable path pinning and manifest recording. Executable selection is Pi-simple: the installed `claude` found on
+  PATH is the default, `executable: "bundled"` selects the SDK engine, any other value is an explicit path, A4's per-session `isolateConfiguration` manifest field beyond `policy.configuration`.
 - **Deviation from 3.3:** an interactive dialog takes the owned session offline, as Pi and Codex do and as the shared
   refusal contract asserts (rather than failing only the turn).
 - **Opt-in real smoke test:** `MINU_CLAUDE_REAL_SMOKE=1 node --test packages/claude-code/dist/test/real-smoke.test.js`

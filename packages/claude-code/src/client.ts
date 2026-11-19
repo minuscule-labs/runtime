@@ -19,7 +19,7 @@ import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeSelectionOptions
 import { probeClaudeCode } from "./probe.js";
 import { claudeCodeVersionSupported } from "./native-history.js";
 import { claudeCodePermissionOptions, resolveClaudeCodePermissions, type ClaudeCodePermissionPolicy, type ClaudeCodePermissions } from "./permissions.js";
-import { claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
+import { claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot, resolveClaudeCodeExecutable } from "./native-config.js";
 
 export interface ClaudeCodeRuntimeOptions {
   /** What sessions may do natively; the library default is "readOnly" so callers opt in to "full". Not an OS sandbox
@@ -33,7 +33,8 @@ export interface ClaudeCodeRuntimeOptions {
   /** Denied when omitted; configured decisions use controlTimeoutMs and a request/turn abort signal.
    * Null/out-of-band replies are unsupported. Does not gate native auto-allowed tools. */
   canUseTool?: CanUseTool;
-  /** Omit to use the SDK's pinned, bundled Claude Code executable. */
+  /** Omit to use the installed `claude` found on PATH (like Pi's `pi`); "bundled" selects the SDK's pinned engine; otherwise an
+   * explicit path. Nothing is pinned: each launch uses what is installed. */
   executable?: string;
   /** When supplied, replaces (does not merge with) the inherited native environment. */
   env?: Record<string, string | undefined>;
@@ -323,6 +324,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       native.signal?.throwIfAborted();
     }
     const policy = resolveClaudeCodePermissions(this.options.permissions);
+    const executable = await resolveClaudeCodeExecutable(this.options.executable, launchEnv ?? process.env);
     const id = native?.runtimeSessionId ?? randomUUID();
     if (this.sessions.has(id) || this.starting.has(id)) throw new Error("Claude Code Runtime identity is already in use");
     this.starting.add(id);
@@ -342,7 +344,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
         options: {
           cwd, ...(native?.mode === "resume" ? { resume: state.nativeId } : { sessionId: state.nativeId }),
           abortController: state.abort,
-          pathToClaudeCodeExecutable: this.options.executable, env: launchEnv,
+          pathToClaudeCodeExecutable: executable, env: launchEnv,
           systemPrompt: config.systemPrompt ?? {
             type: "preset", preset: "claude_code", append: config.appendSystemPrompt,
           },

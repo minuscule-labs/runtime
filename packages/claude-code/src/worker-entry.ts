@@ -45,7 +45,7 @@ export function decodeClaudeCodeWorkerBootstrap(message: unknown): ClaudeCodeWor
     || CLAUDE_CODE_FORBIDDEN_ENV.some(key => (options.env as Record<string, unknown>)[key] !== undefined)
     || Object.entries(options.env).some(([key, value]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)
       || typeof value !== "string" || value.includes("\0") || Buffer.from(value).toString() !== value))
-    || (options.executable !== undefined && !path(options.executable))) throw failed();
+    || (options.executable !== undefined && options.executable !== "bundled" && !path(options.executable))) throw failed();
   for (const key of ["startupTimeoutMs", "controlTimeoutMs", "shutdownTimeoutMs", "turnRetentionLimit", "eventBufferLimit"]) {
     // Match the managed facade's ceilings before the producer reserves or forks.
     const maximum = key === "turnRetentionLimit" ? 1_000 : key === "eventBufferLimit" ? 4_096 : 2_147_483_647;

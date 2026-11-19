@@ -75,7 +75,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
     const entry = await realpath(this.options.workerExecutable ?? fileURLToPath(new URL("./worker-entry.js", import.meta.url)));
     if (!(await lstat(entry)).isFile()) throw unavailable();
     for (const file of [this.options.nodeExecutable, this.nativeOptions.executable]) {
-      if (file !== undefined && !(await lstat(await realpath(file))).isFile()) throw unavailable();
+      if (file !== undefined && file !== "bundled" && !(await lstat(await realpath(file))).isFile()) throw unavailable();
     }
     await this.root();
     return entry;

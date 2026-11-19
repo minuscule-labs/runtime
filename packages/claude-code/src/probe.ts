@@ -1,10 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { query, type ModelInfo, type SDKUserMessage, type SlashCommand } from "@anthropic-ai/claude-agent-sdk";
-import { ClaudeCodeAuthRequiredError, claudeCodeAccountStatus } from "./native-config.js";
+import { ClaudeCodeAuthRequiredError, claudeCodeAccountStatus, resolveClaudeCodeExecutable } from "./native-config.js";
 
 export interface ClaudeCodeProbeOptions {
   cwd: string;
-  /** Resolved executable path; omit for the SDK's bundled engine. */
+  /** Omit for the installed `claude` on PATH, "bundled" for the SDK engine, or an explicit path. */
   executable?: string;
   /** Complete environment for the short-lived process (already inherited + overlaid). */
   env: Record<string, string>;
@@ -36,6 +36,7 @@ function timeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T
  * Persists nothing (no transcript is created). Failure to confirm exit is an error, never a silent leak. */
 export async function probeClaudeCode(options: ClaudeCodeProbeOptions): Promise<ClaudeCodeProbe> {
   options.signal?.throwIfAborted();
+  const executable = await resolveClaudeCodeExecutable(options.executable, options.env);
   const abort = new AbortController();
   let child: ChildProcess | undefined;
   let done!: () => void;
@@ -49,7 +50,7 @@ export async function probeClaudeCode(options: ClaudeCodeProbeOptions): Promise<
   const probe = query({
     prompt: idle(),
     options: {
-      cwd: options.cwd, abortController: abort, env: { ...options.env, MINU_RUNTIME_PROBE: "1" }, pathToClaudeCodeExecutable: options.executable,
+      cwd: options.cwd, abortController: abort, env: { ...options.env, MINU_RUNTIME_PROBE: "1" }, pathToClaudeCodeExecutable: executable,
       tools: [], persistSession: false, permissionMode: "default",
       settingSources: options.isolate ? [] : ["user", "project", "local"],
       ...(options.isolate ? { settings: { disableAllHooks: true }, strictMcpConfig: true, mcpServers: {}, plugins: [] } : {}),

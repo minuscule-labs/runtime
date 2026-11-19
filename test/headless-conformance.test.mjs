@@ -286,7 +286,7 @@ async function bundled(name) {
 
 test("claude-code: full permissions run Write and Bash through the bundled engine; events and history are public", { timeout: 60_000 }, async () => {
   const f = await bundled("tools");
-  const runtime = new ClaudeCodeAgentRuntime({ permissions: "full", env: f.env, startupTimeoutMs: 20_000 });
+  const runtime = new ClaudeCodeAgentRuntime({ permissions: "full", executable: "bundled", env: f.env, startupTimeoutMs: 20_000 });
   const session = await runtime.start({ cwd: f.cwd });
   const events = [], iterator = runtime.events(session.id)[Symbol.asyncIterator]();
   const observing = (async () => { for await (const event of { [Symbol.asyncIterator]: () => iterator }) events.push(event); })().catch(() => {});
@@ -304,7 +304,7 @@ test("claude-code: full permissions run Write and Bash through the bundled engin
 
 test("claude-code: read-only (the library default) cannot run Write", { timeout: 60_000 }, async () => {
   const f = await bundled("readonly");
-  const runtime = new ClaudeCodeAgentRuntime({ env: f.env, startupTimeoutMs: 20_000 });
+  const runtime = new ClaudeCodeAgentRuntime({ executable: "bundled", env: f.env, startupTimeoutMs: 20_000 });
   const session = await runtime.start({ cwd: f.cwd });
   try {
     await bounded(runtime.send(session.id, "edit the file").catch(() => {}), 30_000);
@@ -315,7 +315,7 @@ test("claude-code: read-only (the library default) cannot run Write", { timeout:
 test("claude-code: a managed full-permission tool turn survives stop and resume (real engine history)", { timeout: 90_000 }, async () => {
   const f = await bundled("managed");
   const options = { ownerId: OWNER, storeRoot: f.storeRoot, nativeConfigRoot: f.config, timeoutMs: 20_000, permissions: "full",
-    nativeOptions: { startupTimeoutMs: 20_000, shutdownTimeoutMs: 5_000, controlTimeoutMs: 5_000, env: f.env } };
+    nativeOptions: { executable: "bundled", startupTimeoutMs: 20_000, shutdownTimeoutMs: 5_000, controlTimeoutMs: 5_000, env: f.env } };
   const runtime = new ClaudeCodeManagedRuntime(options);
   let session;
   try {

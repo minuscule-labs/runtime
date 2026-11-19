@@ -67,7 +67,7 @@ async function terminal(handle: Handle, id: string) {
 test("real persistent create/resume keeps native and Runtime identity separate without fabricating caller results", { timeout: 45_000 }, async t => {
   const f = await fixture(t); const provider = await nativeHistoryProvider();
   t.after(() => provider.close());
-  const options = { tools: [], env: { PATH: process.env.PATH, HOME: f.root, CLAUDE_CONFIG_DIR: f.configRoot,
+  const options = { tools: [], executable: "bundled", env: { PATH: process.env.PATH, HOME: f.root, CLAUDE_CONFIG_DIR: f.configRoot,
     ANTHROPIC_API_KEY: "synthetic-local-only", ANTHROPIC_BASE_URL: provider.url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" } };
   const created = f.remember(await openClaudeCodeNativeSession({ cwd: f.cwd }, f.descriptor, options));
   assert.equal(created.session.id, "logical-runtime-id"); assert.notEqual(created.session.id, f.descriptor.nativeSessionId);
@@ -98,7 +98,7 @@ test("real persistent create/resume keeps native and Runtime identity separate w
 
 test("an empty initialized native ID is not history and resume refuses without fallback spawning", { timeout: 30_000 }, async t => {
   const f = await fixture(t); const provider = await nativeHistoryProvider(); t.after(() => provider.close());
-  const created = f.remember(await openClaudeCodeNativeSession({ cwd: f.cwd }, f.descriptor, { tools: [], env: {
+  const created = f.remember(await openClaudeCodeNativeSession({ cwd: f.cwd }, f.descriptor, { tools: [], executable: "bundled", env: {
     PATH: process.env.PATH, HOME: f.root, CLAUDE_CONFIG_DIR: f.configRoot, ANTHROPIC_API_KEY: "local-only",
     ANTHROPIC_BASE_URL: provider.url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
   } }));
