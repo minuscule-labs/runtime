@@ -172,6 +172,13 @@ export async function createCodexWorkerBridge(
         if (!response.destroyed) json(response, 200, { result: { operationId, phase: "native_fact_published" } });
         return;
       }
+      if (request.method === "POST" && request.url === "/force-stop") {
+        // Deliberately skips authorize: recovery must work while busy or fenced. Authentication above still applies.
+        request.resume();
+        setImmediate(() => { void close().catch(() => { process.exitCode = 1; }); });
+        if (!response.destroyed) json(response, 200, { result: null });
+        return;
+      }
       if (request.method !== "POST" || request.url !== "/rpc") {
         request.resume();
         json(response, 404, { error: "Not found" });

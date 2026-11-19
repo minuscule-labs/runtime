@@ -132,9 +132,8 @@ test("public managed creation saves identity without native launch and reports t
   assert.equal((await f.runtime.activityEvents(session.id, { signal: aborted.signal }).next()).done, true);
   assert.equal(typeof f.runtime.destroy, "function");
   assert.equal(typeof f.runtime.inspectSessionProfile, "function"); assert.equal(typeof f.runtime.inspectSessionEvents, "function"); assert.equal(typeof f.runtime.openDiagnostic, "function");
-  for (const method of ["forceStopManaged"]) {
-    assert.equal(typeof (f.runtime as any)[method], "undefined");
-  }
+  // forceStopManaged is implemented (managed recovery); it was previously asserted absent.
+  assert.equal(typeof f.runtime.forceStopManaged, "function");
 });
 
 test("managed lifecycle survives actual controller restart, exact history resume and a second suspend", { timeout: 15_000, skip: process.platform !== "darwin" }, async t => {
@@ -174,7 +173,8 @@ test("never-used public managed suspension stays lazy across cold resume", { tim
   await f.runtime.suspend(session.id, session.ownerId);
 });
 
-for (const action of ["suspend", "destroy"] as const) for (const scenario of ["held", "paused-create"]) {
+// destroy no longer requires an idle live worker (it recovers); see the dedicated destroy test below.
+for (const action of ["suspend"] as const) for (const scenario of ["held", "paused-create"]) {
   test(`public ${action} rejects ${scenario} before interrupting or queuing behind preparation`, { timeout: 15_000, skip: process.platform !== "darwin" }, async t => {
     const f = await fixture(t, `lifecycle-${scenario}`); const session = await f.create();
     await f.runtime.startTurn(session.id, "busy", "hello");
@@ -310,8 +310,11 @@ test("public destroy removes never-launched legacy metadata but never stops unce
   assert.equal(await f.store.read(pending.id, pending.ownerId), undefined);
   const live = await f.create(); const before = await f.store.read(live.id, live.ownerId);
   await f.runtime.stop(live.id);
-  await assert.rejects(f.runtime.destroy(live.id, live.ownerId));
-  assert.deepEqual(await f.store.read(live.id, live.ownerId), before);
+  // Intentional change: a stopped live registration used to be undestroyable. destroy now proves absence first
+  // (here the group is verified/terminated), then removes only the Runtime metadata.
+  assert.equal(before?.worker.state, "ready");
+  await f.runtime.destroy(live.id, live.ownerId);
+  assert.equal(await f.store.read(live.id, live.ownerId), undefined);
   const eager = await f.eager();
   await assert.rejects(f.runtime.destroy(eager.id, "owner-a"));
   assert.equal(await f.runtime.status(eager.id), "idle");
@@ -368,13 +371,19 @@ test("public stale destroy cannot suspend a replacement generation during shutdo
   assert.equal((await f.calls()).filter(call => call.method === "thread/resume").length, 1);
 });
 
-test("public destroy retains metadata after uncertain shutdown/history verification", { timeout: 15_000, skip: process.platform !== "darwin" }, async t => {
+test("uncertain history verification leaves suspend retired-but-unverified; destroy then removes metadata after proven exit, never history", { timeout: 15_000, skip: process.platform !== "darwin" }, async t => {
   const f = await fixture(t, "lifecycle"), session = await f.create(); await f.runtime.send(session.id, "Keep this history");
   const history = await readFile(`${f.log}.history.json`, "utf8");
   t.mock.method(CodexAgentRuntime.prototype, "inspectNativeHistory", async () => { throw new Error("Injected inspection uncertainty"); });
-  await assert.rejects(f.runtime.destroy(session.id, session.ownerId));
+  // Unchanged assertion, now for suspend: uncertain history never grants suspended eligibility.
+  await assert.rejects(f.runtime.suspend(session.id, session.ownerId));
   const current = (await f.store.read(session.id, session.ownerId))!;
   assert.equal(current.worker.state, "retired"); assert.equal(current.version === 5 && current.history?.verified, false);
+  assert.equal(await readFile(`${f.log}.history.json`, "utf8"), history);
+  // Intentional change: destroy used to reject here. The worker's exit is proven (retired), so the Runtime
+  // resume metadata may go; native history is never deleted.
+  await f.runtime.destroy(session.id, session.ownerId);
+  assert.equal(await f.store.read(session.id, session.ownerId), undefined);
   assert.equal(await readFile(`${f.log}.history.json`, "utf8"), history);
 });
 

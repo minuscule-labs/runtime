@@ -156,6 +156,7 @@ export class CodexAgentRuntime implements AgentRuntime {
   }
 
   async suspend(id: string, ownerId: string): Promise<void> { return this.managed.suspend(id, ownerId); }
+  async forceStopManaged(id: string, ownerId: string): Promise<void> { return this.managed.forceStop(id, ownerId); }
   async destroy(id: string, ownerId: string): Promise<void> { return this.managed.destroy(id, ownerId); }
 
   /** @internal Inspection creates no thread and dispatches no user input. */
@@ -203,9 +204,9 @@ export class CodexAgentRuntime implements AgentRuntime {
   /** Connect to an existing living worker only; never launch or cold-resume. */
   async connectManaged(id: string, ownerId: string): Promise<ManagedAgentSession> { return this.managed.connect(id, ownerId); }
 
-  async resume(id: string, ownerId: string, _options?: { allowStopped?: boolean }): Promise<ManagedAgentSession> {
-    // This bounded path never clears stopped/fenced material, even when requested.
-    return this.managed.resume(id, ownerId);
+  async resume(id: string, ownerId: string, options?: { allowStopped?: boolean }): Promise<ManagedAgentSession> {
+    // Fenced material is cleared only for a force-stopped slot, on explicit request, where a fresh launch is already permitted.
+    return this.managed.resume(id, ownerId, options?.allowStopped === true);
   }
 
   /** @internal Native worker primitive, not owner-scoped managed resume.
