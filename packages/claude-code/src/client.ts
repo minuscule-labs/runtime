@@ -89,8 +89,6 @@ interface Execution {
   written: ReturnType<typeof deferred>;
   done: ReturnType<typeof deferred>;
   interruptRequested: boolean;
-  /** Set when the turn must end failed (e.g. a human-in-the-loop dialog); settled by its native result. */
-  failure?: string;
   permissionAbort: AbortController;
   evidence: ClaudeCodeSettlementEvidence;
 }
@@ -278,11 +276,11 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
           // bypassPermissions auto-approves before the callback is consulted (the SDK warns), so none is registered.
           ...(policy.permissionMode === "bypassPermissions" ? {}
             : { canUseTool: (name: string, input: Record<string, unknown>, options: Parameters<CanUseTool>[2]) => this.permissionDecision(state, name, input, options) }),
-          // Headless: no dialog renderer, so never invent an answer. Only the active turn fails; the session stays usable.
+          // Headless: no dialog renderer. Never invent an answer; like Pi, the owned session goes offline (shared contract).
           onUserDialog: async () => {
-            const execution = state.active;
-            if (execution && state.status === "working") execution.failure ??= "Claude Code requested unsupported interactive input";
-            return { behavior: "cancelled" };
+            this.offline(state, "Claude Code requested unsupported interactive input");
+            await this.shutdown(state);
+            throw new Error("Claude Code interactive input is unsupported by Runtime");
           },
           ...(this.options.isolateConfiguration
             ? { settingSources: [], settings: { disableAllHooks: true }, strictMcpConfig: true, mcpServers: {}, plugins: [] }
@@ -637,7 +635,6 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       }
     } else if (message.type === "result") {
       if (execution.interruptRequested) this.finish(state, execution, "interrupted", undefined, undefined, "native");
-      else if (execution.failure) this.finish(state, execution, "failed", undefined, execution.failure, "native");
       else if (message.subtype !== "success" || message.is_error) {
         this.finish(state, execution, "failed", undefined, "Claude Code turn failed", "native");
       } else {

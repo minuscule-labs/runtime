@@ -126,22 +126,20 @@ test("permission requests are denied by default and only an explicit handler gra
 });
 
 for (const kind of ["refusal_fallback_prompt", "future-runtime-dialog"]) {
-  test(`headless ${kind} fails only that turn without a fabricated dialog answer; the session stays usable`, async t => {
+  test(`headless ${kind} fails the owned session without a fabricated dialog answer`, async t => {
     const { runtime, session, dir } = await setup(t);
     await runtime.startTurn(session.id, "dialog", `user-dialog:${kind}`);
     const turn = await terminal(runtime, session.id, "dialog");
     assert.equal(turn.status, "failed"); assert.match(turn.error!, /unsupported interactive input/);
-    assert.equal(await runtime.status(session.id), "idle", "a dialog no longer takes the session offline");
+    assert.equal(await runtime.status(session.id), "offline");
     assert.doesNotMatch(JSON.stringify({ turn, messages: await runtime.messages(session.id) }), /PRIVATE_DIALOG/);
-    await runtime.send(session.id, "after dialog");
-    assert.equal((await runtime.messages(session.id)).at(-1)?.content, "reply: after dialog");
     await runtime.stop(session.id);
     const pid = Number(await readFile(join(dir, "pid"), "utf8"));
     assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
   });
 }
 
-test("headless dialog failure affects only its own turn and session", async t => {
+test("headless dialog failure stops only its exact owned session", async t => {
   const { runtime, session, dir } = await setup(t);
   const firstPid = Number(await readFile(join(dir, "pid"), "utf8"));
   const cwd = join(dir, "second"); await mkdir(cwd, { mode: 0o700 });

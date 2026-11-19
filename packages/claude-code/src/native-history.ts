@@ -175,7 +175,9 @@ const CHAIN = new Set(["user", "assistant", "attachment"]);
 const METADATA = new Set(["queue-operation", "atis-latch", "api-request-shape", "api-request-blob", "api-request", "last-prompt", "cost-state", "mode", "tools-used"]);
 const ATTACHMENTS = new Set(["environment", "model", "session_context", "date", "prompt_snapshot",
   // Observed from the bundled engine in tool/agent turns (bookkeeping, never input).
-  "deferred_tools_delta", "agent_listing_delta", "skill_listing", "auto_mode", "remote_session_change"]);
+  "deferred_tools_delta", "agent_listing_delta", "skill_listing", "auto_mode", "remote_session_change",
+  // Written after Write/Edit/Bash change a tracked file (observed from the real engine).
+  "edited_text_file"]);
 function opaqueBlock(block: Record<string, unknown>): void {
   if (block.type === "image") {
     const source = block.source;
