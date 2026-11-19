@@ -165,17 +165,24 @@ Update `docs/claude-code-process-family-contract.md` to v3:
     `~/.minu/runtime/claude-code` (mode 0700, created if missing). `ClaudeCodeManagedRuntime` stays
     as the per-owner implementation underneath.
 
-### 4.1 Scope decision: Pi parity first
+### 4.1 Scope decision: Pi parity first (as implemented)
 
 The goal is functional parity with the Pi adapter; further capabilities are evaluated after that.
 
-- **Core path (Pi parity):** A1 (native auth, preflight), A3 (`permissions: "full"`), A6 (model, reasoning, skills,
-  `capabilities()`), A7 (images, steering, stop after interrupted/failed turn), A9 (headless conformance), A10
-  (owner-per-call managed API). Recovery is already on `main`.
-- **Deferred until after the parity evaluation (slim or skip):** A2 (executable version range and manifest pinning),
-  A4 (`isolateConfiguration` escape hatch), A8 (contract v3 and README polish). A5 (history widening, caps, fixture
-  corpus) is reduced to the minimum that lets real tool and image turns resume without `unsupported_format`.
-- Deferred items stay specified above; they are not dropped.
+- **Built:** A1 (native config root, inherited environment, auth preflight); A3 (permission policy, manifest v5; native
+  configuration by default with `isolateConfiguration` as the escape hatch, i.e. the native part of A4); A6 (model,
+  reasoning, skills, `capabilities()`); A7 (images, steering, stop after an interrupted or failed turn); minimal A2
+  (engine version recorded, supported range `>=2.1.300 <3`, resume refuses a changed major); minimal A5 (only the history
+  rows the real engine writes for tool, image and steering turns); A9 (shared headless conformance with `permissions:
+  "full"` plus real-engine Write/Bash turns); A10 (owner-per-call managed API on `ClaudeCodeAgentRuntime`); A11
+  (`inspectSessionProfile`, `inspectSessionEvents`, `inspectSessionIntegrations`, integrations via `mcpServerStatus()`).
+- **Deferred (still specified above):** A8 (contract v3 and README), the larger A5 (64 MiB caps, projection bound,
+  fixture corpus), executable resolution and path pinning (the SDK's bundled engine stays the default; `executable` is an
+  explicit path), A4's per-session `isolateConfiguration` manifest field beyond `policy.configuration`.
+- **Deviation from 3.3:** an interactive dialog takes the owned session offline, as Pi and Codex do and as the shared
+  refusal contract asserts (rather than failing only the turn).
+- **Opt-in real smoke test:** `MINU_CLAUDE_REAL_SMOKE=1 node --test packages/claude-code/dist/test/real-smoke.test.js`
+  (uses the real native login and model; skipped by default, never run by the implementer).
 
 ## 5. Testing rules
 
