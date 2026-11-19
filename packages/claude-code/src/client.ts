@@ -2,13 +2,14 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { performance } from "node:perf_hooks";
 import {
   query, type CanUseTool, type Query, type SDKMessage, type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   runtimeInput, type AgentEvent, type AgentRuntime, type AgentSession, type AgentStartConfig,
-  type AgentStatus, type AgentTurn, type RuntimeActivityEvent, type RuntimeActivityPhase,
+  type AgentStatus, type AgentTurn, type ManagedAgentSession, type ManagedSessionSummary, type RuntimeActivityEvent, type RuntimeActivityPhase,
   type RuntimeActivityOptions, type RuntimeImageContent, type RuntimeMessage,
   type RuntimeLaunchCapabilities, type RuntimeSessionCapabilities,
 } from "@minu/runtime-core";
@@ -36,6 +37,15 @@ export interface ClaudeCodeRuntimeOptions {
   executable?: string;
   /** When supplied, replaces (does not merge with) the inherited native environment. */
   env?: Record<string, string | undefined>;
+  /** Managed (durable, owner-per-call) sessions: where manifests live. Default ~/.minu/runtime/claude-code (mode 0700, created
+   * if missing). Unused by in-process sessions. */
+  managedRoot?: string;
+  /** Managed sessions only. Omitted resolves as Claude Code does ($CLAUDE_CONFIG_DIR, else ~/.claude). Never created or written. */
+  nativeConfigRoot?: string;
+  /** Trusted host overrides for managed workers (worker entry / node interpreter / readiness budget), not user-selected commands. */
+  workerExecutable?: string;
+  nodeExecutable?: string;
+  managedTimeoutMs?: number;
   startupTimeoutMs?: number;
   controlTimeoutMs?: number;
   shutdownTimeoutMs?: number;
@@ -140,6 +150,9 @@ async function privateNativeDirectory(path: string, create = false): Promise<voi
 /** In-process owned sessions. No managed lifecycle, recovery, attachment, or automatic replay. */
 export class ClaudeCodeAgentRuntime implements AgentRuntime {
   private sessions = new Map<string, SessionState>();
+  /** Owner-per-call managed API: one durable controller per owner, created lazily; ids learn their owner on start/resume/get/list. */
+  private managers = new Map<string, import("./managed-runtime.js").ClaudeCodeManagedRuntime>();
+  private managedOwners = new Map<string, string>();
   private starting = new Set<string>();
   private options: ClaudeCodeRuntimeOptions;
   private startupMs: number;
@@ -161,6 +174,57 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
         throw new Error("Runtime limits must be positive bounded integers");
       }
     }
+  }
+
+  private async manager(ownerId: string) {
+    let manager = this.managers.get(ownerId);
+    if (!manager) {
+      const { ClaudeCodeManagedRuntime } = await import("./managed-runtime.js");
+      const storeRoot = resolve(this.options.managedRoot ?? join(homedir(), ".minu", "runtime", "claude-code"));
+      await mkdir(storeRoot, { recursive: true, mode: 0o700 });
+      const { executable, env, startupTimeoutMs, controlTimeoutMs, shutdownTimeoutMs, turnRetentionLimit, eventBufferLimit } = this.options;
+      manager = new ClaudeCodeManagedRuntime({ ownerId, storeRoot, permissions: this.options.permissions,
+        isolateConfiguration: this.options.isolateConfiguration,
+        ...(this.options.nativeConfigRoot !== undefined ? { nativeConfigRoot: this.options.nativeConfigRoot } : {}),
+        ...(this.options.workerExecutable !== undefined ? { workerExecutable: this.options.workerExecutable } : {}),
+        ...(this.options.nodeExecutable !== undefined ? { nodeExecutable: this.options.nodeExecutable } : {}),
+        ...(this.options.managedTimeoutMs !== undefined ? { timeoutMs: this.options.managedTimeoutMs } : {}),
+        nativeOptions: { ...(executable !== undefined ? { executable } : {}),
+          ...(env ? { env: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)) } : {}),
+          ...(startupTimeoutMs !== undefined ? { startupTimeoutMs } : {}), ...(controlTimeoutMs !== undefined ? { controlTimeoutMs } : {}),
+          ...(shutdownTimeoutMs !== undefined ? { shutdownTimeoutMs } : {}), ...(turnRetentionLimit !== undefined ? { turnRetentionLimit } : {}),
+          ...(eventBufferLimit !== undefined ? { eventBufferLimit } : {}) } });
+      this.managers.set(ownerId, manager);
+    }
+    return manager;
+  }
+  /** The durable controller for a session started/resumed through this runtime, if any. */
+  private owned(sessionId: string) {
+    const owner = this.managedOwners.get(sessionId);
+    return owner === undefined ? undefined : this.managers.get(owner);
+  }
+  async startManaged(config: AgentStartConfig, ownerId: string): Promise<ManagedAgentSession> {
+    const session = await (await this.manager(ownerId)).startManaged(config, ownerId);
+    this.managedOwners.set(session.id, ownerId); return session;
+  }
+  async resume(managedSessionId: string, ownerId: string, options?: { allowStopped?: boolean }): Promise<ManagedAgentSession> {
+    const session = await (await this.manager(ownerId)).resume(managedSessionId, ownerId, options);
+    this.managedOwners.set(session.id, ownerId); return session;
+  }
+  async suspend(managedSessionId: string, ownerId: string): Promise<void> { await (await this.manager(ownerId)).suspend(managedSessionId, ownerId); }
+  async forceStopManaged(managedSessionId: string, ownerId: string): Promise<void> { await (await this.manager(ownerId)).forceStopManaged(managedSessionId, ownerId); }
+  async destroy(managedSessionId: string, ownerId: string): Promise<void> {
+    await (await this.manager(ownerId)).destroy(managedSessionId, ownerId); this.managedOwners.delete(managedSessionId);
+  }
+  async getManagedSession(managedSessionId: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<ManagedSessionSummary | undefined> {
+    const summary = await (await this.manager(ownerId)).getManagedSession(managedSessionId, ownerId, options);
+    if (summary) this.managedOwners.set(managedSessionId, ownerId);
+    return summary;
+  }
+  async listManagedSessions(ownerId: string, options?: { signal?: AbortSignal }): Promise<ManagedSessionSummary[]> {
+    const sessions = await (await this.manager(ownerId)).listManagedSessions(ownerId, options);
+    for (const session of sessions) this.managedOwners.set(session.id, ownerId);
+    return sessions;
   }
 
   /** Short-lived, prompt-less probe for this cwd: models, effort levels and skills as the user's own native setup reports
@@ -393,6 +457,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   }
 
   async send(sessionId: string, input: string, images?: RuntimeImageContent[]): Promise<void> {
+    { const m = this.owned(sessionId); if (m) return m.send(sessionId, input, images); }
     const turn = await this.startTurn(sessionId, randomUUID(), input, images);
     const state = this.get(sessionId);
     const execution = state.turns.get(turn.id)!;
@@ -403,6 +468,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   }
 
   async startTurn(sessionId: string, turnId: string, input: string, images?: RuntimeImageContent[]): Promise<AgentTurn> {
+    { const m = this.owned(sessionId); if (m) return m.startTurn(sessionId, turnId, input, images); }
     return this.acceptTurn(sessionId, turnId, input, images);
   }
 
@@ -444,6 +510,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   }
 
   async turn(sessionId: string, turnId: string): Promise<AgentTurn | undefined> {
+    { const m = this.owned(sessionId); if (m) return m.turn(sessionId, turnId); }
     const turn = this.get(sessionId).turns.get(turnId)?.turn;
     return turn && copyTurn(turn);
   }
@@ -456,6 +523,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   /** Queues a user message into the live streaming input while a turn is running; the engine folds it in at its next
    * native boundary (the turn still has one result). Never starts a turn and never replays. */
   async steer(sessionId: string, input: string): Promise<void> {
+    { const m = this.owned(sessionId); if (m) return m.steer(sessionId, input); }
     const state = this.get(sessionId), text = runtimeInput(input, undefined).input;
     const execution = state.active;
     if (state.status === "offline") throw new Error("Claude Code session is offline");
@@ -474,6 +542,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   }
 
   async interrupt(sessionId: string): Promise<void> {
+    { const m = this.owned(sessionId); if (m) return m.interrupt(sessionId); }
     const state = this.get(sessionId);
     if (state.status === "offline") throw new Error("Claude Code session is offline");
     if (state.control) return state.control;
@@ -504,23 +573,27 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     finally { if (state.control === operation) state.control = undefined; }
   }
 
-  async status(sessionId: string): Promise<AgentStatus> { return this.get(sessionId).status; }
+  async status(sessionId: string): Promise<AgentStatus> { const m = this.owned(sessionId); return m ? m.status(sessionId) : this.get(sessionId).status; }
 
   async inputCapabilities(sessionId: string): Promise<{ version: 1; images: boolean }> {
+    { const m = this.owned(sessionId); if (m) return m.inputCapabilities(sessionId); }
     return { version: 1, images: this.get(sessionId).images };
   }
 
   async sessionCapabilities(sessionId: string): Promise<RuntimeSessionCapabilities> {
+    { const m = this.owned(sessionId); if (m) return m.sessionCapabilities(sessionId); }
     const live = this.get(sessionId).status !== "offline";
     return { version: 1, safeActivityEvents: live, interrupt: live, reconnectExisting: false,
       interactiveAttach: false, openDiagnostic: false, liveSkillVerification: false };
   }
 
   async messages(sessionId: string): Promise<RuntimeMessage[]> {
+    { const m = this.owned(sessionId); if (m) return m.messages(sessionId); }
     return this.get(sessionId).messages.map((message) => ({ ...message }));
   }
 
   async *events(sessionId: string): AsyncIterable<AgentEvent> {
+    { const m = this.owned(sessionId); if (m) { yield* m.events(sessionId); return; } }
     const state = this.get(sessionId);
     if (state.status === "offline") return;
     const queue = new Queue<AgentEvent>(this.buffer);
@@ -530,6 +603,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   }
 
   async *activityEvents(sessionId: string, options: RuntimeActivityOptions): AsyncIterable<RuntimeActivityEvent> {
+    { const m = this.owned(sessionId); if (m) { yield* m.activityEvents(sessionId, options); return; } }
     const state = this.get(sessionId);
     if (options.signal.aborted || state.status === "offline") return;
     const queue = new Queue<RuntimeActivityEvent>(this.buffer);
@@ -548,6 +622,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   }
 
   async stop(sessionId: string): Promise<void> {
+    { const m = this.owned(sessionId); if (m) return m.suspend(sessionId, this.managedOwners.get(sessionId)!); }
     const state = this.get(sessionId);
     this.offline(state, "Claude Code session stopped", true);
     await this.shutdown(state);

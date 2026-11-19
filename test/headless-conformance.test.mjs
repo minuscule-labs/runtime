@@ -199,11 +199,12 @@ async function openManaged(adapter) {
   const cwd = join(directory, "workspace"); await mkdir(cwd);
   if (adapter === "claude-code") {
     const native = join(directory, "config"), storeRoot = join(directory, "managed"); await mkdir(native, { mode: 0o700 });
-    runtime = new ClaudeCodeManagedRuntime({ ownerId: OWNER, storeRoot, nativeConfigRoot: native, timeoutMs: 8_000, permissions: "full",
+    // Owner-per-call managed API on the runtime itself, constructed like Channels will: no owner, just a root and policy.
+    runtime = new ClaudeCodeAgentRuntime({ managedRoot: storeRoot, nativeConfigRoot: native, managedTimeoutMs: 8_000, permissions: "full",
       workerExecutable: join(root, "packages/claude-code/dist/test/fixtures/worker-entry.js"),
-      nativeOptions: { executable: join(root, "packages/claude-code/dist/test/fixtures/persistent-native.js"),
-        startupTimeoutMs: 4_000, shutdownTimeoutMs: 1_000, controlTimeoutMs: 1_000,
-        env: { PATH: process.env.PATH, HOME: directory, TMPDIR: directory, CLAUDE_CONFIG_DIR: native, MINU_CLAUDE_FIXTURE_PID: join(directory, "pid") } } });
+      executable: join(root, "packages/claude-code/dist/test/fixtures/persistent-native.js"),
+      startupTimeoutMs: 4_000, shutdownTimeoutMs: 1_000, controlTimeoutMs: 1_000,
+      env: { PATH: process.env.PATH, HOME: directory, TMPDIR: directory, CLAUDE_CONFIG_DIR: native, MINU_CLAUDE_FIXTURE_PID: join(directory, "pid") } });
     const store = new ClaudeCodeManagedStore(storeRoot);
     nativePid = async () => Number(await readFile(join(directory, "pid"), "utf8"));
     workerGroup = async id => (await store.read(id, OWNER)).worker.registration.processGroupId;
@@ -334,5 +335,49 @@ test("claude-code: a managed full-permission tool turn survives stop and resume 
     if (session) await runtime.forceStopManaged(session.id, OWNER).catch(() => {});
     if (session) await runtime.destroy(session.id, OWNER).catch(() => {});
     await f.close();
+  }
+});
+
+test("claude-code: one runtime built without an owner serves several owners per call, isolated and durable across instances", { timeout: 60_000 }, async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "runtime-headless-owners-")));
+  const native = join(directory, "config"), managedRoot = join(directory, "managed");
+  await mkdir(native, { mode: 0o700 }); await mkdir(join(directory, "a")); await mkdir(join(directory, "b"));
+  const options = { managedRoot, nativeConfigRoot: native, managedTimeoutMs: 8_000, permissions: "full",
+    workerExecutable: join(root, "packages/claude-code/dist/test/fixtures/worker-entry.js"),
+    executable: join(root, "packages/claude-code/dist/test/fixtures/persistent-native.js"),
+    startupTimeoutMs: 4_000, shutdownTimeoutMs: 1_000, controlTimeoutMs: 1_000,
+    env: { PATH: process.env.PATH, HOME: directory, TMPDIR: directory, CLAUDE_CONFIG_DIR: native } };
+  const runtime = new ClaudeCodeAgentRuntime(options), groups = [];
+  const store = new ClaudeCodeManagedStore(managedRoot);
+  try {
+    const a = await runtime.startManaged({ cwd: join(directory, "a") }, "owner-a"), b = await runtime.startManaged({ cwd: join(directory, "b") }, "owner-b");
+    assert.equal(a.ownerId, "owner-a"); assert.equal(b.ownerId, "owner-b");
+    for (const [id, owner] of [[a.id, "owner-a"], [b.id, "owner-b"]]) groups.push((await store.read(id, owner)).worker.registration.processGroupId);
+    await bounded(runtime.send(a.id, "hello from a")); await bounded(runtime.send(b.id, "hello from b"));
+    assert.equal(await runtime.status(a.id), "idle");
+    assert.equal((await runtime.messages(a.id)).at(-1).content, "reply: hello from a");
+    assert.equal((await runtime.messages(b.id)).at(-1).content, "reply: hello from b");
+    // Owners never see or touch each other's sessions.
+    assert.deepEqual((await runtime.listManagedSessions("owner-a")).map(s => s.id), [a.id]);
+    assert.deepEqual((await runtime.listManagedSessions("owner-b")).map(s => s.id), [b.id]);
+    assert.equal(await runtime.getManagedSession(a.id, "owner-b"), undefined);
+    await assert.rejects(runtime.suspend(a.id, "owner-b"));
+    await runtime.destroy(a.id, "owner-b"); // Another owner's destroy finds nothing and must not touch it.
+    assert.equal((await runtime.getManagedSession(a.id, "owner-a")).state, "active");
+    await runtime.suspend(a.id, "owner-a");
+    assert.equal((await runtime.getManagedSession(a.id, "owner-a")).state, "suspended");
+    // A fresh instance (an app restart) resumes durable sessions without replaying input.
+    const restarted = new ClaudeCodeAgentRuntime(options);
+    assert.equal((await restarted.getManagedSession(b.id, "owner-b")).state, "active");
+    await restarted.resume(a.id, "owner-a", { allowStopped: true });
+    await bounded(restarted.send(a.id, "after restart"));
+    assert.deepEqual((await restarted.messages(a.id)).map(m => m.content), ["hello from a", "reply: hello from a", "after restart", "reply: after restart"]);
+    await restarted.suspend(a.id, "owner-a"); await runtime.suspend(b.id, "owner-b");
+    await restarted.destroy(a.id, "owner-a"); await runtime.destroy(b.id, "owner-b");
+    assert.deepEqual(await runtime.listManagedSessions("owner-a"), []);
+  } finally {
+    for (const g of groups) { try { process.kill(-g, "SIGKILL"); } catch { /* Gone. */ } }
+    for (const g of groups) await until(() => groupAbsent(g));
+    await rm(directory, { recursive: true, force: true });
   }
 });

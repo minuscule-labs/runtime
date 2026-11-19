@@ -246,7 +246,9 @@ async function parse(bytes: Buffer, options: ClaudeCodeHistoryOptions): Promise<
         } else reject("invalid_history");
       }
       if (row.type === "last-prompt") {
-        if (row.leafUuid !== parent) reject("invalid_history");
+        // The engine appends this asynchronously, so mid-file it may name an earlier row than the chain tip; it must still name a
+        // row of this chain. The completed-input check below requires the LAST one to be the terminal leaf.
+        if (typeof row.leafUuid !== "string" || !seen.has(row.leafUuid)) reject("invalid_history");
         lastPrompt = row.leafUuid as string;
       }
       if (row.type === "tools-used") {

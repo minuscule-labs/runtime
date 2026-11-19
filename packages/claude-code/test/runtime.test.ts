@@ -21,6 +21,7 @@ async function waitFor<T>(read: () => Promise<T>, done: (value: T) => boolean): 
 async function terminal(runtime: ClaudeCodeAgentRuntime, session: string, id: string): Promise<AgentTurn> {
   return (await waitFor(() => runtime.turn(session, id), (value) => !!value && value.status !== "running"))!;
 }
+const dir0 = (session: { cwd: string }) => session.cwd;
 async function setup(t: { after: (fn: () => Promise<void>) => void }, options: ClaudeCodeRuntimeOptions = {}, mode = "") {
   const dir = await mkdtemp(join(tmpdir(), "minu-claude-fixture-"));
   const runtime = new ClaudeCodeAgentRuntime({ executable: fixture, startupTimeoutMs: 5_000,
@@ -243,7 +244,12 @@ test("unsupported launch/input/control options fail explicitly before model work
   await assert.rejects(live.startTurn(session.id, "", "text"), /Turn id/);
   await assert.rejects(live.steer(session.id, "steer"), /no running turn/, "steering needs a running turn");
   assert.equal(await live.status(session.id), "idle");
-  assert.equal("startManaged" in live, false);
+  // The owner-per-call managed API now exists on the runtime, but an in-process session is never a managed one.
+  assert.equal(typeof live.startManaged, "function");
+  const managedRoot = join(dir0(session), "managed-probe");
+  const separate = new ClaudeCodeAgentRuntime({ executable: fixture, managedRoot });
+  assert.deepEqual(await separate.listManagedSessions("some-owner"), []);
+  assert.equal(await separate.getManagedSession(session.id, "some-owner"), undefined);
 });
 
 for (const mode of ["startup-hang", "startup-exit"]) {
