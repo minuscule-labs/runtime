@@ -47,7 +47,7 @@ export interface VerifiedTerminationOptions {
   pgid: number;
   /** Expected worker entry path, as it appears in the command line. */
   entryPath: string;
-  markers: { session: string; owner: string; generation: number };
+  markers: { session: string; owner: string; generation: string };
   termMs: number;
   killMs: number;
   kill?: Kill;
@@ -87,7 +87,7 @@ export async function terminateVerifiedGroup(options: VerifiedTerminationOptions
   const command = match?.[2] ?? "";
   if (Number(match?.[1]) !== pgid || !command.includes(` ${entryPath} `)
     || !marked(command, "session", markers.session) || !marked(command, "owner", markers.owner)
-    || !marked(command, "generation", String(markers.generation))) {
+    || !marked(command, "generation", markers.generation)) {
     throw new Error("Process identity could not be verified; no process was signalled");
   }
   for (const [signal, ms] of [["SIGTERM", termMs], ["SIGKILL", killMs]] as const) {
