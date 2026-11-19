@@ -39,6 +39,11 @@ lines.on("line", (line) => {
     if (request.subtype === "initialize" && mode === "startup-hang") return;
     if (request.subtype === "initialize" && mode === "startup-exit") process.exit(2);
     if (request.subtype === "interrupt" && mode === "interrupt-hang") return;
+    if (request.subtype === "mcp_status") {
+      output({ type: "control_response", response: { subtype: "success", request_id: message.request_id,
+        response: { mcpServers: JSON.parse(process.env.MINU_CLAUDE_FIXTURE_MCP ?? "[]") } } });
+      return;
+    }
     output({ type: "control_response", response: { subtype: "success", request_id: message.request_id,
       response: request.subtype === "initialize" ? { commands: JSON.parse(process.env.MINU_CLAUDE_FIXTURE_COMMANDS ?? "[]"), agents: [], models: JSON.parse(process.env.MINU_CLAUDE_FIXTURE_MODELS ?? "[]"), account: process.env.MINU_CLAUDE_FIXTURE_ACCOUNT === "none" ? {} : { apiKeySource: "ANTHROPIC_API_KEY" }, output_style: "default", available_output_styles: [],
         claude_code_version: process.env.MINU_CLAUDE_FIXTURE_VERSION ?? "2.1.321" } : {} } });

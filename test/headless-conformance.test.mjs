@@ -381,3 +381,53 @@ test("claude-code: one runtime built without an owner serves several owners per 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+// Read-only observation contract (profile, bridge events, integrations) on an existing managed worker.
+test("claude-code: session profile, bridge events and integrations are observable on a live worker and never wake a stopped one", { timeout: 60_000 }, async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "runtime-headless-observe-")));
+  const native = join(directory, "config"), managedRoot = join(directory, "managed");
+  await mkdir(native, { mode: 0o700 }); await mkdir(join(directory, "ws"));
+  const models = JSON.stringify([{ value: "default", displayName: "Default", description: "", supportsEffort: true, supportedEffortLevels: ["low", "high"] }]);
+  const commands = JSON.stringify([{ name: "compact", description: "builtin", argumentHint: "", builtin: true }, { name: "review", description: "private description", argumentHint: "" }]);
+  const mcp = JSON.stringify([{ name: "docs server", status: "connected", scope: "user", config: { type: "http", url: "https://PRIVATE.example/mcp" },
+    tools: [{ name: "mcp__docs__search", description: "PRIVATE tool text" }, { name: "mcp__docs__read" }] }, { name: "broken", status: "failed", error: "PRIVATE failure text", scope: "project" }]);
+  const runtime = new ClaudeCodeAgentRuntime({ managedRoot, nativeConfigRoot: native, managedTimeoutMs: 8_000, permissions: "full",
+    workerExecutable: join(root, "packages/claude-code/dist/test/fixtures/worker-entry.js"),
+    executable: join(root, "packages/claude-code/dist/test/fixtures/persistent-native.js"),
+    startupTimeoutMs: 4_000, shutdownTimeoutMs: 1_000, controlTimeoutMs: 1_000,
+    env: { PATH: process.env.PATH, HOME: directory, TMPDIR: directory, CLAUDE_CONFIG_DIR: native, MINU_CLAUDE_FIXTURE_MODELS: models,
+      MINU_CLAUDE_FIXTURE_COMMANDS: commands, MINU_CLAUDE_FIXTURE_MCP: mcp } });
+  const store = new ClaudeCodeManagedStore(managedRoot);
+  let group;
+  try {
+    const session = await runtime.startManaged({ cwd: join(directory, "ws"), reasoningLevel: "high" }, OWNER);
+    group = (await store.read(session.id, OWNER)).worker.registration.processGroupId;
+    // Before the lazy native opening nothing is promised.
+    assert.deepEqual((await runtime.inspectSessionProfile(session.id, OWNER)).model, { status: "not_verified" });
+    assert.equal((await runtime.inspectSessionIntegrations(session.id, OWNER)).status, "unavailable");
+    await bounded(runtime.send(session.id, "observe me"));
+    const profile = await runtime.inspectSessionProfile(session.id, OWNER);
+    assert.deepEqual(profile.model, { status: "verified", provider: "anthropic", id: "fixture-model" });
+    assert.deepEqual(profile.reasoning, { status: "verified", level: "high" });
+    assert.deepEqual(profile.skills, { status: "verified", commandIds: ["review"], complete: true });
+    const events = await runtime.inspectSessionEvents(session.id, OWNER);
+    assert.equal(events.source, "runtime_bridge");
+    const codes = events.events.map(e => e.code);
+    for (const code of ["bridge_ready", "turn_dispatch_requested", "turn_dispatch_returned", "turn_accepted", "turn_completed"]) assert.ok(codes.includes(code), code);
+    const integrations = await runtime.inspectSessionIntegrations(session.id, OWNER);
+    assert.equal(integrations.status, "partial", "a failed server makes the tool coverage partial");
+    assert.deepEqual(integrations.integrations.map(i => [i.id, i.kind, i.source, i.connection, i.failureCode, i.registeredCount]),
+      [["docs_server", "mcp", "user", "connected", undefined, 2], ["broken", "mcp", "project", "failed", "connection_failed", undefined]]);
+    assert.deepEqual(integrations.tools.map(t => [t.name, t.integrationId, t.visibility]), [["mcp__docs__search", "docs_server", "declared"], ["mcp__docs__read", "docs_server", "declared"]]);
+    assert.doesNotMatch(JSON.stringify({ profile, events, integrations }), /PRIVATE|example\.com|description|https?:/i);
+    // Observation only: a stopped session is never woken, another owner sees nothing.
+    assert.equal(await runtime.inspectSessionProfile(session.id, "other-owner"), undefined);
+    await runtime.suspend(session.id, OWNER);
+    for (const inspect of ["inspectSessionProfile", "inspectSessionEvents", "inspectSessionIntegrations"]) assert.equal(await runtime[inspect](session.id, OWNER), undefined, inspect);
+    assert.equal((await runtime.getManagedSession(session.id, OWNER)).state, "suspended");
+    await runtime.destroy(session.id, OWNER);
+  } finally {
+    if (group) { try { process.kill(-group, "SIGKILL"); } catch { /* Gone. */ } await until(() => groupAbsent(group)); }
+    await rm(directory, { recursive: true, force: true });
+  }
+});

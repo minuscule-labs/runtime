@@ -259,6 +259,20 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       if (dispatch.state === "dispatching") await live.client.interrupt(dispatch.turnId);
       else if (await live.client.status() !== "idle") throw unavailable(); });
   }
+  /** Read-only observations of an EXISTING exact-owner worker: never starts, resumes or wakes anything; undefined when none is live. */
+  private async observe<T>(id: string, ownerId: string, signal: AbortSignal | undefined, read: (client: ClaudeCodeWorkerClient, signal: AbortSignal) => Promise<T>): Promise<T | undefined> {
+    return this.guard(async () => {
+      this.owner(ownerId); signal?.throwIfAborted();
+      const m = await this.store.read(id, ownerId);
+      if (!m || m.worker.state !== "live" || m.requiresExplicitResume) return undefined;
+      await this.nativeRoot(m);
+      const live = await this.live(id), abort = AbortSignal.any([AbortSignal.timeout(2_000), ...(signal ? [signal] : [])]);
+      return read(live.client, abort);
+    });
+  }
+  inspectSessionProfile(id: string, ownerId: string, options: { signal?: AbortSignal } = {}) { return this.observe(id, ownerId, options.signal, (client, signal) => client.inspectProfile(signal)); }
+  inspectSessionEvents(id: string, ownerId: string, options: { signal?: AbortSignal } = {}) { return this.observe(id, ownerId, options.signal, (client, signal) => client.inspectEvents(signal)); }
+  inspectSessionIntegrations(id: string, ownerId: string, options: { signal?: AbortSignal } = {}) { return this.observe(id, ownerId, options.signal, (client, signal) => client.inspectIntegrations(signal)); }
   messages(id: string) {
     return this.guard(async () => {
       const m = await this.store.read(id, this.options.ownerId); if (!m) throw unavailable(); await this.nativeRoot(m);

@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import {
-  runtimeInput, type AgentRuntime, type AgentSession, type AgentEvent, type AgentTurn,
+  runtimeInput, unavailableIntegrationSnapshot, type RuntimeIntegrationSnapshot, type RuntimeSessionProfile, type AgentRuntime, type AgentSession, type AgentEvent, type AgentTurn,
   type RuntimeActivityEvent, type RuntimeActivityOptions, type RuntimeImageContent,
 } from "@minu/runtime-core";
 import { ClaudeCodeAgentRuntime, type ClaudeCodeRuntimeOptions } from "./client.js";
@@ -10,6 +10,7 @@ import { openClaudeCodeNativeSession } from "./native-session.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest, type ClaudeCodeManifestLease, type ClaudeCodeDispatchIdentity } from "./managed-store.js";
 import { decodeClaudeCodeWorkerRegistration, encodeClaudeCodeWorkerRegistration, type ClaudeCodeWorkerRegistrationScope } from "./worker-registration.js";
 import { probeClaudeCode } from "./probe.js";
+import { claudeCodeProfile, projectClaudeCodeIntegrations } from "./session-observe.js";
 import { claudeCodeSupportsImages } from "./launch-options.js";
 import { requireClaudeCodePolicy } from "./worker-lifecycle.js";
 import { turnId as callerTurnId } from "./worker-protocol.js";
@@ -63,6 +64,7 @@ class ManagedSession implements AgentRuntime {
   private policy?: string;
   private native?: NativeHandle;
   private nativeId?: string;
+  private readonly workerId = randomUUID();
   private imagesProbe?: Promise<boolean>;
   private opening?: Promise<void>;
   private openingAbort?: AbortController;
@@ -299,6 +301,16 @@ class ManagedSession implements AgentRuntime {
     const live = await this.status(id) !== "offline";
     return { version: 1 as const, safeActivityEvents: live && this.activityHealthy, interrupt: live, reconnectExisting: live,
       interactiveAttach: false, openDiagnostic: false, liveSkillVerification: false };
+  }
+  /** Bounded, presentation-safe observations of the live engine. Nothing is promised before the lazy native opening. */
+  async inspectSessionProfile(id: string): Promise<RuntimeSessionProfile> {
+    this.current(id); return claudeCodeProfile(this.native ? this.native.profile() : undefined);
+  }
+  async inspectSessionIntegrations(id: string): Promise<RuntimeIntegrationSnapshot> {
+    this.current(id);
+    if (!this.native || this.stopped || this.unavailable) return unavailableIntegrationSnapshot("unavailable");
+    try { return projectClaudeCodeIntegrations(await this.native.integrations(), this.workerId); }
+    catch { return unavailableIntegrationSnapshot("unavailable"); }
   }
   async steer(id: string, input: string): Promise<void> {
     this.current(id);

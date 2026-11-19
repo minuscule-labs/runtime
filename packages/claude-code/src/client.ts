@@ -5,13 +5,13 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { performance } from "node:perf_hooks";
 import {
-  query, type CanUseTool, type Query, type SDKMessage, type SDKUserMessage,
+  query, type CanUseTool, type McpServerStatus, type Query, type SDKMessage, type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
-  runtimeInput, type AgentEvent, type AgentRuntime, type AgentSession, type AgentStartConfig,
+  runtimeInput, type AgentReasoningLevel, type AgentEvent, type AgentRuntime, type AgentSession, type AgentStartConfig,
   type AgentStatus, type AgentTurn, type ManagedAgentSession, type ManagedSessionSummary, type RuntimeActivityEvent, type RuntimeActivityPhase,
   type RuntimeActivityOptions, type RuntimeImageContent, type RuntimeMessage,
-  type RuntimeLaunchCapabilities, type RuntimeSessionCapabilities,
+  type RuntimeIntegrationSnapshot, type RuntimeLaunchCapabilities, type RuntimeSessionCapabilities, type RuntimeSessionEvents, type RuntimeSessionProfile,
 } from "@minu/runtime-core";
 import { Queue } from "./queue.js";
 import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeSelectionOptions, claudeCodeSkillOptions, claudeCodeSupportsImages,
@@ -109,6 +109,8 @@ interface SessionState {
   persistent: boolean;
   /** Whether the selected model accepts images, observed at initialization. */
   images: boolean;
+  /** What the live engine reported (system/init model, discovered skills, launch-verified reasoning). */
+  observed: { model?: string; reasoning?: AgentReasoningLevel; skills?: string[] };
   policy: ClaudeCodePermissionPolicy;
   status: AgentStatus;
   query?: Query;
@@ -210,6 +212,15 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   async resume(managedSessionId: string, ownerId: string, options?: { allowStopped?: boolean }): Promise<ManagedAgentSession> {
     const session = await (await this.manager(ownerId)).resume(managedSessionId, ownerId, options);
     this.managedOwners.set(session.id, ownerId); return session;
+  }
+  async inspectSessionProfile(id: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeSessionProfile | undefined> {
+    return (await this.manager(ownerId)).inspectSessionProfile(id, ownerId, options);
+  }
+  async inspectSessionEvents(id: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeSessionEvents | undefined> {
+    return (await this.manager(ownerId)).inspectSessionEvents(id, ownerId, options);
+  }
+  async inspectSessionIntegrations(id: string, ownerId: string, options?: { signal?: AbortSignal }): Promise<RuntimeIntegrationSnapshot | undefined> {
+    return (await this.manager(ownerId)).inspectSessionIntegrations(id, ownerId, options);
   }
   async suspend(managedSessionId: string, ownerId: string): Promise<void> { await (await this.manager(ownerId)).suspend(managedSessionId, ownerId); }
   async forceStopManaged(managedSessionId: string, ownerId: string): Promise<void> { await (await this.manager(ownerId)).forceStopManaged(managedSessionId, ownerId); }
@@ -317,7 +328,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     this.starting.add(id);
     const state: SessionState = {
       session: { id, runtime: "claude-code", ownership: "owned", cwd },
-      nativeId: native?.nativeSessionId ?? id, persistent: !!native, policy, images: false,
+      nativeId: native?.nativeSessionId ?? id, persistent: !!native, policy, images: false, observed: {},
       status: "idle", abort: new AbortController(), exited: deferred(),
       inputs: new Queue<Execution | Steer>(this.retention), turns: new Map(), messages: history.map(message => ({ ...message })), tools: new Map(),
       events: new Set(), activities: new Set(),
@@ -375,6 +386,8 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       const discovery = claudeCodeDiscovery(initialized);
       verifyClaudeCodeSelection(config, discovery);
       state.images = claudeCodeSupportsImages(config, discovery);
+      state.observed.skills = config.skillIds ? [...config.skillIds] : discovery.skills.map(skill => skill.name);
+      if (config.reasoningLevel) state.observed.reasoning = config.reasoningLevel; // Verified against the engine at launch.
       if (native && !claudeCodeVersionSupported(initialized.claude_code_version)) throw new Error("Unsupported persistent Claude Code version");
       if (native?.engineVersion && String(initialized.claude_code_version).split(".")[0] !== native.engineVersion.split(".")[0]) {
         throw new Error("Persistent Claude Code engine major version changed");
@@ -513,6 +526,15 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     { const m = this.owned(sessionId); if (m) return m.turn(sessionId, turnId); }
     const turn = this.get(sessionId).turns.get(turnId)?.turn;
     return turn && copyTurn(turn);
+  }
+
+  /** Live-engine observations for one session (model from system/init; nothing is promised before the first turn). */
+  protected observedProfile(sessionId: string) { return { ...this.get(sessionId).observed }; }
+  /** One bounded read of the engine's MCP server status. */
+  protected async integrationStatuses(sessionId: string): Promise<McpServerStatus[]> {
+    const state = this.get(sessionId);
+    if (state.status === "offline" || !state.query) throw new Error("Claude Code session is offline");
+    return deadline(state.query.mcpServerStatus(), Math.min(this.controlMs, 2_000), "Claude Code integration read timed out");
   }
 
   /** Observation only; never derive this from resumed textual history. */
@@ -660,6 +682,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
           && (message.cwd !== state.session.cwd || !claudeCodeVersionSupported(message.claude_code_version) || message.permissionMode !== state.policy.permissionMode)) {
           throw new Error("Persistent Claude Code launch metadata mismatch");
         }
+        if (message.type === "system" && message.subtype === "init" && typeof message.model === "string") state.observed.model = message.model;
         this.observe(state, message);
       }
       this.offline(state, "Claude Code stream ended");

@@ -6,6 +6,8 @@ import {
   type AgentRuntime, type AgentEvent, type RuntimeActivityEvent,
 } from "@minu/runtime-core";
 import { Queue } from "./queue.js";
+import { ClaudeCodeSessionEventLog } from "./session-observe.js";
+import { sessionEvents, sessionIntegrations, sessionProfile, unavailableIntegrationSnapshot } from "@minu/runtime-core";
 import {
   CLAUDE_WORKER_LIMITS as LIMITS, ClaudeCodeWorkerError, envelope, turnId,
   workerActivity, workerEvent, workerIdentity, workerToken, type ClaudeCodeWorkerConnection,
@@ -54,6 +56,7 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
 }> {
   workerIdentity(options); workerToken(options.token);
   const runtime = options.runtime, id = options.nativeSessionId;
+  const log = new ClaudeCodeSessionEventLog();
   const events = new Set<Queue<AgentEvent>>();
   const activities = new Set<Queue<RuntimeActivityEvent>>();
   const responses = new Set<ServerResponse>();
@@ -73,6 +76,7 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
   };
   const reply = (response: ServerResponse, value: unknown) => json(response, 200, envelope(options, value));
   const stop = async () => {
+    log.record("stop_requested");
     stopping = true;
     if (!stopTask) {
       stopTask = options.admit(() => runtime.stop(id));
@@ -83,7 +87,7 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
   };
   const mutate = async <T>(operation: () => Promise<T>): Promise<T> => {
     if (stopping) throw new ClaudeCodeWorkerError("stopping", 409);
-    if (mutating) throw new ClaudeCodeWorkerError("busy", 409);
+    if (mutating) { log.record("request_rejected_busy"); throw new ClaudeCodeWorkerError("busy", 409); }
     mutating = true;
     try {
       return await options.admit(async () => {
@@ -168,6 +172,16 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
             reconnectExisting: (await runtime.status(id)) !== "offline" };
         });
         reply(response, capabilities ?? null);
+      } else if (request.method === "GET" && url.pathname === "/session-profile") {
+        reply(response, sessionProfile(await options.admit(async () => {
+          if (!runtime.inspectSessionProfile) throw new ClaudeCodeWorkerError("profile_unavailable", 404);
+          return runtime.inspectSessionProfile(id, options.ownerId, { signal: AbortSignal.timeout(2_000) });
+        })));
+      } else if (request.method === "GET" && url.pathname === "/session-events") {
+        reply(response, sessionEvents(log.snapshot()));
+      } else if (request.method === "GET" && url.pathname === "/session-integrations") {
+        reply(response, sessionIntegrations(await options.admit(async () => runtime.inspectSessionIntegrations
+          ? runtime.inspectSessionIntegrations(id, options.ownerId, { signal: AbortSignal.timeout(2_000) }) : unavailableIntegrationSnapshot("unsupported"))));
       } else if (request.method === "GET" && url.pathname === "/events") {
         const status = await options.admit(() => runtime.status(id));
         await stream(response, events, { type: "status", status, sessionId: options.sessionId, timestamp: new Date().toISOString() } as AgentEvent, eventsEnded);
@@ -178,15 +192,29 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
         const data = await body(request);
         const input = runtimeInput(data.input, data.images);
         const callerId = turnId(data.turnId);
-        const turn = await mutate(() => runtime.startTurn(id, callerId, input.input, input.images.length ? input.images : undefined));
+        let reused = false;
+        const turn = await mutate(async () => {
+          reused = !!(await runtime.turn(id, callerId).catch(() => undefined));
+          log.record(reused ? "turn_reused" : "turn_dispatch_requested");
+          try { return await runtime.startTurn(id, callerId, input.input, input.images.length ? input.images : undefined); }
+          catch (error) {
+            log.record(error instanceof Error && error.message === "Turn id conflicts with previously accepted input" ? "turn_rejected_conflict" : "turn_dispatch_failed");
+            throw error;
+          }
+        });
+        if (!reused) { log.record("turn_dispatch_returned"); log.record("turn_accepted"); }
         reply(response, turn);
       } else if (request.method === "POST" && url.pathname === "/interrupt") {
         const data = await body(request);
-        await control(data.expectedTurnId, () => runtime.interrupt(id)); reply(response, { acknowledged: true });
+        log.record("interrupt_requested");
+        try { await control(data.expectedTurnId, () => runtime.interrupt(id)); } catch (error) { log.record("interrupt_failed"); throw error; }
+        log.record("interrupt_acknowledged"); reply(response, { acknowledged: true });
       } else if (request.method === "POST" && url.pathname === "/steer") {
         const data = await body(request);
         const input = runtimeInput(data.input, undefined);
-        await control(data.expectedTurnId, () => runtime.steer(id, input.input)); reply(response, { acknowledged: true });
+        log.record("steer_requested");
+        try { await control(data.expectedTurnId, () => runtime.steer(id, input.input)); } catch (error) { log.record("steer_failed"); throw error; }
+        log.record("steer_acknowledged"); reply(response, { acknowledged: true });
       } else if (request.method === "POST" && url.pathname === "/quiesce-idle") {
         await mutate(async () => {
           if (await runtime.status(id) !== "idle") throw new ClaudeCodeWorkerError("not_idle", 409);
@@ -239,6 +267,7 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
     try {
       for await (const event of runtime.events(id)) {
         const value = { ...workerEvent(event, id), sessionId: options.sessionId } as AgentEvent;
+        if (value.type === "turn_completed") log.record("turn_completed"); else if (value.type === "error" && value.operationId) log.record("turn_failed");
         for (const queue of events) queue.push(value);
       }
       for (const queue of events) queue.end();
@@ -258,6 +287,7 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
   try { await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); }); }
   catch (error) { abort.abort(); await runtime.stop(id); await Promise.all([eventPump, activityPump]); throw error; }
   const address = server.address() as AddressInfo;
+  log.record("bridge_ready");
   return {
     idleQuiesced, forceStopped,
     connection: { sessionId: options.sessionId, ownerId: options.ownerId, generation: options.generation,
