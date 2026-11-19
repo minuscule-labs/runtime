@@ -139,3 +139,45 @@ test("managed: steering needs a running dispatch; images need a model that accep
   await assert.rejects(f.runtime.steer(session.id, "turn already settled"), /unavailable/);
   await f.runtime.stop(session.id);
 });
+
+test("images: an idempotent retry compares MIME types too; the same pixels under another type conflict", async t => {
+  const { runtime, session } = await inProcess(t);
+  await runtime.startTurn(session.id, "pic", "same bytes", [image]); await terminal(runtime, session.id, "pic");
+  assert.equal((await runtime.startTurn(session.id, "pic", "same bytes", [image])).id, "pic");
+  await assert.rejects(runtime.startTurn(session.id, "pic", "same bytes", [{ ...image, mimeType: "image/jpeg" }]), /conflicts/);
+});
+
+test("model selection fails closed when the engine reports a different model than requested", async t => {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "claude-model-")));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const models = JSON.stringify([{ value: "default", displayName: "D", description: "" },
+    { value: "sonnet", resolvedModel: "claude-sonnet-fixture", displayName: "S", description: "" }]);
+  const env = (extra: Record<string, string> = {}) => ({ PATH: process.env.PATH, HOME: dir, CLAUDE_CONFIG_DIR: join(dir, "config"), MINU_CLAUDE_FIXTURE_MODELS: models, ...extra });
+  // Honest engine: the requested alias or its resolved id is what runs.
+  for (const id of ["sonnet", "claude-sonnet-fixture"]) {
+    const runtime = new ClaudeCodeAgentRuntime({ executable: claude, startupTimeoutMs: 5_000, shutdownTimeoutMs: 2_000, env: env() });
+    const session = await runtime.start({ cwd: dir, model: { provider: "anthropic", id } });
+    await runtime.send(session.id, "hello");
+    assert.equal(await runtime.status(session.id), "idle"); await runtime.stop(session.id);
+  }
+  // The engine ran something else: the turn fails and the session goes offline instead of silently accepting it.
+  const runtime = new ClaudeCodeAgentRuntime({ executable: claude, startupTimeoutMs: 5_000, shutdownTimeoutMs: 2_000, env: env({ MINU_CLAUDE_FIXTURE_INIT_MODEL: "claude-other-model" }) });
+  const session = await runtime.start({ cwd: dir, model: { provider: "anthropic", id: "sonnet" } });
+  await assert.rejects(runtime.send(session.id, "hello"));
+  assert.equal(await runtime.status(session.id), "offline"); await runtime.stop(session.id);
+  // No model requested: whatever the native default is, is accepted.
+  const plain = new ClaudeCodeAgentRuntime({ executable: claude, startupTimeoutMs: 5_000, env: env({ MINU_CLAUDE_FIXTURE_INIT_MODEL: "claude-other-model" }) });
+  const free = await plain.start({ cwd: dir }); await plain.send(free.id, "hello"); await plain.stop(free.id);
+});
+
+test("in-process capabilities() requires the same native login as managed creation", async t => {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "claude-caps-auth-")));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const runtime = new ClaudeCodeAgentRuntime({ executable: claude, startupTimeoutMs: 5_000, shutdownTimeoutMs: 2_000,
+    env: { PATH: process.env.PATH, HOME: dir, CLAUDE_CONFIG_DIR: join(dir, "config"), MINU_CLAUDE_FIXTURE_ACCOUNT: "none", MINU_CLAUDE_FIXTURE_MODELS: MODELS } });
+  const error = await runtime.capabilities({ cwd: dir }).then(() => undefined, caught => caught);
+  assert.equal(error?.name, "ClaudeCodeAuthRequiredError");
+  const loggedIn = new ClaudeCodeAgentRuntime({ executable: claude, startupTimeoutMs: 5_000, shutdownTimeoutMs: 2_000,
+    env: { PATH: process.env.PATH, HOME: dir, CLAUDE_CONFIG_DIR: join(dir, "config"), MINU_CLAUDE_FIXTURE_MODELS: MODELS } });
+  assert.deepEqual((await loggedIn.capabilities({ cwd: dir })).models.map(m => m.id), ["default"]);
+});

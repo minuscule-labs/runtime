@@ -14,9 +14,9 @@ import {
   type RuntimeIntegrationSnapshot, type RuntimeLaunchCapabilities, type RuntimeSessionCapabilities, type RuntimeSessionEvents, type RuntimeSessionProfile,
 } from "@minu/runtime-core";
 import { Queue } from "./queue.js";
-import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeSelectionOptions, claudeCodeSkillOptions, claudeCodeSupportsImages,
+import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeExpectedModels, claudeCodeSelectionOptions, claudeCodeSkillOptions, claudeCodeSupportsImages,
   validateClaudeCodeSelection, verifyClaudeCodeSelection } from "./launch-options.js";
-import { probeClaudeCode } from "./probe.js";
+import { requireClaudeCodeAuth } from "./probe.js";
 import { claudeCodeVersionSupported } from "./native-history.js";
 import { claudeCodePermissionOptions, resolveClaudeCodePermissions, type ClaudeCodePermissionPolicy, type ClaudeCodePermissions } from "./permissions.js";
 import { claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot, resolveClaudeCodeExecutable } from "./native-config.js";
@@ -110,6 +110,8 @@ interface SessionState {
   persistent: boolean;
   /** Whether the selected model accepts images, observed at initialization. */
   images: boolean;
+  /** system/init must report one of these when a model was requested (undefined: not checkable). */
+  expectedModels?: string[];
   /** What the live engine reported (system/init model, discovered skills, launch-verified reasoning). */
   observed: { model?: string; reasoning?: AgentReasoningLevel; skills?: string[] };
   policy: ClaudeCodePermissionPolicy;
@@ -244,7 +246,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   async capabilities(config: Pick<AgentStartConfig, "cwd"> = {}): Promise<RuntimeLaunchCapabilities> {
     const cwd = await realpath(config.cwd ?? process.cwd());
     if (!(await stat(cwd)).isDirectory()) throw new Error("Workspace must be a directory");
-    const probe = await probeClaudeCode({ cwd, executable: this.options.executable,
+    const probe = await requireClaudeCodeAuth({ cwd, executable: this.options.executable,
       env: Object.fromEntries(Object.entries(this.options.env ?? claudeCodeNativeEnvironment()).filter((entry): entry is [string, string] => entry[1] !== undefined)),
       isolate: this.options.isolateConfiguration, startupTimeoutMs: this.startupMs, shutdownTimeoutMs: this.shutdownMs });
     return claudeCodeCapabilities(probe);
@@ -388,6 +390,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       const discovery = claudeCodeDiscovery(initialized);
       verifyClaudeCodeSelection(config, discovery);
       state.images = claudeCodeSupportsImages(config, discovery);
+      state.expectedModels = claudeCodeExpectedModels(config, discovery);
       state.observed.skills = config.skillIds ? [...config.skillIds] : discovery.skills.map(skill => skill.name);
       if (config.reasoningLevel) state.observed.reasoning = config.reasoningLevel; // Verified against the engine at launch.
       if (native && !claudeCodeVersionSupported(initialized.claude_code_version)) throw new Error("Unsupported persistent Claude Code version");
@@ -496,7 +499,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     }
     const state = this.get(sessionId);
     if (normalized.images.length && !state.images) throw new Error("Claude Code image input is not supported by the selected model");
-    const digest = createHash("sha256").update(JSON.stringify([normalized.input, normalized.images.map(image => createHash("sha256").update(image.data).digest("hex"))])).digest("hex");
+    const digest = createHash("sha256").update(JSON.stringify([normalized.input, normalized.images.map(image => createHash("sha256").update(image.mimeType).update("\0").update(image.data).digest("hex"))])).digest("hex");
     const existing = state.turns.get(turnId);
     if (existing) {
       if (existing.digest !== digest) throw new Error("Turn id conflicts with previously accepted input");
@@ -684,7 +687,11 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
           && (message.cwd !== state.session.cwd || !claudeCodeVersionSupported(message.claude_code_version) || message.permissionMode !== state.policy.permissionMode)) {
           throw new Error("Persistent Claude Code launch metadata mismatch");
         }
-        if (message.type === "system" && message.subtype === "init" && typeof message.model === "string") state.observed.model = message.model;
+        if (message.type === "system" && message.subtype === "init") {
+          // Fail closed if the engine ran a different model than the one requested.
+          if (state.expectedModels && !state.expectedModels.includes(String(message.model))) throw new Error("Claude Code model mismatch");
+          if (typeof message.model === "string") state.observed.model = message.model;
+        }
         this.observe(state, message);
       }
       this.offline(state, "Claude Code stream ended");

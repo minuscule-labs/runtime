@@ -14,6 +14,13 @@ let pendingPermission: any;
 if (process.env.MINU_CLAUDE_FIXTURE_ARGV) appendFileSync(process.env.MINU_CLAUDE_FIXTURE_ARGV, JSON.stringify({ probe, argv: process.argv.slice(2),
   env: { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR } }) + "\n", { mode: 0o600 });
 const flag = (name: string) => process.argv.find(arg => arg.startsWith(`${name}=`))?.slice(name.length + 1);
+// The engine reports the model it actually runs: the requested one resolved through its model list, unless overridden.
+const initModel = () => {
+  if (process.env.MINU_CLAUDE_FIXTURE_INIT_MODEL) return process.env.MINU_CLAUDE_FIXTURE_INIT_MODEL;
+  const requested = flag("--model");
+  const row = (JSON.parse(process.env.MINU_CLAUDE_FIXTURE_MODELS ?? "[]") as any[]).find(model => model.value === requested);
+  return requested ? (row?.resolvedModel ?? requested) : "fixture-model";
+};
 const output = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const base = () => ({ session_id: current.session_id, uuid: crypto.randomUUID() });
 function result(text: string, extra: Record<string, unknown> = {}) {
@@ -75,7 +82,7 @@ lines.on("line", (line) => {
   if (process.env.MINU_CLAUDE_FIXTURE_IMAGES) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_IMAGES, JSON.stringify(blocks.filter((block: any) => block.type === "image")));
   if (process.env.MINU_CLAUDE_FIXTURE_INPUT) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_INPUT, input);
   output({ ...base(), type: "system", subtype: "init", permissionMode: flag("--permission-mode") ?? "default",
-    cwd: mode === "wrong-workspace-init" ? "/" : process.cwd(), model: "fixture-model", claude_code_version: process.env.MINU_CLAUDE_FIXTURE_VERSION ?? "2.1.321" });
+    cwd: mode === "wrong-workspace-init" ? "/" : process.cwd(), model: initModel(), claude_code_version: process.env.MINU_CLAUDE_FIXTURE_VERSION ?? "2.1.321" });
   if (input === "hold") return;
   if (input === "wait-steer") { current.waitSteer = true; return; }
   if (input === "crash") process.exit(3);

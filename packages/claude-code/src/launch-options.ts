@@ -82,3 +82,12 @@ export function claudeCodeDiscovery(init: { models?: ModelInfo[]; commands?: Sla
   return { models: Array.isArray(init.models) ? init.models : [],
     skills: Array.isArray(init.commands) ? init.commands.filter(command => command && command.builtin !== true) : [] };
 }
+
+/** Model ids the engine may report in system/init for a requested selection, or undefined when it cannot be checked (an alias
+ * whose resolution the engine did not tell us). A mismatch means the native engine ran something else than was requested. */
+export function claudeCodeExpectedModels(config: AgentStartConfig, discovery: ClaudeCodeDiscovery): string[] | undefined {
+  if (!config.model) return undefined;
+  const row = find(discovery.models, config.model.id);
+  if (!row || (!row.resolvedModel && !/^claude-/.test(config.model.id))) return undefined;
+  return [...new Set([config.model.id, row.value, ...(row.resolvedModel ? [row.resolvedModel] : [])])];
+}
