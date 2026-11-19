@@ -153,3 +153,29 @@ test("destroy removes a live healthy session through the recovery path and leave
   assert.equal(await f.store.read(session.id, "owner"), undefined); assert.equal(processGroupAbsent(group), "absent");
   await assert.rejects(f.runtime.destroy(session.id, "owner"), "a session that does not exist for this owner is not destroyable twice");
 });
+
+// X5: an interrupt before dispatch still stops the native process and leaves the session unavailable (the existing
+// pending-worker test keeps asserting that). This is the accepted outcome, so recovery must work on it.
+test("a session left unavailable by an interrupt before dispatch is recoverable by forceStopManaged and destroy", { timeout: 30_000 }, async t => {
+  for (const action of ["forceStopManaged", "destroy"] as const) {
+    const f = await fixture(t, "paused-create"), session = await f.runtime.startManaged({ cwd: f.directory }, "owner");
+    await f.runtime.startTurn(session.id, "busy", "hello");
+    await until(f.calls, calls => calls.some(c => c.method === "thread/start"));
+    await f.runtime.interrupt(session.id);
+    await writeFile(`${f.log}.release`, "release");
+    const turn = await until(() => f.runtime.turn(session.id, "busy"), value => value?.status !== "running");
+    assert.equal(turn?.status, "interrupted");
+    await until(() => f.runtime.status(session.id), status => status === "offline");
+    const before = f.track(await f.read(session.id)), group = groupOf(before)!;
+    assert.equal(await f.state(session.id), "unavailable", "the session is not usable, but must not be stuck");
+    await f.runtime[action](session.id, "owner");
+    assert.equal(processGroupAbsent(group), "absent");
+    if (action === "forceStopManaged") {
+      const stopped = await f.read(session.id);
+      assert.equal(stopped.worker.state, "none"); assert.equal(stopped.requiresExplicitResume, true);
+      assert.equal(await f.state(session.id), "suspended");
+      await f.runtime.destroy(session.id, "owner");
+    }
+    assert.equal(await f.store.read(session.id, "owner"), undefined);
+  }
+});
