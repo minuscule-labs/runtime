@@ -10,9 +10,12 @@ import {
   runtimeInput, type AgentEvent, type AgentRuntime, type AgentSession, type AgentStartConfig,
   type AgentStatus, type AgentTurn, type RuntimeActivityEvent, type RuntimeActivityPhase,
   type RuntimeActivityOptions, type RuntimeImageContent, type RuntimeMessage,
-  type RuntimeSessionCapabilities,
+  type RuntimeLaunchCapabilities, type RuntimeSessionCapabilities,
 } from "@minu/runtime-core";
 import { Queue } from "./queue.js";
+import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeSelectionOptions, claudeCodeSkillOptions, claudeCodeSupportsImages,
+  validateClaudeCodeSelection, verifyClaudeCodeSelection } from "./launch-options.js";
+import { probeClaudeCode } from "./probe.js";
 import { claudeCodePermissionOptions, resolveClaudeCodePermissions, type ClaudeCodePermissionPolicy, type ClaudeCodePermissions } from "./permissions.js";
 import { claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
 
@@ -86,6 +89,8 @@ interface SessionState {
   session: AgentSession;
   nativeId: string;
   persistent: boolean;
+  /** Whether the selected model accepts images, observed at initialization. */
+  images: boolean;
   policy: ClaudeCodePermissionPolicy;
   status: AgentStatus;
   query?: Query;
@@ -150,6 +155,17 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     }
   }
 
+  /** Short-lived, prompt-less probe for this cwd: models, effort levels and skills as the user's own native setup reports
+   * them. Never dispatches input and closes with confirmed process exit. */
+  async capabilities(config: Pick<AgentStartConfig, "cwd"> = {}): Promise<RuntimeLaunchCapabilities> {
+    const cwd = await realpath(config.cwd ?? process.cwd());
+    if (!(await stat(cwd)).isDirectory()) throw new Error("Workspace must be a directory");
+    const probe = await probeClaudeCode({ cwd, executable: this.options.executable,
+      env: Object.fromEntries(Object.entries(this.options.env ?? claudeCodeNativeEnvironment()).filter((entry): entry is [string, string] => entry[1] !== undefined)),
+      isolate: this.options.isolateConfiguration, startupTimeoutMs: this.startupMs, shutdownTimeoutMs: this.shutdownMs });
+    return claudeCodeCapabilities(probe);
+  }
+
   async start(config: AgentStartConfig = {}): Promise<AgentSession> {
     return this.launch(config);
   }
@@ -167,10 +183,8 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     for (const prompt of [config.systemPrompt, config.appendSystemPrompt]) {
       if (prompt !== undefined && typeof prompt !== "string") throw new Error("System prompt must be text");
     }
-    // No silent model/effort fallback or skill-filter promises in the initial slice.
-    if (config.model !== undefined) throw new Error("Claude Code model selection is not supported yet");
-    if (config.reasoningLevel !== undefined) throw new Error("Claude Code reasoning selection is not supported yet");
-    if (config.skillIds !== undefined) throw new Error("Claude Code skill selection is not supported yet");
+    // No silent model/effort fallback: unsupported selections are refused (shape here, support after initialization).
+    validateClaudeCodeSelection(config);
     const cwd = await realpath(config.cwd ?? process.cwd());
     if (!(await stat(cwd)).isDirectory()) throw new Error("Workspace must be a directory");
     let history: RuntimeMessage[] = [];
@@ -231,7 +245,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     this.starting.add(id);
     const state: SessionState = {
       session: { id, runtime: "claude-code", ownership: "owned", cwd },
-      nativeId: native?.nativeSessionId ?? id, persistent: !!native, policy,
+      nativeId: native?.nativeSessionId ?? id, persistent: !!native, policy, images: false,
       status: "idle", abort: new AbortController(), exited: deferred(),
       inputs: new Queue<Execution>(this.retention), turns: new Map(), messages: history.map(message => ({ ...message })), tools: new Map(),
       events: new Set(), activities: new Set(),
@@ -250,6 +264,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
             type: "preset", preset: "claude_code", append: config.appendSystemPrompt,
           },
           ...claudeCodePermissionOptions(policy, this.options.tools),
+          ...claudeCodeSelectionOptions(config), ...claudeCodeSkillOptions(config),
           // bypassPermissions auto-approves before the callback is consulted (the SDK warns), so none is registered.
           ...(policy.permissionMode === "bypassPermissions" ? {}
             : { canUseTool: (name: string, input: Record<string, unknown>, options: Parameters<CanUseTool>[2]) => this.permissionDecision(state, name, input, options) }),
@@ -285,6 +300,9 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       void this.consume(state);
       const initialized = await deadline(state.query.initializationResult(), this.startupMs, "Claude Code startup timed out");
       native?.signal?.throwIfAborted();
+      const discovery = claudeCodeDiscovery(initialized);
+      verifyClaudeCodeSelection(config, discovery);
+      state.images = claudeCodeSupportsImages(config, discovery);
       if (native && initialized.claude_code_version !== "2.1.321") throw new Error("Unsupported persistent Claude Code version");
       if (state.status === "offline") throw new Error("Claude Code exited during startup");
       this.sessions.set(id, state);
@@ -449,8 +467,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
   async status(sessionId: string): Promise<AgentStatus> { return this.get(sessionId).status; }
 
   async inputCapabilities(sessionId: string): Promise<{ version: 1; images: boolean }> {
-    this.get(sessionId);
-    return { version: 1, images: false };
+    return { version: 1, images: this.get(sessionId).images };
   }
 
   async sessionCapabilities(sessionId: string): Promise<RuntimeSessionCapabilities> {

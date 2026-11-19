@@ -244,8 +244,12 @@ test("invalid first input, identities and explicit launch selections do not laun
     await assert.rejects(f.fake({}, { ...f.descriptor, ...patch } as ClaudeCodeNativeOpen));
   }
   for (const config of [null, [], "not-config"]) await assert.rejects(openClaudeCodeNativeSession(config as any, f.descriptor, { executable, env: f.env }), /Invalid.*configuration/);
-  await assert.rejects(openClaudeCodeNativeSession({ cwd: f.cwd, model: { provider: "anthropic", id: "explicit" } }, f.descriptor, { executable, env: f.env }), /not supported/);
+  // Selections are a feature now: a malformed one is refused before launch; a well-formed unsupported one only after discovery.
+  await assert.rejects(openClaudeCodeNativeSession({ cwd: f.cwd, model: { provider: "other", id: "explicit" } }, f.descriptor, { executable, env: f.env }), /Unsupported/);
   await assert.rejects(readFile(join(f.root, "pid")), { code: "ENOENT" });
+  await assert.rejects(openClaudeCodeNativeSession({ cwd: f.cwd, model: { provider: "anthropic", id: "explicit" } }, f.descriptor, { executable, env: f.env }), /Unsupported/);
+  const started = Number(await readFile(join(f.root, "pid"), "utf8"));
+  assert.throws(() => process.kill(started, 0), { code: "ESRCH" }, "the engine that refused the selection is confirmed gone");
 });
 
 test("unsupported native version refuses registration and confirms spawned-process shutdown", async t => {

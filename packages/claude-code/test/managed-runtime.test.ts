@@ -340,3 +340,65 @@ test("worker environment inherits the process environment with overrides; forbid
   assert.throws(() => new ClaudeCodeManagedRuntime({ ...f.options, nativeOptions: { ...f.options.nativeOptions,
     env: { ...f.options.nativeOptions!.env!, CLAUDE_CONFIG_DIR: join(f.root, "elsewhere") } } }), "explicit root and a different override conflict");
 });
+
+const MODELS = JSON.stringify([
+  { value: "default", displayName: "Default", description: "d", supportsEffort: true, supportedEffortLevels: ["low", "high"] },
+  { value: "sonnet", resolvedModel: "claude-sonnet-fixture", displayName: "Sonnet", description: "s", supportsEffort: true, supportedEffortLevels: ["low", "high", "max"] },
+]);
+const COMMANDS = JSON.stringify([{ name: "compact", description: "builtin", argumentHint: "", builtin: true }, { name: "review", description: "Review code", argumentHint: "" }]);
+
+test("managed capabilities(): models, reasoning levels, skills and the default from the engine, with no session or input", async t => {
+  const f = await fixture(t, { MINU_CLAUDE_FIXTURE_MODELS: MODELS, MINU_CLAUDE_FIXTURE_COMMANDS: COMMANDS });
+  const capabilities = await f.runtime.capabilities({ cwd: f.cwd });
+  assert.deepEqual(capabilities.models.map(m => m.id), ["default", "sonnet"]);
+  assert.deepEqual(capabilities.reasoningLevels, ["off", "low", "high", "max"]);
+  assert.deepEqual(capabilities.skills.map(s => s.id), ["review"]);
+  assert.deepEqual(capabilities.defaultModel, { provider: "anthropic", id: "default" });
+  assert.deepEqual(await f.runtime.listManagedSessions("owner"), []);
+  await assert.rejects(readFile(join(f.root, "native-pid")), { code: "ENOENT" });
+  const loggedOut = await fixture(t, { MINU_CLAUDE_FIXTURE_ACCOUNT: "none" });
+  assert.equal((await loggedOut.runtime.capabilities({ cwd: loggedOut.cwd }).catch(error => error)).name, "ClaudeCodeAuthRequiredError");
+});
+
+test("managed launch selections are validated, persisted in launchConfig and re-applied on resume", async t => {
+  const f = await fixture(t, { MINU_CLAUDE_FIXTURE_MODELS: MODELS, MINU_CLAUDE_FIXTURE_COMMANDS: COMMANDS });
+  const argv = join(f.root, "argv"); f.options.nativeOptions!.env!.MINU_CLAUDE_FIXTURE_ARGV = argv;
+  const config = { cwd: f.cwd, model: { provider: "anthropic", id: "sonnet" }, reasoningLevel: "max" as const, skillIds: ["review"] };
+  const runtime = f.controller(), session = await runtime.startManaged(config, "owner");
+  const stored = (await f.read(session.id))!;
+  assert.deepEqual(stored.launchConfig, config); assert.equal(stored.version, 5);
+  await runtime.send(session.id, "first"); await runtime.stop(session.id);
+  const resumed = f.controller(); await resumed.resume(session.id, "owner", { allowStopped: true });
+  const launches = (await readFile(argv, "utf8")).trim().split("\n").map(line => JSON.parse(line) as { probe: boolean; argv: string[] }).filter(entry => !entry.probe);
+  assert.equal(launches.length, 2);
+  for (const launch of launches) {
+    assert.ok(launch.argv.includes("--model=sonnet")); assert.ok(launch.argv.includes("--effort=max"));
+  }
+  assert.deepEqual((await f.read(session.id))!.launchConfig, config, "resume never rewrites the stored selections");
+  await resumed.send(session.id, "second"); await resumed.stop(session.id); await resumed.destroy(session.id, "owner");
+});
+
+test("managed unsupported selections are refused before any manifest or worker exists", async t => {
+  const f = await fixture(t, { MINU_CLAUDE_FIXTURE_MODELS: MODELS, MINU_CLAUDE_FIXTURE_COMMANDS: COMMANDS });
+  for (const config of [{ model: { provider: "anthropic", id: "gone" } }, { model: { provider: "x", id: "sonnet" } }, { reasoningLevel: "xhigh" as const },
+    { reasoningLevel: "minimal" as const }, { skillIds: ["compact"] }, { skillIds: ["missing"] }, { skillIds: ["review", "review"] }]) {
+    await assert.rejects(f.runtime.startManaged({ cwd: f.cwd, ...config } as never, "owner"), /unavailable/);
+  }
+  assert.deepEqual(await f.runtime.listManagedSessions("owner"), []);
+  await assert.rejects(readFile(join(f.root, "native-pid")), { code: "ENOENT" });
+});
+
+test("a resumed session whose stored model is no longer offered fails closed and stays fenced", async t => {
+  const f = await fixture(t, { MINU_CLAUDE_FIXTURE_MODELS: MODELS, MINU_CLAUDE_FIXTURE_COMMANDS: COMMANDS });
+  const runtime = f.controller(), session = await runtime.startManaged({ cwd: f.cwd, model: { provider: "anthropic", id: "sonnet" } }, "owner");
+  await runtime.send(session.id, "first"); await runtime.stop(session.id);
+  const stopped = await f.read(session.id);
+  f.options.nativeOptions!.env!.MINU_CLAUDE_FIXTURE_MODELS = JSON.stringify([{ value: "default", displayName: "Default", description: "" }]);
+  const next = f.controller();
+  await assert.rejects(next.resume(session.id, "owner", { allowStopped: true }));
+  const children = (next as unknown as { ownedChildren: Map<string, ChildProcess> }).ownedChildren;
+  for (const child of children.values()) await until(async () => child.exitCode ?? child.signalCode, code => code !== null);
+  children.clear(); // The failed relaunch's worker is confirmed gone (force-stopped), so the fixture has nothing left to dispose.
+  const after = await f.read(session.id);
+  assert.equal(after!.worker.state, "none"); assert.equal(after!.requiresExplicitResume, true); assert.equal(after!.native.state, stopped!.native.state);
+});

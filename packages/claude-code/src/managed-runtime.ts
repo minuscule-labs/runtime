@@ -5,8 +5,9 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import { runtimeInput, type AgentRuntime, type AgentStartConfig, type ManagedAgentSession, type ManagedSessionSummary,
-  type RuntimeImageContent, type RuntimeActivityOptions } from "@minu/runtime-core";
+  type RuntimeImageContent, type RuntimeActivityOptions, type RuntimeLaunchCapabilities } from "@minu/runtime-core";
 import { CLAUDE_CODE_FORBIDDEN_ENV, ClaudeCodeAuthRequiredError, claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
+import { claudeCodeCapabilities, validateClaudeCodeSelection, verifyClaudeCodeSelection } from "./launch-options.js";
 import { resolveClaudeCodePermissions, type ClaudeCodePermissions } from "./permissions.js";
 import { requireClaudeCodeAuth } from "./probe.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest } from "./managed-store.js";
@@ -118,22 +119,36 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       timeoutMs: this.options.timeoutMs ?? 15_000 })).state !== "ready") throw unavailable();
     const m = await this.store.read(id, this.options.ownerId); if (!m) throw unavailable(); return this.session(m);
   }
+  /** Models, reasoning levels and skills for this cwd from a short-lived prompt-less query. Requires a native login. */
+  capabilities(config: Pick<AgentStartConfig, "cwd"> = {}): Promise<RuntimeLaunchCapabilities> {
+    return this.guard(async () => {
+      const cwd = await realpath(config?.cwd ?? process.cwd());
+      if (!(await lstat(cwd)).isDirectory()) throw unavailable();
+      await this.root();
+      return claudeCodeCapabilities(await requireClaudeCodeAuth({ cwd, executable: this.nativeOptions.executable,
+        env: claudeCodeNativeEnvironment(this.nativeOptions.env), startupTimeoutMs: this.nativeOptions.startupTimeoutMs,
+        shutdownTimeoutMs: this.nativeOptions.shutdownTimeoutMs, isolate: this.options.isolateConfiguration }));
+    });
+  }
   start(config: AgentStartConfig = {}) { return this.startManaged(config, this.options.ownerId); }
   startManaged(config: AgentStartConfig, ownerId: string): Promise<ManagedAgentSession> {
     return this.guard(async () => {
       this.owner(ownerId);
       config = structuredClone(config);
-      if (!config || typeof config !== "object" || Array.isArray(config) || Object.keys(config).some(key => !["cwd", "systemPrompt", "appendSystemPrompt"].includes(key))
+      if (!config || typeof config !== "object" || Array.isArray(config) || Object.keys(config).some(key => !["cwd", "systemPrompt", "appendSystemPrompt", "model", "reasoningLevel", "skillIds"].includes(key))
         || (config.systemPrompt !== undefined && config.appendSystemPrompt !== undefined)
         || [config.systemPrompt, config.appendSystemPrompt].some(value => value !== undefined && typeof value !== "string")) throw unavailable();
+      validateClaudeCodeSelection(config);
       const cwd = await realpath(config.cwd ?? process.cwd()), entry = await this.host(), id = randomUUID(), generation = randomUUID();
       if (!(await lstat(cwd)).isDirectory()) throw unavailable();
       // Reuse the real preflight decoder BEFORE creating launch metadata.
       await this.preflight(id, generation, cwd, entry);
       // Auth preflight: a short-lived query that sends no prompt. Unauthenticated throws the specific error
       // BEFORE any manifest or worker exists.
-      await requireClaudeCodeAuth({ cwd, executable: this.nativeOptions.executable, env: claudeCodeNativeEnvironment(this.nativeOptions.env),
-        startupTimeoutMs: this.nativeOptions.startupTimeoutMs, shutdownTimeoutMs: this.nativeOptions.shutdownTimeoutMs });
+      const probe = await requireClaudeCodeAuth({ cwd, executable: this.nativeOptions.executable, env: claudeCodeNativeEnvironment(this.nativeOptions.env),
+        startupTimeoutMs: this.nativeOptions.startupTimeoutMs, shutdownTimeoutMs: this.nativeOptions.shutdownTimeoutMs, isolate: this.options.isolateConfiguration });
+      // Unsupported model/effort/skills are refused, never silently replaced, and before any manifest exists.
+      verifyClaudeCodeSelection(config, probe);
       const policy = resolveClaudeCodePermissions(this.options.permissions);
       await this.store.create({ version: 5, runtime: "claude-code", id, ownerId, revision: 0, generation, requiresExplicitResume: false,
         native: { state: "pending" }, worker: { state: "none" }, lastDispatch: { state: "none" }, launchConfig: { ...config, cwd },
@@ -231,7 +246,6 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
   }); }
   inputCapabilities(id: string) { return this.guard(async () => (await this.live(id)).client.inputCapabilities()); }
   sessionCapabilities(id: string) { return this.guard(async () => (await this.live(id)).client.sessionCapabilities().then(value => { if (!value) throw unavailable(); return value; })); }
-  capabilities() { return Promise.resolve({ models: [], reasoningLevels: [], skills: [] }); }
   steer(_id: string, _input: string): Promise<void> { return Promise.reject(new Error("Claude Code managed steering is unsupported")); }
   interrupt(id: string) {
     return this.guard(async () => { const live = await this.live(id), dispatch = live.manifest.lastDispatch;

@@ -37,7 +37,7 @@ lines.on("line", (line) => {
     if (request.subtype === "initialize" && mode === "startup-exit") process.exit(2);
     if (request.subtype === "interrupt" && mode === "interrupt-hang") return;
     output({ type: "control_response", response: { subtype: "success", request_id: message.request_id,
-      response: request.subtype === "initialize" ? { commands: [], agents: [], models: JSON.parse(process.env.MINU_CLAUDE_FIXTURE_MODELS ?? "[]"), account: process.env.MINU_CLAUDE_FIXTURE_ACCOUNT === "none" ? {} : { apiKeySource: "ANTHROPIC_API_KEY" }, output_style: "default", available_output_styles: [],
+      response: request.subtype === "initialize" ? { commands: JSON.parse(process.env.MINU_CLAUDE_FIXTURE_COMMANDS ?? "[]"), agents: [], models: JSON.parse(process.env.MINU_CLAUDE_FIXTURE_MODELS ?? "[]"), account: process.env.MINU_CLAUDE_FIXTURE_ACCOUNT === "none" ? {} : { apiKeySource: "ANTHROPIC_API_KEY" }, output_style: "default", available_output_styles: [],
         claude_code_version: process.env.MINU_CLAUDE_FIXTURE_VERSION ?? "2.1.321" } : {} } });
     if (request.subtype === "interrupt" && mode !== "interrupt-no-result") {
       setTimeout(() => result("interrupted", { subtype: "error_during_execution", is_error: true, errors: ["interrupted"] }), 20);

@@ -23,6 +23,7 @@ export interface ClaudeCodeProbe {
   /** User/project/plugin-defined commands, i.e. skills. Claude Code's own builtin commands are excluded. */
   skills: SlashCommand[];
 }
+export type { ModelInfo, SlashCommand };
 
 function timeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
