@@ -55,6 +55,15 @@ export interface VerifiedTerminationOptions {
   readProcess?: (pgid: number) => Promise<string>;
 }
 
+/** The process group `ps` reports for a live PID, or undefined. Used to verify a fresh fork's own group before recording it. */
+export async function readProcessGroup(pid: number): Promise<number | undefined> {
+  try {
+    const { stdout } = await execute("ps", ["-ww", "-p", String(pid), "-o", "pgid="], { timeout: 2_000 });
+    const group = Number(stdout.trim());
+    return Number.isSafeInteger(group) && group > 0 ? group : undefined;
+  } catch { return undefined; }
+}
+
 const readProcessStdout = async (pgid: number) =>
   (await execute("ps", ["-ww", "-p", String(pgid), "-o", "pgid=", "-o", "args="], { timeout: 2_000 })).stdout;
 

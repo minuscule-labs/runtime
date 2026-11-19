@@ -110,7 +110,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       if (!(await lstat(cwd)).isDirectory()) throw unavailable();
       // Reuse the real preflight decoder BEFORE creating launch metadata.
       this.preflight(id, generation, cwd, entry);
-      await this.store.create({ version: 3, runtime: "claude-code", id, ownerId, revision: 0, generation, requiresExplicitResume: false,
+      await this.store.create({ version: 4, runtime: "claude-code", id, ownerId, revision: 0, generation, requiresExplicitResume: false,
         native: { state: "pending" }, worker: { state: "none" }, lastDispatch: { state: "none" }, launchConfig: { ...config, cwd },
         policy: { configuration: "isolated", permissionMode: "default", nativeConfigRoot: this.options.nativeConfigRoot, tools: ["Read", "Grep", "Glob"] }, createdAt: new Date().toISOString() });
       return this.launch(id);

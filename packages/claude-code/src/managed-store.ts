@@ -43,7 +43,12 @@ export type ClaudeCodeDispatchState =
   | (ClaudeCodeDispatchIdentity & { state: "settled"; generation: string; outcome: "completed" | "failed" | "interrupted" });
 
 export interface ClaudeCodeWorkerProcess { pid: number; processGroupId: number | null }
-interface WorkerReservation { generation: string; reservationId: string; workerExecutable: string }
+/** v4 launches carry the exact argv identity markers (`marked`) and the boot they started in. Neither
+ * is process authority by itself; a missing bootIdentity means "no boot proof", unmarked means no signals. */
+export interface ClaudeCodeWorkerLaunchIdentity { bootIdentity?: string }
+interface WorkerReservation { generation: string; reservationId: string; workerExecutable: string; bootIdentity?: string; marked?: true }
+/** Which independently observed fact allows forceClearWorker to drop an occupied slot. */
+export type ClaudeCodeWorkerAbsenceProof = "unstarted" | "boot" | "group";
 export type ClaudeCodeManagedWorker =
   | { state: "none" }
   | (WorkerReservation & { state: "reserved" })
@@ -51,15 +56,17 @@ export type ClaudeCodeManagedWorker =
   | (WorkerReservation & { state: "live"; registration: ClaudeCodeWorkerRegistration });
 
 type WorkerOperation =
-  | { type: "reserve"; reservationId: string; workerExecutable: string }
+  | { type: "reserve"; reservationId: string; workerExecutable: string; launch?: ClaudeCodeWorkerLaunchIdentity }
   | { type: "begin" | "release"; reservationId: string }
   | { type: "process"; reservationId: string; pid: number; processGroupId: number | null }
   | { type: "publish"; reservationId: string; payload: Uint8Array }
-  | { type: "clear"; reservationId: string; pid: number };
+  | { type: "clear"; reservationId: string; pid: number }
+  | { type: "force-clear"; reservationId: string; proof: ClaudeCodeWorkerAbsenceProof };
 
 /** Internal resume material. Never expose this as a sanitized inventory/profile. */
 export interface ClaudeCodeManagedManifest {
-  version: 3;
+  /** 3 predates launch identity (bootIdentity/markers); both stay readable. */
+  version: 3 | 4;
   runtime: "claude-code";
   revision: number;
   generation: string;
@@ -89,7 +96,8 @@ export interface ClaudeCodeManifestLease {
   /** Only the current, unfenced generation and exact native/caller input may record a terminal result. */
   settleDispatch(expectedRevision: number, generation: string, identity: ClaudeCodeDispatchIdentity,
     outcome: "completed" | "failed" | "interrupted"): Promise<ClaudeCodeManagedManifest>;
-  reserveWorker(expectedRevision: number, generation: string, reservationId: string, workerExecutable: string): Promise<ClaudeCodeManagedManifest>;
+  reserveWorker(expectedRevision: number, generation: string, reservationId: string, workerExecutable: string,
+    launch?: ClaudeCodeWorkerLaunchIdentity): Promise<ClaudeCodeManagedManifest>;
   /** Commit before fork. A starting reservation with no recorded PID remains uncertain. */
   beginWorkerStart(expectedRevision: number, generation: string, reservationId: string): Promise<ClaudeCodeManagedManifest>;
   recordWorkerProcess(expectedRevision: number, generation: string, reservationId: string, pid: number, processGroupId: number | null): Promise<ClaudeCodeManagedManifest>;
@@ -100,6 +108,10 @@ export interface ClaudeCodeManifestLease {
    * PID equality or an RPC acknowledgment is NOT exit proof. Starting-without-PID
    * cannot be cleared. Preserves input uncertainty/native history/fence. */
   clearWorkerAfterExit(expectedRevision: number, generation: string, reservationId: string, pid: number): Promise<ClaudeCodeManagedManifest>;
+  /** Forced-recovery clear. Needs the fence already persisted, but NOT a clean dispatch/history or a valid
+   * registration. The caller MUST have independently proven absence (`proof`); the store only checks that the
+   * claimed proof is coherent with the record. Keeps native binding/dispatch; rotates the generation. */
+  forceClearWorker(expectedRevision: number, generation: string, reservationId: string, proof: ClaudeCodeWorkerAbsenceProof): Promise<ClaudeCodeManagedManifest>;
 }
 
 export class ClaudeCodeManifestConflictError extends Error {}
@@ -156,7 +168,10 @@ function validateWorker(worker: unknown, manifest: ClaudeCodeManagedManifest): v
     || typeof worker.generation !== "string" || !ID.test(worker.generation)
     || typeof worker.reservationId !== "string" || !UUID.test(worker.reservationId)
     || !normalizedPath(worker.workerExecutable)) throw new Error("Invalid Claude Code worker reservation");
-  const common = ["state", "generation", "reservationId", "workerExecutable"];
+  if ((worker.bootIdentity !== undefined || worker.marked !== undefined) && manifest.version !== 4) throw new Error("Invalid Claude Code worker launch identity");
+  if ((worker.bootIdentity !== undefined && (typeof worker.bootIdentity !== "string" || !/^[a-z]+:[0-9a-f-]{32,36}$/.test(worker.bootIdentity)))
+    || (worker.marked !== undefined && worker.marked !== true)) throw new Error("Invalid Claude Code worker launch identity");
+  const common = ["state", "generation", "reservationId", "workerExecutable", "bootIdentity", "marked"];
   if (worker.state === "reserved" && keys(worker, common)) return;
   if (worker.state === "starting" && keys(worker, [...common, "process"])
     && (worker.process === null || workerProcess(worker.process))) return;
@@ -175,7 +190,7 @@ function validate(value: ClaudeCodeManagedManifest): void {
   const config = value.launchConfig;
   const native = value.native;
   const policy = value.policy;
-  if (value.version !== 3 || value.runtime !== "claude-code"
+  if (![3, 4].includes(value.version) || value.runtime !== "claude-code"
     || !keys(value, ["version", "runtime", "revision", "generation", "requiresExplicitResume", "id", "ownerId", "native", "worker", "lastDispatch", "launchConfig", "policy", "createdAt"])
     || !Number.isSafeInteger(value.revision) || value.revision < 0 || value.revision >= Number.MAX_SAFE_INTEGER
     || typeof value.requiresExplicitResume !== "boolean"
@@ -252,12 +267,13 @@ export class ClaudeCodeManagedStore {
         bindNativeSession: (revision, sessionId) => mutate(() => this.bindLocked(id, ownerId, revision, sessionId, true)),
         beginDispatch: (revision, generation, identity) => mutate(() => this.dispatchLocked(id, ownerId, revision, generation, identity)),
         settleDispatch: (revision, generation, identity, outcome) => mutate(() => this.dispatchLocked(id, ownerId, revision, generation, identity, { outcome })),
-        reserveWorker: (revision, generation, reservationId, workerExecutable) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "reserve", reservationId, workerExecutable })),
+        reserveWorker: (revision, generation, reservationId, workerExecutable, launch) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "reserve", reservationId, workerExecutable, ...(launch ? { launch } : {}) })),
         beginWorkerStart: (revision, generation, reservationId) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "begin", reservationId })),
         recordWorkerProcess: (revision, generation, reservationId, pid, processGroupId) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "process", reservationId, pid, processGroupId })),
         publishWorker: (revision, generation, reservationId, payload) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "publish", reservationId, payload })),
         releaseWorkerReservation: (revision, generation, reservationId) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "release", reservationId })),
         clearWorkerAfterExit: (revision, generation, reservationId, pid) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "clear", reservationId, pid })),
+        forceClearWorker: (revision, generation, reservationId, proof) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "force-clear", reservationId, proof })),
       };
       try { return await operation(lease); }
       finally {
@@ -401,13 +417,26 @@ export class ClaudeCodeManagedStore {
         || (current.native.state === "bound" && current.lastDispatch.state !== "settled")) {
         throw new ClaudeCodeManifestConflictError("Claude Code worker launch is active, fenced or uncertain");
       }
-      next = { state: "reserved", generation, reservationId: operation.reservationId, workerExecutable: operation.workerExecutable };
+      next = { state: "reserved", generation, reservationId: operation.reservationId, workerExecutable: operation.workerExecutable,
+        ...(operation.launch ? { marked: true as const, ...(operation.launch.bootIdentity ? { bootIdentity: operation.launch.bootIdentity } : {}) } : {}) };
+      return this.publishUpdate({ ...current, revision: current.revision + 1, ...(operation.launch ? { version: 4 as const } : {}), worker: next });
     } else {
       if (worker.state === "none" || worker.reservationId !== operation.reservationId) throw new ClaudeCodeManifestConflictError("Claude Code worker reservation changed");
       if (operation.type === "release") {
         if (current.requiresExplicitResume || worker.generation !== generation || worker.state !== "reserved") {
           throw new ClaudeCodeManifestConflictError("Claude Code worker reservation release authority changed");
         }
+        return this.publishUpdate({ ...current, revision: current.revision + 1, generation: randomUUID(), worker: { state: "none" } });
+      }
+      if (operation.type === "force-clear") {
+        const group = worker.state === "live" ? worker.registration.processGroupId : worker.state === "starting" ? worker.process?.processGroupId : null;
+        if (!current.requiresExplicitResume || !["unstarted", "boot", "group"].includes(operation.proof)
+          || (operation.proof === "unstarted" && worker.state !== "reserved")
+          || (operation.proof === "boot" && worker.bootIdentity === undefined)
+          || (operation.proof === "group" && !group)) {
+          throw new ClaudeCodeManifestConflictError("Claude Code forced clear requires the fence and a coherent absence proof");
+        }
+        // The caller proved absence independently. Rotation fences every old controller/callback.
         return this.publishUpdate({ ...current, revision: current.revision + 1, generation: randomUUID(), worker: { state: "none" } });
       }
       if (operation.type === "clear") {
@@ -431,7 +460,8 @@ export class ClaudeCodeManagedStore {
         if (registration.pid !== worker.process.pid || registration.processGroupId !== worker.process.processGroupId) {
           throw new ClaudeCodeManifestConflictError("Claude Code worker registration process mismatch");
         }
-        next = { state: "live", generation, reservationId: worker.reservationId, workerExecutable: worker.workerExecutable, registration };
+        next = { state: "live", generation, reservationId: worker.reservationId, workerExecutable: worker.workerExecutable, registration,
+          ...(worker.marked ? { marked: true as const } : {}), ...(worker.bootIdentity ? { bootIdentity: worker.bootIdentity } : {}) };
       }
     }
     return this.publishUpdate({ ...current, revision: current.revision + 1, worker: next });

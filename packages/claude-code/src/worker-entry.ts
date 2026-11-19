@@ -82,11 +82,14 @@ function currentScope(manifest: ClaudeCodeManagedManifest | undefined, scope: Cl
  * physical exit/group proof, recovery, public routing or metadata mutation is supplied here.
  * The returned handle is privileged LOCAL self-cleanup, never exposed over private IPC/HTTP. */
 export async function runClaudeCodeWorkerEntry(): Promise<ClaudeCodeManagedSessionHandle> {
-  if (!process.send || !process.connected || process.argv.length !== 2 || process.execArgv.length
+  if (!process.send || !process.connected || ![2, 8].includes(process.argv.length) || process.execArgv.length
     || process.env.NODE_OPTIONS !== undefined || process.env.NODE_PATH !== undefined) throw failed();
   const bootstrap = await receive();
   const { scope } = bootstrap;
   if (await realpath(process.argv[1]) !== scope.workerExecutable || await realpath(process.cwd()) !== scope.cwd) throw failed();
+  // Marked launches (argv of 8) must carry exactly this scope's identity; legacy launches carry none.
+  if (process.argv.length === 8 && process.argv.slice(2).join("\0") !== ["--minu-runtime-session", scope.sessionId,
+    "--minu-runtime-owner", scope.ownerId, "--minu-runtime-generation", scope.generation].join("\0")) throw failed();
   const store = new ClaudeCodeManagedStore(bootstrap.storeRoot);
   const initial = await store.read(scope.sessionId, scope.ownerId);
   if (!currentScope(initial, scope) || initial!.worker.state !== "starting" || initial!.worker.process?.pid !== process.pid) throw failed();
