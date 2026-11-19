@@ -123,10 +123,14 @@ test("committed native success with missing final materialization never grants c
   const f = await fixture(t, { MINU_PERSIST_DROP_FINAL: "1" }), session = await f.runtime.start({ cwd: f.cwd });
   await f.runtime.send(session.id, "not fully persisted"); const before = (await f.read(session.id))!;
   assert.equal(before.lastDispatch.state, "settled"); await assert.rejects(f.runtime.stop(session.id));
-  assert.deepEqual(await f.read(session.id), before);
-  assert.equal((await f.runtime.getManagedSession(session.id, "owner"))?.state, "unavailable");
+  // The MVP left the manifest unchanged here, i.e. a DEAD worker recorded as live. History is judged only after proven absence
+  // and the worker is gone either way, so it is now fenced and cleared; only resume stays refused (history is ineligible).
+  const after = (await f.read(session.id))!;
+  assert.equal(after.worker.state, "none"); assert.equal(after.requiresExplicitResume, true); assert.notEqual(after.generation, before.generation);
+  assert.deepEqual(after.native, before.native); assert.deepEqual(after.lastDispatch, before.lastDispatch);
+  assert.equal((await f.runtime.getManagedSession(session.id, "owner"))?.state, "suspended");
   await assert.rejects(f.controller().resume(session.id, "owner", { allowStopped: true }));
-  assert.deepEqual(await f.read(session.id), before);
+  assert.deepEqual(await f.read(session.id), after);
 });
 
 for (const action of ["stop", "resume"]) test(`hidden uncompleted input plus snapshot cannot grant ${action} or mutate its checkpoint`, async t => {
@@ -145,8 +149,15 @@ for (const action of ["stop", "resume"]) test(`hidden uncompleted input plus sna
   await writeFile(path, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
   const bytes = await readFile(path), next = f.controller();
   await assert.rejects(action === "stop" ? f.runtime.stop(session.id) : next.resume(session.id, "owner", { allowStopped: true }));
-  assert.deepEqual(await f.read(session.id), before); assert.deepEqual(await readFile(path), bytes);
-  await assert.rejects(next.resume(session.id, "owner", { allowStopped: true })); assert.deepEqual(await f.read(session.id), before);
+  // A refused stop still ends the (proven-absent) worker: fenced and cleared, binding and dispatch untouched. A refused resume changes nothing.
+  const after = (await f.read(session.id))!;
+  if (action === "stop") {
+    assert.equal(after.worker.state, "none"); assert.equal(after.requiresExplicitResume, true);
+    assert.deepEqual(after.native, before.native); assert.deepEqual(after.lastDispatch, before.lastDispatch);
+    assert.equal((await f.runtime.getManagedSession(session.id, "owner"))?.state, "suspended");
+  } else assert.deepEqual(after, before);
+  assert.deepEqual(await readFile(path), bytes);
+  await assert.rejects(next.resume(session.id, "owner", { allowStopped: true })); assert.deepEqual(await f.read(session.id), after);
   assert.equal((next as unknown as { ownedChildren: Map<string, ChildProcess> }).ownedChildren.size, 0, "rejection must not launch replacement");
 });
 

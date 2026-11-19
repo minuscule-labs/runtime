@@ -89,12 +89,17 @@ export async function suspendClaudeCodeWorker(store: ClaudeCodeManagedStore, id:
     await store.withSessionLock(id, ownerId, async lease => {
       const current = await store.read(id, ownerId); exact(current); remaining();
       if (!groupAbsent(live.registration.pid)) throw unavailable();
-      await claudeCodeCleanHistory(current!); remaining();
+      // History is only judged AFTER proven absence (the real engine finalizes on exit). Whatever it says, the worker is gone:
+      // always fence and clear so a dead worker is never left recorded as live; an ineligible history then refuses resume and
+      // fails this call.
+      let history: unknown;
+      try { await claudeCodeCleanHistory(current!); } catch (error) { history = error ?? unavailable(); }
       if (!groupAbsent(live.registration.pid)) throw unavailable();
       // Fence BEFORE clear. A lost mutation return cannot leave an automatically
       // resumable slot. Clear preserves binding/input/fence and rotates generation.
       const fenced = await lease.update(current!.revision, { requiresExplicitResume: true });
       await lease.clearWorkerAfterExit(fenced.revision, snapshot.generation, live.scope.reservationId, live.registration.pid);
+      if (history !== undefined) throw unavailable();
     }, remaining());
     remaining(); // A late committed return is uncertainty, never an on-time success.
   } catch { throw unavailable(); }

@@ -133,6 +133,44 @@ for (const [name, patch, code] of invalidToolsUsed) test(`tools-used refuses ${n
   } finally { await f.cleanup(); }
 });
 
+test("a final last-prompt may name an ancestor when everything after it is the completed dispatch's own response (real-engine ordering)", async () => {
+  const f = await fixture();
+  try {
+    // Observed from the real engine: `last-prompt` and `atis-latch` land BEFORE the final assistant row and are not rewritten at exit.
+    const user = f.row(), call = f.row("assistant", [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "echo" } }], user.uuid);
+    call.message.stop_reason = "tool_use";
+    const result = f.row("user", [{ type: "tool_result", tool_use_id: "t1", content: "ok" }], call.uuid);
+    const answer = f.row("assistant", [{ type: "text", text: "tools finished" }], result.uuid); answer.message.stop_reason = "end_turn";
+    const completedInput = { nativeMessageId: user.uuid, fingerprint: createHash("sha256").update("hello").digest("hex") };
+    const last = (leafUuid: string) => ({ type: "last-prompt", sessionId: f.id, leafUuid });
+    const latch = { type: "atis-latch", sessionId: f.id };
+    // A leaf can only name a row already written, so mid-response placements use the rows before them.
+    for (const leaf of [user.uuid, call.uuid]) {
+      await f.save([user, call, last(leaf), latch, result, answer]);
+      assert.equal((await inspectClaudeCodeHistory({ ...f.options, completedInput })).state, "present", `leaf ${leaf}`);
+    }
+    for (const leaf of [user.uuid, call.uuid, result.uuid, answer.uuid]) {
+      await f.save([user, call, result, answer, last(leaf)]);
+      assert.equal((await inspectClaudeCodeHistory({ ...f.options, completedInput })).state, "present", `final leaf ${leaf}`);
+    }
+    // Still refused: a trailing hidden/visible user row, a leaf from an EARLIER turn, an unknown leaf, no last-prompt at all.
+    const earlier = f.row("user", "earlier turn"), earlierAnswer = f.row("assistant", [{ type: "text", text: "earlier" }], earlier.uuid); earlierAnswer.message.stop_reason = "end_turn";
+    const second = { ...f.row("user", "hello", earlierAnswer.uuid) }, secondAnswer = f.row("assistant", [{ type: "text", text: "done" }], second.uuid); secondAnswer.message.stop_reason = "end_turn";
+    const secondInput = { nativeMessageId: second.uuid, fingerprint: completedInput.fingerprint };
+    const cases: [string, Record<string, any>[], typeof completedInput][] = [
+      ["trailing user row", [user, call, last(call.uuid), result, answer, f.row("user", "later input", answer.uuid)], completedInput],
+      ["trailing hidden row", [user, call, last(call.uuid), result, answer, { ...f.row("user", "hidden", answer.uuid), isMeta: true }], completedInput],
+      ["leaf from an earlier turn", [earlier, earlierAnswer, second, secondAnswer, last(earlier.uuid)], secondInput],
+      ["unknown leaf", [user, call, last(randomUUID()), result, answer], completedInput],
+      ["no last-prompt", [user, call, result, answer], completedInput],
+    ];
+    for (const [name, rows, input] of cases) {
+      await f.save(rows);
+      await assert.rejects(inspectClaudeCodeHistory({ ...f.options, completedInput: input }), rejected("invalid_history"), name);
+    }
+  } finally { await f.cleanup(); }
+});
+
 test("completed-input eligibility requires the committed mapped text, terminal end_turn, final leaf and drained native queue", async () => {
   const f = await fixture();
   try {

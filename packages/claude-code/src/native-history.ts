@@ -209,6 +209,8 @@ async function parse(bytes: Buffer, options: ClaudeCodeHistoryOptions): Promise<
   let steerQueued: string | undefined, steerRemoved: string | undefined;
   const steers = new Set(options.completedInput?.steers ?? []);
   let imageMetaOk = false;
+  // Chain order, so a final last-prompt may name the committed input or any LATER row of its own response.
+  const order = new Map<string, number>(); let matchedOrdinal = -1;
   const append = (role: RuntimeMessage["role"], content: string, timestamp: number, toolName?: string) => {
     if (!content) return;
     textBytes += Buffer.byteLength(content);
@@ -263,7 +265,7 @@ async function parse(bytes: Buffer, options: ClaudeCodeHistoryOptions): Promise<
     if (row.cwd !== options.canonicalCwd || row.isSidechain !== false || row.teamName !== undefined
       || typeof row.uuid !== "string" || !UUID.test(row.uuid) || seen.has(row.uuid)
       || row.parentUuid !== parent || typeof row.timestamp !== "string" || !Number.isFinite(Date.parse(row.timestamp))) reject("invalid_history");
-    seen.add(row.uuid as string);
+    seen.add(row.uuid as string); order.set(row.uuid as string, order.size);
     parent = row.uuid as string;
     if (row.type === "attachment") {
       if (object(row.attachment) && row.attachment.type === "queued_command") {
@@ -317,7 +319,7 @@ async function parse(bytes: Buffer, options: ClaudeCodeHistoryOptions): Promise<
       if (row.uuid === options.completedInput.nativeMessageId) {
         if (row.type !== "user" || hidden || text === undefined || Buffer.from(text).toString() !== text
           || createHash("sha256").update(text).digest("hex") !== options.completedInput.fingerprint) reject("invalid_history");
-        matchedInput = true; terminal = undefined; terminalResponse = undefined; imageMetaOk = hasImage;
+        matchedInput = true; terminal = undefined; terminalResponse = undefined; imageMetaOk = hasImage; matchedOrdinal = order.get(row.uuid as string)!;
       } else if (matchedInput && row.type === "user" && imageMetaOk && hidden && row.isMeta === true && Array.isArray(content) && content.length === 1
         && object(content[0]) && content[0].type === "text" && typeof content[0].text === "string" && content[0].text.startsWith("[Image: source: ")) {
         // The engine's hidden pointer to a stored image, directly after the committed image input. Not a new prompt.
@@ -381,6 +383,6 @@ async function parse(bytes: Buffer, options: ClaudeCodeHistoryOptions): Promise<
     }
     flush();
   }
-  if (!users || (options.completedInput && (!matchedInput || !terminal || terminal !== parent || lastPrompt !== terminal || toolNames.size || queued !== undefined || dequeued !== undefined || steerQueued !== undefined || steerRemoved !== undefined))) reject("invalid_history");
+  if (!users || (options.completedInput && (!matchedInput || !terminal || terminal !== parent || lastPrompt === undefined || order.get(lastPrompt)! < matchedOrdinal || toolNames.size || queued !== undefined || dequeued !== undefined || steerQueued !== undefined || steerRemoved !== undefined))) reject("invalid_history");
   return { messages, records: lines.length };
 }
