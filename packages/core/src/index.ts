@@ -193,3 +193,4 @@ export interface AgentRuntime {
   /** Stop a Runtime-owned worker; managed sessions preserve resume metadata. Attached sessions cannot be stopped by Runtime. */
   stop(sessionId: string): Promise<void>;
 }
+export { readBootIdentity, bootChanged, processGroupAbsent, terminateVerifiedGroup, type VerifiedTerminationOptions } from "./process-recovery.js";
