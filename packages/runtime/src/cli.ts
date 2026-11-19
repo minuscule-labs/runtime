@@ -1,12 +1,21 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
 import { open } from "node:fs/promises";
-import { constants } from "node:fs";
-import { extname, resolve } from "node:path";
+import { constants, realpathSync } from "node:fs";
+import { basename, dirname, extname, resolve } from "node:path";
 import { createRuntime, runtimeReference, CodexAgentRuntime, runtimeInput, RUNTIME_INPUT_LIMITS,
   type AgentRuntime, type AgentStartConfig, type AgentEvent, type RuntimeAdapterId, type RuntimeImageContent } from "./index.js";
 import { listRegistrations, readRegistration } from "@minu/runtime-pi";
 
+/** Canonical path even when the leaf does not exist yet: the managed store requires a real, non-symlinked root. */
+export function canonicalRoot(path: string): string {
+  const absolute = resolve(path);
+  try { return realpathSync(absolute); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(absolute) === absolute) throw error;
+    return resolve(canonicalRoot(dirname(absolute)), basename(absolute));
+  }
+}
 function render(event: AgentEvent): void {
   if (event.type === "message_delta") process.stdout.write(event.delta);
   else if (event.type === "tool_started") console.log(`\n[tool] ${event.toolName}`);
@@ -55,7 +64,7 @@ export function createRuntimeProgram(): Command {
     const { adapter, id } = runtimeReference(reference ?? "", options.adapter);
     if (options.managedRoot && adapter !== "codex") throw new Error("--managed-root requires Codex");
     let runtime = runtimes.get(adapter);
-    if (!runtime) { runtime = adapter === "codex" ? createRuntime("codex", { managedRoot: options.managedRoot ? resolve(options.managedRoot) : undefined }) : createRuntime("pi"); runtimes.set(adapter, runtime); }
+    if (!runtime) { runtime = adapter === "codex" ? createRuntime("codex", { managedRoot: options.managedRoot ? canonicalRoot(options.managedRoot) : undefined }) : createRuntime("pi"); runtimes.set(adapter, runtime); }
     return { adapter, id, runtime, owner: options.owner };
   };
   const owner = (value: string | undefined) => { if (!value) throw new Error("An explicit --owner is required"); return value; };

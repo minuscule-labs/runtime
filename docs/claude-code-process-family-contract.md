@@ -1,4 +1,42 @@
-# Claude Code MVP process-family contract — v1
+# Claude Code MVP process-family contract — v2
+
+## v2: explicit forced recovery
+
+v2 supersedes the v1 ban on TERM/KILL and recovered-PID control for **marked,
+own-group workers only**; everything else in v1 is unchanged. The change set is
+specified in `docs/managed-recovery-spec.md` (section 2.5).
+
+- **Marked launch.** A worker forked by this adapter (manifest v4) carries the argv
+  markers `--minu-runtime-session <id> --minu-runtime-owner <ownerId>
+  --minu-runtime-generation <generation>`, runs in its own process group
+  (`pgid === pid`, verified with `ps` before it is recorded) and records the boot
+  identity it started in. The worker entry refuses markers that differ from its
+  bootstrap scope.
+- **Absence proof (no signals).** A worker is proven absent by a changed boot
+  identity (`kern.bootsessionuuid` on macOS, `/proc/sys/kernel/random/boot_id` on
+  Linux; unreadable means no proof) or by `ESRCH` on `kill(-pgid, 0)` for a worker
+  with a recorded own group. `EPERM` is unproven and any other error fails closed.
+  A bare-PID `ESRCH` is never proof: native children may outlive it.
+- **Verified termination (signals), marked own-group workers only.** If the boot is
+  unchanged and the group is present, read `ps -ww -p <pgid> -o pgid= -o args=`;
+  require the pgid and the exact markers plus the recorded worker entry path, then
+  TERM `-pgid` (up to 5 s), then KILL `-pgid` (up to 5 s), proving exit with `ESRCH`.
+  A mismatch throws without signalling. Never a bare PID, a group that is not the
+  worker's own, or a process found by name.
+- **Legacy and unmarked workers keep the v1 ban.** `group:null`, pre-v4 and
+  unmarked workers are never signalled. They clear only through boot-change proof
+  (or a recorded own-group `ESRCH` when they have one); otherwise they stay fenced.
+- **Ordering.** Fence first (`requiresExplicitResume`), one best-effort
+  admission-bypassing worker stop that needs no valid registration and never gates
+  the outcome, then proof or verified termination, then clear and rotate the
+  generation. Never clear on uncertainty. History is not checked before absence; the
+  real bundled binary finalizes history only after it exits, so any history check
+  (`resume`) happens after proven absence.
+- **Scope.** `forceStopManaged` and `destroy` only; these routines live in
+  `packages/core/src/process-recovery.ts` and `packages/claude-code/src/worker-recovery.ts`.
+  Normal `suspend`/`stop` keep the strict v1 semantics. R19/R20 beyond this (a
+  supervisor/witness, OS-enforced containment, cross-boot fencing of legacy workers)
+  remain future work.
 
 ## Decision and current status
 
@@ -100,9 +138,10 @@ Present/ambiguous/unreadable domains, unknown origin, legacy `group:null`, chang
 scope/fence, uncertain creation/dispatch or unproven history remain unavailable.
 No guessed cleanup, automatic migration, replacement thread or input replay.
 
-This does not authorize TERM/KILL against recovered PIDs/groups, process-name
-matching, forced busy/unreachable recovery, a new supervisor/witness or OS helper.
-Full R19/R20 recovery/fencing remains separate required work beyond this MVP.
+Normal retirement still does not signal anything. Under v2, TERM/KILL of a recovered
+group is authorized only through the explicit recovery path above, for marked
+own-group workers. Process-name matching, bare-PID signals, a new supervisor/witness
+or OS helper remain unauthorized. Full R19/R20 recovery/fencing beyond v2 stays future work.
 
 ## Validation and evidence limits
 

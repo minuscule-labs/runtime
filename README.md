@@ -45,7 +45,9 @@ Every Codex session operation requires the exact explicit `--owner`. Optional
 `--managed-root` selects its private metadata root. Creation is managed/lazy;
 ordinary status/control/history commands only connect to living workers and never
 implicitly cold-resume. `resume` is explicit. Existing macOS/v5 suspend/destroy
-eligibility limits still apply; `stop` is not verified suspension or force recovery.
+eligibility limits still apply; `stop` is not verified suspension or force recovery
+(use `forceStopManaged`, below). `--managed-root` and workspaces are canonicalized
+(symlinks such as macOS `/tmp` are resolved) before anything is persisted.
 
 The CLI also exposes `capabilities`, model/provider/reasoning/skill launch choices,
 `start-turn`/`turn`, repeated `--image <file>` inputs (including image-only turns),
@@ -234,11 +236,23 @@ cold resume. Neither operation proves tool-descendant/group exit or establishes 
 recovery fence. Messages are hydrated from native history after clean resume.
 Caller-turn lookup/idempotency remains bounded to the original worker's retention
 window; native history is not a durable caller-turn or exactly-once tool ledger.
-`destroy(id, ownerId)` reuses verified idle suspension, then removes only Runtime
-resume metadata under the same revision-checked lifecycle lock. Codex history is
-never deleted. Never-launched pending metadata can also be removed, including v4;
-active v4/unsupported-platform, busy, fenced, stopped-without-receipt or otherwise
-uncertain material rejects without recovery or force-stop. Concurrent cold resume
+`forceStopManaged(id, ownerId)` is explicit recovery for a busy, interrupted,
+unreachable, `reserved`, `aborted` or `ready` worker. It persists a fence first,
+sends one best-effort authenticated stop that bypasses admission, then needs
+**absence proof**: a changed boot identity, or `ESRCH` on the worker's own process
+group (new workers are forked detached with exact `--minu-runtime-*` argv markers and a
+`ps`-verified group). Otherwise it verifies the group leader's command line and sends
+TERM then KILL to that group only. It never signals a bare PID or a legacy worker
+recorded without a group; those stay fenced unless a reboot proves absence. Success
+leaves the worker `none`, the session `suspended` and the native binding untouched;
+it does not validate history. `resume(id, owner, { allowStopped: true })` relaunches
+such a slot only where a fresh launch is already permitted (native never started, or
+a verified resume epoch); otherwise it stays fenced and suspended.
+`destroy(id, ownerId)` first tries verified idle suspension for a ready worker, then
+proves absence (or force-stops, on every platform including Linux) and removes only
+Runtime resume metadata under the same revision-checked lifecycle lock. Codex history is
+never deleted. An unfenced slot with a bound thread and no registered worker, or any
+slot whose absence cannot be proven, rejects. Concurrent cold resume
 and destruction cannot both mutate the same generation. Publication/lock-return
 failure remains uncertain, even when canonical metadata is already gone. Lifecycle
 lock files are retained; unexpected files in the resume directory prevent deletion.
@@ -267,8 +281,7 @@ report a gap; use retained turn lookup—not stream closure, interrupt acknowled
 or `offline` status—as evidence of actual turn settlement. Worker loss still ends
 the retention window; there is no durable stream/caller-turn ledger.
 
-**Still required and not yet implemented:** explicit force-stop recovery,
-cross-platform suspend/cold resume and legacy migration policy, native TUI
+**Still required and not yet implemented:** cross-platform suspend/cold resume and legacy migration policy, native TUI
 attachment and Conversations/CLI selection. Native launch/input capabilities are
 independently approved; profile/structured observations and managed local diagnostics
 await behavior-level independent review. Non-macOS viewers and direct/unmanaged
@@ -345,8 +358,8 @@ control failures take the session offline and stop it; no automatic replay occur
 all tool descendants or a managed recovery fence.
 
 The in-process class has no managed lifecycle. `ClaudeCodeManagedRuntime` separately
-implements the durable text-only MVP below; forced recovery, destroy, rich live
-profiles/diagnostics and native TUI attachment remain outside that implementation.
+implements the durable text-only MVP below, including explicit forced recovery and
+destroy (see its contract v2); rich live profiles/diagnostics and native TUI attachment remain outside that implementation.
 The existing `runtime` CLI and Channels/Conversations loading remain Pi-only.
 
 ### Durable text-only MVP (real-auth acceptance pending)
@@ -360,13 +373,26 @@ process groups are not OS containment or a filesystem sandbox.
 
 Supported path: managed create/readiness, literal text/streams/history/status,
 interrupt, owner inventory, reconnect to a living worker, healthy idle-only stop and
-explicit same-history resume. Stop observes the eligible fresh process-family's
+explicit same-history resume, `forceStopManaged` and `destroy`. Stop observes the eligible fresh process-family's
 absence, requires exact unchanged metadata and materialization of an independently
 completed latest input, then fences/clears the worker under CAS. Resume requires
-`{ allowStopped: true }`. No missing-history fallback, unknown-outcome replay,
-legacy null-group migration or busy/unreachable recovery. Busy stop is refused. An interrupted but healthy worker needs a fresh confirmed
+`{ allowStopped: true }`. No missing-history fallback, unknown-outcome replay or
+legacy null-group migration. Normal busy `stop` is still refused. An interrupted but healthy worker needs a fresh confirmed
 completed turn before clean suspension; failed/uncertain sessions remain refused
 rather than guessing history eligibility.
+
+Recovery is separate and explicit. `forceStopManaged` fences first, sends one
+admission-bypassing stop to the authenticated worker, then requires absence proof
+(reboot, or `ESRCH` on the worker's own group) or marker-verified TERM/KILL of that
+group, and clears the slot without needing a clean dispatch or history. Workers
+launched with the new argv identity markers (manifest v4) are signalable; legacy
+`group:null` or unmarked workers are never signalled and clear only on a reboot.
+After recovery `getManagedSession` reports `suspended`; `resume` re-checks history
+and refuses (staying fenced and suspended) when it is not clean. `destroy` removes
+only Runtime metadata after the same proof; native history is left in place. A
+`startManaged` whose launch/readiness fails runs the same stop path and removes the
+record only after proven absence, otherwise it stays fenced and listed. See
+[contract v2](docs/claude-code-process-family-contract.md).
 
 Caller turn results/idempotence are retained within a living worker, not rebuilt
 from transcript text after worker restart. Use new turn IDs after explicit resume;

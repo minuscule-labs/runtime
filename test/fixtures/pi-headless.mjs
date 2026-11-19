@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // Synthetic native RPC peer. No model, provider, authentication or tool execution.
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 
-const sessionId = randomUUID();
+// A Runtime-managed start passes its transcript; identify as that session so the managed controller accepts it.
+const transcript = process.argv.includes("--session") ? process.argv[process.argv.indexOf("--session") + 1] : undefined;
+const sessionId = transcript ? JSON.parse(readFileSync(transcript, "utf8").split("\n")[0]).id : randomUUID();
 writeFileSync("native-meta.json", JSON.stringify({ pid: process.pid, sessionId, args: process.argv.slice(2) }));
 const messages = [];
 const output = (...frames) => process.stdout.write(frames.map(frame => JSON.stringify(frame)).join("\n") + "\n");
@@ -12,7 +14,7 @@ createInterface({ input: process.stdin }).on("line", line => {
   appendFileSync("native-input.jsonl", line + "\n");
   const r = JSON.parse(line);
   const response = data => ({ type: "response", id: r.id, command: r.type, success: true, data });
-  if (r.type === "get_state") output(response({ sessionId, isStreaming: false }));
+  if (r.type === "get_state") output(response({ sessionId, ...(transcript ? { sessionFile: transcript } : {}), isStreaming: false }));
   else if (r.type === "get_messages") output(response({ messages }));
   else if (r.type === "prompt") {
     output(response({ disposition: "started" }), { type: "agent_start" });

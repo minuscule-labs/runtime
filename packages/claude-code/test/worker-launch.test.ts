@@ -96,11 +96,15 @@ test("producer commits before real fork, records before private bootstrap, publi
   const observed = JSON.parse(await readFile(join(f.root, "peer-observed.json"), "utf8"));
   assert.equal(observed.manifest.worker.state, "starting"); assert.equal(observed.manifest.worker.process.pid, attempt.child!.pid);
   assert.equal(observed.manifest.worker.process.processGroupId, attempt.child!.pid);
-  assert.deepEqual(observed.execArgv, []); assert.equal(observed.argv.length, 2);
+  assert.deepEqual(observed.execArgv, []); assert.equal(observed.argv.length, 8);
+  const markers = ["--minu-runtime-session", attempt.scope.sessionId, "--minu-runtime-owner", attempt.scope.ownerId, "--minu-runtime-generation", attempt.scope.generation];
+  assert.deepEqual(observed.argv.slice(2), markers);
+  assert.equal(observed.manifest.version, 4); assert.equal(observed.manifest.worker.marked, true);
+  if (process.platform === "darwin" || process.platform === "linux") assert.match(observed.manifest.worker.bootIdentity, /^(darwin|linux):[0-9a-f-]{32,36}$/);
   assert.equal(observed.environment.ANTHROPIC_API_KEY, undefined); assert.equal(observed.environment.NODE_OPTIONS, undefined);
   assert.deepEqual(Object.keys(observed.environment).filter(key => key !== "__CF_USER_TEXT_ENCODING").sort(), ["CLAUDE_CONFIG_DIR", "HOME", "PATH", "TMPDIR"]);
   assert.deepEqual(Object.keys(f.forks[0].options.env!).sort(), ["CLAUDE_CONFIG_DIR", "HOME", "PATH", "TMPDIR"]);
-  assert.deepEqual(f.forks[0].options.execArgv, []); assert.deepEqual(f.forks[0].args, []); assert.equal(f.forks[0].options.detached, true);
+  assert.deepEqual(f.forks[0].options.execArgv, []); assert.deepEqual(f.forks[0].args, markers); assert.equal(f.forks[0].options.detached, true);
   assert.ok(!JSON.stringify(f.forks[0]).includes("PRIVATE_PRODUCER_AUTH"));
   const published = await f.read(), registration = decode(attempt.registration!, attempt.scope);
   assert.equal(published.worker.state, "live"); assert.equal(published.revision, 4);

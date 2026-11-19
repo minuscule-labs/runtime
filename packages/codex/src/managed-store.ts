@@ -30,12 +30,17 @@ export interface CodexWorkerAbsence {
   result: "pid_absent";
 }
 
+/** Launch identity for forced recovery. `pgid` (always === pid) is the ps-verified own group of the fork, `marked`
+ * means the argv identity markers were passed, `bootIdentity` is the boot it started in. Absent = legacy: such a
+ * worker is never signalled and can only be cleared by a boot-change proof. None of it is authority by itself. */
+export interface CodexWorkerLaunchIdentity { pgid?: number; bootIdentity?: string; marked?: true }
 export type CodexWorkerRegistration =
   | { state: "none" }
-  | { state: "reserved" | "aborted"; claimId: string; generation: string; pid?: number }
-  | { state: "ready"; claimId: string; generation: string; connection: CodexWorkerConnection }
-  | { state: "retiring"; claimId: string; generation: string; connection: CodexWorkerConnection; retirement: CodexRetirementIntent; nativeQuiesce?: CodexNativeQuiesce }
-  | { state: "retired"; claimId: string; generation: string; connection: CodexWorkerConnection; retirement: CodexRetirementIntent; nativeQuiesce: CodexNativeQuiesce; workerAbsence: CodexWorkerAbsence };
+  | ({ state: "reserved" | "aborted"; claimId: string; generation: string; pid?: number } & CodexWorkerLaunchIdentity)
+  | ({ state: "ready"; claimId: string; generation: string; connection: CodexWorkerConnection } & CodexWorkerLaunchIdentity)
+  | ({ state: "retiring"; claimId: string; generation: string; connection: CodexWorkerConnection; retirement: CodexRetirementIntent; nativeQuiesce?: CodexNativeQuiesce } & CodexWorkerLaunchIdentity)
+  | ({ state: "retired"; claimId: string; generation: string; connection: CodexWorkerConnection; retirement: CodexRetirementIntent; nativeQuiesce: CodexNativeQuiesce; workerAbsence: CodexWorkerAbsence } & CodexWorkerLaunchIdentity);
+export type CodexWorkerAbsenceProof = "boot" | "group";
 
 /** Private correlation only, not independent collection, attestation or exit proof. */
 export interface CodexProcessDomain {
@@ -76,13 +81,22 @@ export interface CodexManifestLease {
   beginNativeCreation(expectedRevision: number): Promise<CodexManagedManifest>;
   /** Bind once, before submitting user input. A bound native ID is immutable. */
   bindNativeThread(expectedRevision: number, threadId: string): Promise<CodexManagedManifest>;
-  reserveWorker(expectedRevision: number, claimId: string): Promise<CodexManagedManifest>;
-  recordWorkerPid(expectedRevision: number, claimId: string, pid: number): Promise<CodexManagedManifest>;
+  reserveWorker(expectedRevision: number, claimId: string, launch?: { bootIdentity?: string }): Promise<CodexManagedManifest>;
+  /** `pgid` is recorded only after ps verified that the fork leads its own group. */
+  recordWorkerPid(expectedRevision: number, claimId: string, pid: number, pgid?: number): Promise<CodexManagedManifest>;
+  /** Forced recovery: needs the fence already persisted, NOT a clean dispatch/history. The caller MUST have proven
+   * absence independently (reboot or own-group ESRCH); the store only checks the proof fits the record. Drops the
+   * worker slot and its process-domain/history receipts (which require a worker), keeps the native binding and the
+   * resume predecessor, keeps the fence, and rotates the generation. */
+  clearWorkerAfterProvenAbsence(expectedRevision: number, generation: string, claimId: string, proof: CodexWorkerAbsenceProof): Promise<CodexManagedManifest>;
   publishWorkerReady(expectedRevision: number, connection: CodexWorkerConnection): Promise<CodexManagedManifest>;
   abortWorkerStartup(expectedRevision: number, claimId: string, pid: number): Promise<CodexManagedManifest>;
   recordProcessDomain(expectedRevision: number, domain: CodexProcessDomain): Promise<CodexManagedManifest>;
   beginRetirementIntent(expectedRevision: number, connection: CodexWorkerConnection, intent: CodexRetirementIntent, checkpoint?: CodexHistoryCheckpoint): Promise<CodexManagedManifest>;
   removeResumeMetadata(expectedRevision: number): Promise<CodexManagedManifest>;
+  /** Destroy after recovery: the slot is none (force-cleared, fenced) or retired, so absence is already proven.
+   * Removes only Runtime resume metadata; native history is never touched. */
+  removeStoppedSession(expectedRevision: number): Promise<CodexManagedManifest>;
   verifyHistory(expectedRevision: number, checkpoint: CodexHistoryCheckpoint): Promise<CodexManagedManifest>;
   beginResume(expectedRevision: number, generation: string): Promise<CodexManagedManifest>;
   recordNativeQuiesce(expectedRevision: number, connection: CodexWorkerConnection, intent: CodexRetirementIntent, fact: CodexNativeQuiesce): Promise<CodexManagedManifest>;
@@ -123,12 +137,17 @@ function validateRegistration(value: CodexManagedManifest): void {
   }
   identity(worker.claimId);
   identity(worker.generation);
+  const identityKeys = ["pgid", "bootIdentity", "marked"];
+  const pid = worker.state === "ready" || worker.state === "retiring" || worker.state === "retired" ? worker.connection?.pid : worker.pid;
+  if ((worker.pgid !== undefined && (worker.pgid !== pid || !Number.isSafeInteger(worker.pgid) || worker.pgid < 2))
+    || (worker.bootIdentity !== undefined && (typeof worker.bootIdentity !== "string" || !/^[a-z]+:[0-9a-f-]{32,36}$/.test(worker.bootIdentity)))
+    || (worker.marked !== undefined && worker.marked !== true)) throw new Error("Invalid Codex worker launch identity");
   if (worker.state === "reserved" || worker.state === "aborted") {
-    if (Object.keys(worker).some(key => !["state", "claimId", "generation", "pid"].includes(key))
+    if (Object.keys(worker).some(key => !["state", "claimId", "generation", "pid", ...identityKeys].includes(key))
       || (worker.pid !== undefined && (!Number.isSafeInteger(worker.pid) || worker.pid < 1))) throw new Error("Invalid Codex worker reservation");
   } else if (worker.state === "ready" || worker.state === "retiring" || worker.state === "retired") {
     validateWorkerConnection(worker.connection);
-    if (Object.keys(worker).some(key => !["state", "claimId", "generation", "connection", ...(worker.state === "retiring" ? ["retirement", "nativeQuiesce"] : worker.state === "retired" ? ["retirement", "nativeQuiesce", "workerAbsence"] : [])].includes(key))
+    if (Object.keys(worker).some(key => !["state", "claimId", "generation", "connection", ...identityKeys, ...(worker.state === "retiring" ? ["retirement", "nativeQuiesce"] : worker.state === "retired" ? ["retirement", "nativeQuiesce", "workerAbsence"] : [])].includes(key))
       || worker.connection.claimId !== worker.claimId || worker.connection.generation !== worker.generation
       || worker.connection.ownerId !== value.ownerId || worker.connection.sessionId !== value.id) {
       throw new Error("Codex worker registration identity mismatch");
@@ -371,9 +390,10 @@ export class CodexManagedStore {
         update: (expectedRevision, patch) => mutate(() => this.updateLocked(id, ownerId, expectedRevision, patch)),
         beginNativeCreation: expectedRevision => mutate(() => this.bindLocked(id, ownerId, expectedRevision)),
         bindNativeThread: (expectedRevision, threadId) => mutate(() => this.bindLocked(id, ownerId, expectedRevision, threadId)),
-        reserveWorker: (revision, claimId) => mutate(() => this.registerLocked(id, ownerId, revision, claimId)),
+        reserveWorker: (revision, claimId, launch) => mutate(() => this.registerLocked(id, ownerId, revision, claimId, undefined, undefined, undefined, launch)),
+        clearWorkerAfterProvenAbsence: (revision, generation, claimId, proof) => mutate(() => this.forceClearLocked(id, ownerId, revision, generation, claimId, proof)),
         abortWorkerStartup: (revision, claimId, pid) => mutate(() => this.abortStartupLocked(id, ownerId, revision, claimId, pid)),
-        recordWorkerPid: (revision, claimId, pid) => mutate(() => this.registerLocked(id, ownerId, revision, claimId, pid)),
+        recordWorkerPid: (revision, claimId, pid, pgid) => mutate(() => this.registerLocked(id, ownerId, revision, claimId, pid, undefined, pgid)),
         recordNativeQuiesce: (revision, connection, intent, fact) => {
           const snapshot = JSON.parse(JSON.stringify({ connection, intent, fact })) as { connection: CodexWorkerConnection; intent: CodexRetirementIntent; fact: CodexNativeQuiesce };
           validateWorkerConnection(snapshot.connection); validateRetirementIntent(snapshot.intent); validateNativeQuiesce(snapshot.fact, snapshot.intent);
@@ -385,6 +405,7 @@ export class CodexManagedStore {
           return mutate(() => this.finalizeRetirementLocked(id, ownerId, revision, snapshot.connection, snapshot.intent, snapshot.absence));
         },
         removeResumeMetadata: revision => mutate(() => this.removeResumeMetadataLocked(id, ownerId, revision)),
+        removeStoppedSession: revision => mutate(() => this.removeResumeMetadataLocked(id, ownerId, revision, true)),
         verifyHistory: (revision, checkpoint) => {
           const captured = structuredClone(checkpoint);
           return mutate(() => this.verifyHistoryLocked(id, ownerId, revision, captured));
@@ -476,10 +497,12 @@ export class CodexManagedStore {
       ...(checkpoint ? { history: { operationId: intent.operationId, checkpoint, verified: false } } : {}), revision: current.revision + 1 });
   }
 
-  private async removeResumeMetadataLocked(id: string, ownerId: string, revision: number): Promise<CodexManagedManifest> {
+  private async removeResumeMetadataLocked(id: string, ownerId: string, revision: number, afterRecovery = false): Promise<CodexManagedManifest> {
     const current = await this.current(id, ownerId, revision);
     const neverStarted = current.native.state === "pending" && current.worker.state === "none" && !current.requiresExplicitResume;
-    if (!neverStarted && !codexResumeEligible(current)) throw new CodexManifestConflictError("Codex destruction requires confirmed eligible shutdown");
+    // A fenced none slot was force-cleared after proven absence; a retired one exited. Native history stays either way.
+    const stopped = afterRecovery && ((current.worker.state === "none" && current.requiresExplicitResume) || current.worker.state === "retired");
+    if (!neverStarted && !stopped && !codexResumeEligible(current)) throw new CodexManifestConflictError("Codex destruction requires confirmed eligible shutdown");
     const owner = await this.verify(ownerId), directory = join(owner, `${id}.session`);
     await privateDirectory(directory);
     const entries = await readdir(directory);
@@ -566,8 +589,24 @@ export class CodexManagedStore {
     return this.publishUpdate({ ...current, worker: { ...worker, state: "aborted", pid }, revision: current.revision + 1 });
   }
 
+  private async forceClearLocked(
+    id: string, ownerId: string, revision: number, generation: string, claimId: string, proof: CodexWorkerAbsenceProof,
+  ): Promise<CodexManagedManifest> {
+    identity(generation); identity(claimId);
+    const current = await this.current(id, ownerId, revision), worker = current.worker;
+    if (!current.requiresExplicitResume || current.generation !== generation || worker.state === "none" || worker.state === "retired"
+      || worker.claimId !== claimId || worker.generation !== generation || !["boot", "group"].includes(proof)
+      || (proof === "group" && !worker.pgid)
+      || (proof === "boot" && !worker.bootIdentity && !(current.version === 5 && current.processDomain))) {
+      throw new CodexManifestConflictError("Codex forced clear requires the fence and a coherent absence proof");
+    }
+    const { processDomain: _domain, history: _history, ...rest } = current as Extract<CodexManagedManifest, { version: 5 }>;
+    return this.publishUpdate({ ...(current.version === 5 ? rest : current), generation: randomUUID(), worker: { state: "none" }, revision: current.revision + 1 } as CodexManagedManifest);
+  }
+
   private async registerLocked(
-    id: string, ownerId: string, revision: number, claimId: string, pid?: number, connection?: CodexWorkerConnection,
+    id: string, ownerId: string, revision: number, claimId: string, pid?: number, connection?: CodexWorkerConnection, pgid?: number,
+    launch?: { bootIdentity?: string },
   ): Promise<CodexManagedManifest> {
     identity(claimId);
     const current = await this.current(id, ownerId, revision);
@@ -576,16 +615,19 @@ export class CodexManagedStore {
     if (connection) {
       assertCodexWorkerClaim(current, { claimId, pid: connection.pid }, "reserved");
       if (connection.generation !== current.generation) throw new CodexManifestConflictError("Codex worker generation is stale");
-      worker = { state: "ready", claimId, generation: current.generation, connection };
+      const { pgid: group, bootIdentity, marked } = current.worker as CodexWorkerLaunchIdentity;
+      worker = { state: "ready", claimId, generation: current.generation, connection,
+        ...(group ? { pgid: group } : {}), ...(bootIdentity ? { bootIdentity } : {}), ...(marked ? { marked } : {}) };
     } else if (pid !== undefined) {
       if (current.worker.state !== "reserved" || current.worker.claimId !== claimId || current.worker.pid !== undefined
         || current.worker.generation !== current.generation || !Number.isSafeInteger(pid) || pid < 1) {
         throw new CodexManifestConflictError("Codex worker PID is already bound or stale");
       }
-      worker = { ...current.worker, pid };
+      worker = { ...current.worker, pid, ...(pgid ? { pgid } : {}) };
     } else {
       if (current.worker.state !== "none") throw new CodexManifestConflictError("Codex worker is already reserved or registered");
-      worker = { state: "reserved", claimId, generation: current.generation };
+      worker = { state: "reserved", claimId, generation: current.generation,
+        ...(launch ? { marked: true as const, ...(launch.bootIdentity ? { bootIdentity: launch.bootIdentity } : {}) } : {}) };
     }
     return this.publishUpdate({ ...current, worker, revision: current.revision + 1 });
   }
