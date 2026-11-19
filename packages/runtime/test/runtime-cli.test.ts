@@ -135,3 +135,14 @@ for(const outcome of ["success","send-failure","stream-ended"] as const)test(`CL
   stream.push({type:"message_delta",delta:"COMPLETE_ANSWER"});stream.push({type:"turn_completed",operationId:"turn"});
   await command;assert.ok(output.includes("COMPLETE_ANSWER"));assert.equal(stream.closed,true);
 });
+
+test("CLI canonicalizes a symlinked --managed-root and --cwd instead of leaving the session stuck",{timeout:60000},async t=>{
+  const f=await fixture(t),link=join(f.directory,"managed-link"),workspace=join(f.directory,"workspace"),workspaceLink=join(f.directory,"workspace-link");
+  await mkdir(workspace);await (await import("node:fs/promises")).symlink(f.directory,link);await (await import("node:fs/promises")).symlink(workspace,workspaceLink);
+  // The root need not exist yet: its parent is canonicalized and the leaf appended.
+  const args=["--adapter","codex","--owner","cli-owner","--managed-root",join(link,"managed")];
+  const started=await f.run([...args,"start","--cwd",workspaceLink,"--no-skills"]),reference=started.split("\t")[0];f.sessions.push(reference.slice("codex:".length));
+  assert.equal(started.split("\t")[2],workspace);
+  assert.equal(await f.run([...args,"status",reference]),"idle");
+  assert.match(await f.run([...args,"sessions"]),new RegExp(reference));
+});

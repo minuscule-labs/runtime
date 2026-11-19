@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { AgentSession, AgentStartConfig, ManagedAgentSession } from "@minu/runtime-core";
 import { CodexAgentRuntime, type CodexAgentRuntimeOptions } from "./client.js";
@@ -25,6 +26,9 @@ export async function createPendingCodexSession(
     native: { state: "pending" }, worker: { state: "none" }, launchConfig: { ...config, cwd: resolve(config.cwd ?? process.cwd()) },
     sandbox, createdAt: new Date().toISOString(),
   }));
+  // Snapshotted above, before any await. Canonical before anything is persisted: the store and worker require a
+  // real path (macOS /tmp is a symlink); a missing workspace fails here.
+  manifest.launchConfig.cwd = await realpath(manifest.launchConfig.cwd);
   await store.create(manifest);
   return { id: manifest.id, ownerId: manifest.ownerId, runtime: "codex", ownership: "owned", cwd: manifest.launchConfig.cwd };
 }
