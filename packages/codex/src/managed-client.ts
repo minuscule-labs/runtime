@@ -129,9 +129,9 @@ export class CodexManagedClient {
     } finally { release(); }
   }
 
-  async inventory(ownerId: string): Promise<ManagedSessionSummary[]> {
+  async inventory(ownerId: string, only?: string): Promise<ManagedSessionSummary[]> {
     try {
-      const manifests = await this.store.list(ownerId);
+      const manifests = only === undefined ? await this.store.list(ownerId) : [await this.store.read(only, ownerId)].filter(m => m !== undefined);
       const summaries: ManagedSessionSummary[] = [];
       for (const manifest of manifests) {
         let state: ManagedSessionSummary["state"] = "unavailable";

@@ -200,6 +200,11 @@ export class CodexAgentRuntime implements AgentRuntime {
   async listManagedSessions(ownerId: string): Promise<ManagedSessionSummary[]> {
     return this.managed.inventory(ownerId);
   }
+  /** Owner-scoped summary of one session; undefined when it does not exist for this owner. */
+  async getManagedSession(id: string, ownerId: string, options: { signal?: AbortSignal } = {}): Promise<ManagedSessionSummary | undefined> {
+    options.signal?.throwIfAborted();
+    return (await this.managed.inventory(ownerId, id))[0];
+  }
 
   /** Connect to an existing living worker only; never launch or cold-resume. */
   async connectManaged(id: string, ownerId: string): Promise<ManagedAgentSession> { return this.managed.connect(id, ownerId); }
