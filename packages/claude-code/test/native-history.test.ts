@@ -332,6 +332,22 @@ for (const which of ["file", "project", "projects", "config"]) {
   });
 }
 
+for (const which of ["file", "project", "projects", "config"]) {
+  test(`native roots accept a world-readable ${which} but still refuse group/other writable ones`, async () => {
+    const f = await fixture();
+    try {
+      await f.save();
+      const path = which === "file" ? f.path : which === "project" ? f.project : which === "projects" ? join(f.config, "projects") : f.config;
+      const native = { ...f.options, nativeRoot: true };
+      await chmod(path, which === "file" ? 0o644 : 0o755);
+      assert.equal((await inspectClaudeCodeHistory(native)).state, "present");
+      await assert.rejects(inspectClaudeCodeHistory(f.options), rejected("unsafe_file"), "private mode still refuses it");
+      await chmod(path, which === "file" ? 0o664 : 0o775);
+      await assert.rejects(inspectClaudeCodeHistory(native), rejected("unsafe_file"));
+    } finally { await f.cleanup(); }
+  });
+}
+
 test("hardlinks and nonregular transcript paths are refused", async () => {
   const f = await fixture();
   try {

@@ -246,14 +246,22 @@ test("failed bound initialization is terminal and unavailable, not retried or cl
   assert.ok(!f.messages.some(message => message.type === "ready")); assert.equal(f.child.exitCode, null);
 });
 
-test("bootstrap does not inherit a missing native environment or ignore unsupported callbacks", async t => {
-  for (const change of [ { env: undefined }, { canUseTool: "PRIVATE_BOOTSTRAP_AUTH" } ]) {
+test("bootstrap refuses forbidden environment overrides and ignores no unsupported callback", async t => {
+  // A missing env is now valid (overrides overlay the inherited environment); forbidden keys remain refused.
+  for (const name of ["forbidden-env", "callback"]) {
     const f = await fixture(t), before = await f.read();
+    const change = name === "callback" ? { canUseTool: "PRIVATE_BOOTSTRAP_AUTH" }
+      : { env: { ...f.bootstrap.nativeOptions.env, NODE_OPTIONS: "--require /x" } };
     await f.send(JSON.stringify({ ...f.bootstrap, nativeOptions: { ...f.bootstrap.nativeOptions, ...change } }));
     await f.wait("unavailable"); await missing(f.pidFile); assert.deepEqual(await f.read(), before);
     assert.ok(!f.messages.some(message => message.type === "prepared"));
     assert.ok(!JSON.stringify(f.messages).includes("PRIVATE_BOOTSTRAP_AUTH"));
   }
+});
+test("bootstrap without an env override is accepted and inherits the worker environment", async t => {
+  const f = await fixture(t), { env: _env, ...nativeOptions } = f.bootstrap.nativeOptions;
+  await f.send(JSON.stringify({ ...f.bootstrap, nativeOptions }));
+  await f.wait("prepared"); await missing(f.pidFile);
 });
 
 for (const message of ["not-json-PRIVATE_BOOTSTRAP_AUTH", "x".repeat(CLAUDE_CODE_BOOTSTRAP_MAX_BYTES + 1), { type: "bootstrap", private: "PRIVATE_BOOTSTRAP_AUTH" }]) {

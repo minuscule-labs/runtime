@@ -13,6 +13,7 @@ import {
   type RuntimeSessionCapabilities,
 } from "@minu/runtime-core";
 import { Queue } from "./queue.js";
+import { claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
 
 export interface ClaudeCodeRuntimeOptions {
   /** Defaults to Read/Grep/Glob only. Not an OS sandbox or a filesystem boundary. */
@@ -38,6 +39,9 @@ export interface ClaudeCodeNativeLaunch {
   nativeSessionId: string;
   canonicalCwd: string;
   nativeConfigRoot: string;
+  /** The root is the user's NATIVE Claude Code configuration: inherited environment overlaid by `env`, owned (not
+   * private) directories, never created/chmodded/written by Runtime. Omitted keeps the private-root behavior. */
+  nativeRoot?: boolean;
   signal?: AbortSignal;
 }
 export type ClaudeCodeSettlementEvidence = "native" | "undispatched" | "uncertain";
@@ -167,27 +171,35 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
         || typeof native.nativeSessionId !== "string" || !NATIVE_UUID.test(native.nativeSessionId) || config.cwd !== native.canonicalCwd || cwd !== native.canonicalCwd) {
         throw new Error("Invalid persistent Claude Code identity or workspace");
       }
-      const env = { ...(this.options.env ?? process.env) };
+      const env: Record<string, string | undefined> = native.nativeRoot ? claudeCodeNativeEnvironment(this.options.env)
+        : { ...(this.options.env ?? process.env) };
       launchEnv = env; // Validate and spawn from the same per-launch snapshot.
       if (env.CLAUDE_CODE_PROJECT_DIR_NAME !== undefined) {
         throw new Error("Persistent Claude Code project-directory override is not supported");
       }
       const root = native.nativeConfigRoot;
-      const effectiveRoot = env.CLAUDE_CONFIG_DIR ?? (env.HOME ? join(env.HOME, ".claude") : undefined);
-      if (!process.getuid || !isAbsolute(root) || resolve(root) !== root || root.includes("\0") || effectiveRoot !== root) {
+      if (!process.getuid || !isAbsolute(root) || resolve(root) !== root || root.includes("\0")) {
+        throw new Error("Persistent Claude Code native configuration root is not verified");
+      }
+      if (native.nativeRoot) {
+        // The user's own root: resolve exactly as Claude Code does, and require it to be the one authorized for this session.
+        if (await resolveClaudeCodeConfigRoot(undefined, env) !== root) {
+          throw new Error("Persistent Claude Code native configuration root is not verified");
+        }
+      } else if ((env.CLAUDE_CONFIG_DIR ?? (env.HOME ? join(env.HOME, ".claude") : undefined)) !== root) {
         throw new Error("Persistent Claude Code native configuration root is not verified");
       }
       if (env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN !== undefined) {
         throw new Error("Automatic interrupted-turn replay is not allowed");
       }
-      try {
+      if (!native.nativeRoot) try {
         await privateNativeDirectory(root);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT" || native.mode === "resume") throw error;
         if (await realpath(dirname(root)) !== dirname(root)) throw new Error("Persistent Claude Code configuration parent is redirected");
       }
       const { inspectClaudeCodeHistory, claudeCodeNativeProjectKey } = await import("./native-history.js");
-      if (native.mode === "create") {
+      if (native.mode === "create" && !native.nativeRoot) {
         // Native defaults can create these as 0755. Prepare only missing directories;
         // never chmod/repair existing native storage or manufacture history files.
         for (const path of [root, join(root, "projects"), join(root, "projects", claudeCodeNativeProjectKey(cwd))]) {
@@ -196,7 +208,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
         }
       }
       const snapshot = await inspectClaudeCodeHistory({ nativeSessionId: native.nativeSessionId,
-        canonicalCwd: cwd, nativeConfigRoot: root, signal: native.signal });
+        canonicalCwd: cwd, nativeConfigRoot: root, nativeRoot: native.nativeRoot, signal: native.signal });
       if (native.mode === "resume") {
         if (snapshot.state !== "present") throw new Error("Mapped Claude Code native history is missing");
         history = snapshot.messages;

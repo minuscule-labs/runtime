@@ -17,6 +17,8 @@ export interface ClaudeCodeHistoryOptions {
   /** Exact authorized native home, not Runtime's manifest storage directory. */
   nativeConfigRoot: string;
   signal?: AbortSignal;
+  /** The root is the user's native Claude Code configuration (not Runtime-private storage). */
+  nativeRoot?: boolean;
   /** Extra clean-resume check against an ALREADY committed completed dispatch.
    * Never derives caller settlement; requires pinned end_turn + final leaf materialization. */
   completedInput?: { nativeMessageId: string; fingerprint: string };
@@ -39,9 +41,11 @@ function absolute(value: string): boolean {
   return typeof value === "string" && !value.includes("\0") && isAbsolute(value) && resolve(value) === value;
 }
 function identity(a: Stats, b: Stats): boolean { return a.dev === b.dev && a.ino === b.ino; }
-function safe(metadata: Stats, directory: boolean): boolean {
+// Default: private (0o077 clear). "native" configuration roots (a normal ~/.claude is world-readable) only
+// require owner ownership and no group/other WRITE access; reads never become authority to trust another user's file.
+function safe(metadata: Stats, directory: boolean, native = false): boolean {
   return (directory ? metadata.isDirectory() : metadata.isFile() && metadata.nlink === 1)
-    && !(metadata.mode & 0o077) && (!process.getuid || metadata.uid === process.getuid());
+    && !(metadata.mode & (native ? 0o022 : 0o077)) && (!process.getuid || metadata.uid === process.getuid());
 }
 
 // Pinned SDK 0.3.321: rd/gl/xTe/eC. No env-dependent project-directory override,
@@ -58,10 +62,10 @@ function projectKey(cwd: string): string {
 export { projectKey as claudeCodeNativeProjectKey };
 
 interface PinnedDirectory { path: string; metadata: Stats; handle: FileHandle }
-async function verifyDirectory(directory: PinnedDirectory): Promise<void> {
+async function verifyDirectory(directory: PinnedDirectory, native = false): Promise<void> {
   const current = await lstat(directory.path);
   const held = await directory.handle.stat();
-  if (!safe(current, true) || !safe(held, true) || !identity(current, directory.metadata)
+  if (!safe(current, true, native) || !safe(held, true, native) || !identity(current, directory.metadata)
     || !identity(held, directory.metadata) || await realpath(directory.path) !== directory.path) reject("changed");
 }
 
@@ -75,6 +79,7 @@ async function verifyDirectory(directory: PinnedDirectory): Promise<void> {
 export async function inspectClaudeCodeHistory(options: ClaudeCodeHistoryOptions): Promise<ClaudeCodeHistorySnapshot> {
   options = { ...options, ...(options.completedInput ? { completedInput: { ...options.completedInput } } : {}) };
   const { nativeSessionId, canonicalCwd, nativeConfigRoot, signal, completedInput } = options;
+  const native = options.nativeRoot === true;
   signal?.throwIfAborted();
   // The safety contract requires POSIX ownership and no-follow directory opens.
   if (!process.getuid || !constants.O_NOFOLLOW || !constants.O_DIRECTORY) reject("unsupported_host");
@@ -93,28 +98,28 @@ export async function inspectClaudeCodeHistory(options: ClaudeCodeHistoryOptions
       try { metadata = await lstat(path); }
       catch (error) {
         if (!absent(error)) throw error;
-        for (const directory of directories) await verifyDirectory(directory);
+        for (const directory of directories) await verifyDirectory(directory, native);
         return { state: "missing" };
       }
-      if (!safe(metadata, true) || await realpath(path) !== path) reject("unsafe_file");
+      if (!safe(metadata, true, native) || await realpath(path) !== path) reject("unsafe_file");
       const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       directories.push({ path, metadata, handle });
-      await verifyDirectory(directories.at(-1)!);
+      await verifyDirectory(directories.at(-1)!, native);
     }
     const path = join(paths[2], `${nativeSessionId}.jsonl`);
     let metadata: Stats;
     try { metadata = await lstat(path); }
     catch (error) {
       if (!absent(error)) throw error;
-      for (const directory of directories) await verifyDirectory(directory);
+      for (const directory of directories) await verifyDirectory(directory, native);
       return { state: "missing" };
     }
-    if (!safe(metadata, false) || await realpath(path) !== path) reject("unsafe_file");
+    if (!safe(metadata, false, native) || await realpath(path) !== path) reject("unsafe_file");
     if (metadata.size > CLAUDE_HISTORY_LIMITS.bytes) reject("too_large");
     // NONBLOCK prevents a regular-file-to-FIFO replacement from hanging open().
     file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const before = await file.stat();
-    if (!safe(before, false) || !identity(before, metadata)) reject("changed");
+    if (!safe(before, false, native) || !identity(before, metadata)) reject("changed");
     const buffer = Buffer.alloc(CLAUDE_HISTORY_LIMITS.bytes + 1);
     let length = 0;
     while (length < buffer.length) {
@@ -126,19 +131,19 @@ export async function inspectClaudeCodeHistory(options: ClaudeCodeHistoryOptions
     if (length > CLAUDE_HISTORY_LIMITS.bytes) reject("too_large");
     const after = await file.stat();
     const current = await lstat(path);
-    if (!safe(after, false) || !safe(current, false) || !identity(before, current)
+    if (!safe(after, false, native) || !safe(current, false, native) || !identity(before, current)
       || before.size !== length || after.size !== length || current.size !== length
       || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs
       || before.mtimeMs !== current.mtimeMs || before.ctimeMs !== current.ctimeMs) reject("changed");
-    for (const directory of directories) await verifyDirectory(directory);
+    for (const directory of directories) await verifyDirectory(directory, native);
     const bytes = buffer.subarray(0, length);
     const parsed = await parse(bytes, options);
     // Check again after cooperative parsing, before returning the snapshot.
     signal?.throwIfAborted();
     const final = await lstat(path);
-    if (!safe(final, false) || !identity(before, final) || final.size !== length
+    if (!safe(final, false, native) || !identity(before, final) || final.size !== length
       || final.mtimeMs !== before.mtimeMs || final.ctimeMs !== before.ctimeMs) reject("changed");
-    for (const directory of directories) await verifyDirectory(directory);
+    for (const directory of directories) await verifyDirectory(directory, native);
     return { state: "present", messages: parsed.messages, evidence: {
       sha256: createHash("sha256").update(bytes).digest("hex"), bytes: length, records: parsed.records,
     } };

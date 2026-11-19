@@ -1,7 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
-import { join } from "node:path";
 import {
   runtimeInput, type AgentRuntime, type AgentSession, type AgentEvent, type AgentTurn,
   type RuntimeActivityEvent, type RuntimeActivityOptions, type RuntimeImageContent,
@@ -12,6 +11,7 @@ import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest, type ClaudeCode
 import { decodeClaudeCodeWorkerRegistration, encodeClaudeCodeWorkerRegistration, type ClaudeCodeWorkerRegistrationScope } from "./worker-registration.js";
 import { turnId as callerTurnId } from "./worker-protocol.js";
 import { Queue } from "./queue.js";
+import { CLAUDE_CODE_FORBIDDEN_ENV, claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
 
 type NativeHandle = Awaited<ReturnType<typeof openClaudeCodeNativeSession>>;
 // One facade per physical worker epoch, even after failed initialization or stop.
@@ -73,7 +73,9 @@ class ManagedSession implements AgentRuntime {
   constructor(private readonly store: ClaudeCodeManagedStore, scope: ClaudeCodeWorkerRegistrationScope, options: ClaudeCodeManagedSessionOptions["nativeOptions"] = {}) {
     this.scope = { ...scope };
     this.session = { id: this.scope.sessionId, runtime: "claude-code", ownership: "owned", cwd: this.scope.cwd };
-    this.options = { ...options, env: { ...(options.env ?? process.env) } };
+    if (CLAUDE_CODE_FORBIDDEN_ENV.some(key => options.env?.[key] !== undefined)) throw new Error("Managed Claude Code environment overrides are not permitted");
+    // The worker inherits its process environment (HOME is needed for keychain access); `env` only overlays it.
+    this.options = { ...options, env: claudeCodeNativeEnvironment(options.env) };
     // Validate limits without launching anything. Policy tools are loaded from the manifest.
     new ClaudeCodeAgentRuntime(this.options);
     this.retention = options.turnRetentionLimit ?? 1_000;
@@ -95,9 +97,7 @@ class ManagedSession implements AgentRuntime {
       if (manifest.launchConfig.model || manifest.launchConfig.reasoningLevel !== undefined || manifest.launchConfig.skillIds !== undefined) {
         throw new Error("Managed Claude Code launch selections are not implemented");
       }
-      const env = this.options.env!;
-      if ((env.CLAUDE_CONFIG_DIR ?? (env.HOME ? join(env.HOME, ".claude") : undefined)) !== manifest.policy.nativeConfigRoot
-        || env.CLAUDE_CODE_PROJECT_DIR_NAME !== undefined || env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN !== undefined) {
+      if (await resolveClaudeCodeConfigRoot(undefined, this.options.env!).catch(() => undefined) !== manifest.policy.nativeConfigRoot) {
         throw new Error("Managed Claude Code native environment is not verified");
       }
       if (await realpath(manifest.launchConfig.cwd) !== manifest.launchConfig.cwd || !(await stat(manifest.launchConfig.cwd)).isDirectory()) {
@@ -196,7 +196,7 @@ class ManagedSession implements AgentRuntime {
     this.openingAbort = new AbortController();
     this.openingUnknown = true;
     const common = { runtimeSessionId: this.session.id, nativeSessionId, canonicalCwd: context.manifest.launchConfig.cwd,
-      nativeConfigRoot: context.manifest.policy.nativeConfigRoot, signal: this.openingAbort.signal };
+      nativeConfigRoot: context.manifest.policy.nativeConfigRoot, nativeRoot: true, signal: this.openingAbort.signal };
     const opening = (async () => {
       this.native = await openClaudeCodeNativeSession(context.manifest.launchConfig,
         mode === "create" ? { ...common, mode, firstInput: firstInput! } : { ...common, mode }, this.options);

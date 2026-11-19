@@ -29,7 +29,7 @@ export async function claudeCodeCleanHistory(m: ClaudeCodeManagedManifest) {
   if (m.native.state === "pending" && m.lastDispatch.state === "none") return [];
   if (m.native.state !== "bound" || m.lastDispatch.state !== "settled" || m.lastDispatch.outcome !== "completed") throw unavailable();
   const history = await inspectClaudeCodeHistory({ nativeSessionId: m.native.sessionId, canonicalCwd: m.launchConfig.cwd,
-    nativeConfigRoot: m.policy.nativeConfigRoot, completedInput: {
+    nativeConfigRoot: m.policy.nativeConfigRoot, nativeRoot: true, completedInput: {
       nativeMessageId: m.lastDispatch.nativeMessageId, fingerprint: m.lastDispatch.fingerprint,
     } });
   if (history.state !== "present") throw unavailable();

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,7 @@ async function until<T>(read: () => Promise<T>, done: (value: T) => boolean) {
   while (true) { const value = await read(); if (done(value)) return value; if (performance.now() > end) throw Error("Managed test timed out"); await delay(10); }
 }
 async function fixture(t: TestContext, extraEnv: Record<string, string> = {}) {
+  extraEnv = Object.fromEntries(Object.entries(extraEnv).filter(([, v]) => v !== ""));
   const root = await realpath(await mkdtemp(join(tmpdir(), "claude-managed-api-")));
   const cwd = join(root, "workspace"), native = join(root, "native"), state = join(root, "managed");
   await mkdir(cwd, { mode: 0o700 }); await mkdir(native, { mode: 0o700 });
@@ -89,7 +90,7 @@ test("durable managed path: text/streams, living reconnect, clean stop and exact
 
 test("first input permits healthy lazy native initialization beyond short status deadlines", async t => {
   const f = await fixture(t, { MINU_PERSIST_INIT_DELAY_MS: "2_300" });
-  f.options.nativeOptions.startupTimeoutMs = 4_000;
+  f.options.nativeOptions!.startupTimeoutMs = 4_000;
   const runtime = f.controller(), session = await runtime.start({ cwd: f.cwd });
   await runtime.send(session.id, "delayed healthy startup");
   assert.equal(await runtime.status(session.id), "idle"); await runtime.stop(session.id);
@@ -226,9 +227,9 @@ test("generation/human fence after quiesce wins over physical absence; exact cha
 test("bundled native managed stop/resume preserves materialized history without replay (two local requests)", { timeout: 45_000 }, async t => {
   const f = await fixture(t), provider = await nativeHistoryProvider(2, true); f.preserve();
   t.after(() => provider.close());
-  delete f.options.nativeOptions.executable;
-  Object.assign(f.options.nativeOptions.env, { ANTHROPIC_BASE_URL: provider.url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", NO_PROXY: "127.0.0.1,localhost" });
-  Object.assign(f.options.nativeOptions, { startupTimeoutMs: 10_000, controlTimeoutMs: 5_000, shutdownTimeoutMs: 5_000 });
+  delete f.options.nativeOptions!.executable;
+  Object.assign(f.options.nativeOptions!.env!, { ANTHROPIC_BASE_URL: provider.url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", NO_PROXY: "127.0.0.1,localhost" });
+  Object.assign(f.options.nativeOptions!, { startupTimeoutMs: 10_000, controlTimeoutMs: 5_000, shutdownTimeoutMs: 5_000 });
   f.options.timeoutMs = 15_000;
   const runtime = f.controller(), session = await runtime.start({ cwd: f.cwd });
   await runtime.send(session.id, "native before app restart"); assert.equal(provider.calls(), 1);
@@ -262,13 +263,80 @@ test("owner/config/input preflight and inventory stay private and do not start o
   assert.deepEqual(await f.read(session.id), before); await f.runtime.stop(session.id);
   const stopped = await f.read(session.id), otherRoot = join(f.root, "other-native"); await mkdir(otherRoot, { mode: 0o700 });
   const mismatched = new ClaudeCodeManagedRuntime({ ...f.options, nativeConfigRoot: otherRoot, nativeOptions: {
-    ...f.options.nativeOptions, env: { ...f.options.nativeOptions.env, CLAUDE_CONFIG_DIR: otherRoot },
+    ...f.options.nativeOptions!, env: { ...f.options.nativeOptions!.env, CLAUDE_CONFIG_DIR: otherRoot },
   } });
   await assert.rejects(mismatched.resume(session.id, "owner", { allowStopped: true })); assert.deepEqual(await f.read(session.id), stopped);
   for (const patch of [{ startupTimeoutMs: 0 }, { turnRetentionLimit: 1_001 }, { eventBufferLimit: 4_097 }, { executable: join(f.root, "missing-native") }]) {
-    const invalid = new ClaudeCodeManagedRuntime({ ...f.options, nativeOptions: { ...f.options.nativeOptions, ...patch } });
+    const invalid = new ClaudeCodeManagedRuntime({ ...f.options, nativeOptions: { ...f.options.nativeOptions!, ...patch } });
     await assert.rejects(invalid.resume(session.id, "owner", { allowStopped: true }));
     assert.deepEqual(await f.read(session.id), stopped, "configuration errors must not clear the explicit-resume fence");
   }
   await f.runtime.resume(session.id, "owner", { allowStopped: true }); await f.runtime.stop(session.id);
+});
+
+test("auth preflight: unauthenticated native login throws the specific error before any session exists", async t => {
+  const f = await fixture(t, { MINU_CLAUDE_FIXTURE_ACCOUNT: "none", MINU_CLAUDE_FIXTURE_PROBE: "" });
+  const probes = join(f.root, "probes"); f.options.nativeOptions!.env!.MINU_CLAUDE_FIXTURE_PROBE = probes;
+  const runtime = f.controller();
+  const error = await runtime.startManaged({ cwd: f.cwd }, "owner").then(() => undefined, caught => caught);
+  assert.equal(error?.name, "ClaudeCodeAuthRequiredError");
+  assert.equal(error.message, "Claude Code is not logged in; run `claude` to sign in");
+  assert.deepEqual(await runtime.listManagedSessions("owner"), [], "no manifest is created");
+  await assert.rejects(readFile(join(f.root, "native-pid")), { code: "ENOENT" }, "no session was started");
+  const pid = Number((await readFile(probes, "utf8")).trim());
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, "the probe process exited before the error surfaced");
+  // Every other failure stays generic (never the auth error).
+  const other = await runtime.startManaged({ cwd: f.cwd }, "wrong-owner").then(() => undefined, caught => caught);
+  assert.equal(other?.name, "Error"); assert.match(other.message, /unavailable/);
+});
+
+test("auth preflight: a logged-in probe sends no input, persists nothing and exits before the session starts", async t => {
+  const f = await fixture(t); const probes = join(f.root, "probes"); f.options.nativeOptions!.env!.MINU_CLAUDE_FIXTURE_PROBE = probes;
+  const runtime = f.controller(), session = await runtime.startManaged({ cwd: f.cwd }, "owner");
+  const pid = Number((await readFile(probes, "utf8")).trim());
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  await assert.rejects(readFile(join(f.root, "native-pid")), { code: "ENOENT" });
+  assert.equal((await f.read(session.id))!.native.state, "pending");
+  await assert.rejects(readFile(join(f.native, "projects")), { code: "ENOENT" }, "no transcript or project directory was created");
+  await runtime.destroy(session.id, "owner");
+});
+
+test("native config root: default resolution like Claude Code, world-readable accepted, never created or modified", async t => {
+  const f = await fixture(t);
+  await chmod(f.native, 0o755);
+  // No explicit root: resolved from the effective environment ($CLAUDE_CONFIG_DIR override), exactly as Claude Code does.
+  delete f.options.nativeConfigRoot;
+  const runtime = f.controller(), session = await runtime.startManaged({ cwd: f.cwd }, "owner");
+  assert.equal((await f.read(session.id))!.policy.nativeConfigRoot, f.native);
+  assert.equal((await stat(f.native)).mode & 0o777, 0o755, "never chmodded");
+  await runtime.send(session.id, "hello native root"); await runtime.stop(session.id);
+  assert.equal((await stat(f.native)).mode & 0o777, 0o755);
+  // ~/.claude fallback uses HOME and is realpath'd; a missing root is refused and never created.
+  const home = join(f.root, "home"); await mkdir(home, { mode: 0o700 });
+  const env = { ...f.options.nativeOptions!.env!, HOME: home }; delete (env as Record<string, string | undefined>).CLAUDE_CONFIG_DIR;
+  const homeless = new ClaudeCodeManagedRuntime({ ...f.options, nativeConfigRoot: undefined, nativeOptions: { ...f.options.nativeOptions, env } });
+  await assert.rejects(homeless.startManaged({ cwd: f.cwd }, "owner"));
+  await assert.rejects(stat(join(home, ".claude")), { code: "ENOENT" });
+  // A symlinked root resolves to its real directory, which is what is recorded.
+  await symlink(f.native, join(home, ".claude"));
+  const linked = new ClaudeCodeManagedRuntime({ ...f.options, nativeConfigRoot: undefined, nativeOptions: { ...f.options.nativeOptions, env } });
+  const second = await linked.startManaged({ cwd: f.cwd }, "owner");
+  assert.equal((await f.read(second.id))!.policy.nativeConfigRoot, f.native);
+  await linked.destroy(second.id, "owner");
+  // Remaining refusals: a relative explicit root and a file.
+  for (const nativeConfigRoot of ["relative/root", `${f.root}/workspace/../native`]) {
+    assert.throws(() => new ClaudeCodeManagedRuntime({ ...f.options, nativeConfigRoot }));
+  }
+  const file = join(f.root, "not-a-dir"); await writeFile(file, "x");
+  const filed = new ClaudeCodeManagedRuntime({ ...f.options, nativeConfigRoot: file, nativeOptions: { ...f.options.nativeOptions, env: { ...env, CLAUDE_CONFIG_DIR: file } } });
+  await assert.rejects(filed.startManaged({ cwd: f.cwd }, "owner"));
+});
+
+test("worker environment inherits the process environment with overrides; forbidden keys are refused as overrides", async t => {
+  const f = await fixture(t);
+  for (const key of ["NODE_OPTIONS", "NODE_PATH", "CLAUDE_CODE_PROJECT_DIR_NAME", "CLAUDE_CODE_RESUME_INTERRUPTED_TURN"]) {
+    assert.throws(() => new ClaudeCodeManagedRuntime({ ...f.options, nativeOptions: { ...f.options.nativeOptions, env: { ...f.options.nativeOptions!.env!, [key]: "x" } } }));
+  }
+  assert.throws(() => new ClaudeCodeManagedRuntime({ ...f.options, nativeOptions: { ...f.options.nativeOptions,
+    env: { ...f.options.nativeOptions!.env!, CLAUDE_CONFIG_DIR: join(f.root, "elsewhere") } } }), "explicit root and a different override conflict");
 });

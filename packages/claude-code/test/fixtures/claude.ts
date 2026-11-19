@@ -3,7 +3,11 @@ import { createInterface } from "node:readline";
 import { appendFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.MINU_CLAUDE_FIXTURE_MODE;
-if (process.env.MINU_CLAUDE_FIXTURE_PID) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_PID, String(process.pid));
+// Short-lived probes (auth/capabilities, marked MINU_RUNTIME_PROBE) never receive input: they must not look like a
+// started session, so they are recorded separately.
+const probe = process.env.MINU_RUNTIME_PROBE === "1";
+if (process.env.MINU_CLAUDE_FIXTURE_PID && !probe) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_PID, String(process.pid));
+else if (probe && process.env.MINU_CLAUDE_FIXTURE_PROBE) appendFileSync(process.env.MINU_CLAUDE_FIXTURE_PROBE, `${process.pid}\n`);
 if (process.env.MINU_CLAUDE_FIXTURE_PROJECT_DIR) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_PROJECT_DIR, process.env.CLAUDE_CODE_PROJECT_DIR_NAME ?? "<default>");
 let current: any;
 let pendingPermission: any;
@@ -30,7 +34,7 @@ lines.on("line", (line) => {
     if (request.subtype === "initialize" && mode === "startup-exit") process.exit(2);
     if (request.subtype === "interrupt" && mode === "interrupt-hang") return;
     output({ type: "control_response", response: { subtype: "success", request_id: message.request_id,
-      response: request.subtype === "initialize" ? { commands: [], agents: [], models: [], account: {}, output_style: "default", available_output_styles: [],
+      response: request.subtype === "initialize" ? { commands: [], agents: [], models: JSON.parse(process.env.MINU_CLAUDE_FIXTURE_MODELS ?? "[]"), account: process.env.MINU_CLAUDE_FIXTURE_ACCOUNT === "none" ? {} : { apiKeySource: "ANTHROPIC_API_KEY" }, output_style: "default", available_output_styles: [],
         claude_code_version: process.env.MINU_CLAUDE_FIXTURE_VERSION ?? "2.1.321" } : {} } });
     if (request.subtype === "interrupt" && mode !== "interrupt-no-result") {
       setTimeout(() => result("interrupted", { subtype: "error_during_execution", is_error: true, errors: ["interrupted"] }), 20);

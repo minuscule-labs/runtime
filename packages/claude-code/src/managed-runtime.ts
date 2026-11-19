@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import { runtimeInput, type AgentRuntime, type AgentStartConfig, type ManagedAgentSession, type ManagedSessionSummary,
   type RuntimeImageContent, type RuntimeActivityOptions } from "@minu/runtime-core";
+import { CLAUDE_CODE_FORBIDDEN_ENV, ClaudeCodeAuthRequiredError, claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
+import { requireClaudeCodeAuth } from "./probe.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest } from "./managed-store.js";
 import { decodeClaudeCodeWorkerBootstrap, type ClaudeCodeWorkerBootstrap } from "./worker-entry.js";
 import { launchClaudeCodeWorker } from "./worker-launch.js";
@@ -19,20 +21,25 @@ export interface ClaudeCodeManagedRuntimeOptions {
   /** One exact owner per controller instance. Never discovers another owner's sessions. */
   ownerId: string;
   storeRoot: string;
-  /** Existing owner-private canonical native config root. Authentication stays native-owned. */
-  nativeConfigRoot: string;
-  nativeOptions: ClaudeCodeWorkerBootstrap["nativeOptions"];
+  /** Optional. Omitted resolves as Claude Code does ($CLAUDE_CONFIG_DIR, else ~/.claude), realpath'd and owned by this user.
+   * Authentication stays native-owned: never read, copied, stored or prompted for. Never created, chmodded or written. */
+  nativeConfigRoot?: string;
+  /** `env` OVERLAYS the inherited process environment; it never replaces it. */
+  nativeOptions?: ClaudeCodeWorkerBootstrap["nativeOptions"];
   /** Trusted host overrides, not user/tool-selected commands. Must obey the family contract. */
   workerExecutable?: string;
   nodeExecutable?: string;
   timeoutMs?: number;
 }
 const unavailable = () => new Error("Claude Code managed operation unavailable");
+/** The only public error that stays distinguishable: callers show a "not logged in" state for it. */
+const publicError = (error: unknown) => error instanceof ClaudeCodeAuthRequiredError ? error : unavailable();
 
 /** Durable text-only controller. Native owns its loop/tools/auth. Forced recovery is explicit
  * (forceStopManaged/destroy) and absence-proven; no configuration inheritance, transcript repair, input replay or durable turn ledger. */
 export class ClaudeCodeManagedRuntime implements AgentRuntime {
   private readonly options: ClaudeCodeManagedRuntimeOptions;
+  private readonly nativeOptions: NonNullable<ClaudeCodeManagedRuntimeOptions["nativeOptions"]>;
   private readonly store: ClaudeCodeManagedStore;
   // Original local handles remain private, not recovered-PID control capabilities.
   private readonly ownedChildren = new Map<string, ChildProcess>();
@@ -42,42 +49,47 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       workerIdentity({ sessionId: "validation", ownerId: options.ownerId, generation: "validation" });
       const timeout = options.timeoutMs ?? 15_000;
       if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 30_000) throw unavailable();
-      if (typeof options.storeRoot !== "string" || typeof options.nativeConfigRoot !== "string"
-        || !isAbsolute(options.nativeConfigRoot) || resolve(options.nativeConfigRoot) !== options.nativeConfigRoot
-        || options.nativeConfigRoot.includes("\0")) throw unavailable();
+      const explicit = options.nativeConfigRoot, env = options.nativeOptions?.env ?? {};
+      if (typeof options.storeRoot !== "string" || (explicit !== undefined && (typeof explicit !== "string"
+        || !isAbsolute(explicit) || resolve(explicit) !== explicit || explicit.includes("\0")))
+        || CLAUDE_CODE_FORBIDDEN_ENV.some(key => env[key] !== undefined)
+        || (explicit !== undefined && env.CLAUDE_CONFIG_DIR !== undefined && env.CLAUDE_CONFIG_DIR !== explicit)) throw unavailable();
       this.store = new ClaudeCodeManagedStore(options.storeRoot);
-      if (!options.nativeOptions?.env || options.nativeOptions.env.CLAUDE_CONFIG_DIR !== options.nativeConfigRoot
-        || ["NODE_OPTIONS", "NODE_PATH", "CLAUDE_CODE_PROJECT_DIR_NAME", "CLAUDE_CODE_RESUME_INTERRUPTED_TURN"]
-          .some(key => options.nativeOptions.env[key] !== undefined)) throw unavailable();
+      // CLAUDE_CONFIG_DIR is set for the worker only when the caller passed a root (or an explicit override).
+      this.nativeOptions = { ...options.nativeOptions, env: { ...env, ...(explicit !== undefined ? { CLAUDE_CONFIG_DIR: explicit } : {}) } };
     } catch { throw unavailable(); }
   }
   private async guard<T>(operation: () => Promise<T>): Promise<T> {
-    try { return await operation(); } catch { throw unavailable(); }
+    try { return await operation(); } catch (error) { throw publicError(error); }
   }
   private owner(ownerId: string) { if (ownerId !== this.options.ownerId) throw unavailable(); }
   private async host() {
     const entry = await realpath(this.options.workerExecutable ?? fileURLToPath(new URL("./worker-entry.js", import.meta.url)));
     if (!(await lstat(entry)).isFile()) throw unavailable();
-    for (const file of [this.options.nodeExecutable, this.options.nativeOptions.executable]) {
+    for (const file of [this.options.nodeExecutable, this.nativeOptions.executable]) {
       if (file !== undefined && !(await lstat(await realpath(file))).isFile()) throw unavailable();
     }
-    const root = this.options.nativeConfigRoot, info = await lstat(root);
-    if (await realpath(root) !== root || !info.isDirectory() || (info.mode & 0o077) || info.uid !== process.getuid?.()) throw unavailable();
+    await this.root();
     return entry;
   }
-  private preflight(id: string, generation: string, cwd: string, entry: string): void {
+  /** Explicit root, else as Claude Code resolves it for the effective (inherited + overlaid) environment. */
+  private root(): Promise<string> {
+    return resolveClaudeCodeConfigRoot(this.options.nativeConfigRoot, claudeCodeNativeEnvironment(this.nativeOptions.env));
+  }
+  private async preflight(id: string, generation: string, cwd: string, entry: string): Promise<void> {
+    const nativeConfigRoot = await this.root();
     decodeClaudeCodeWorkerBootstrap(JSON.stringify({ version: 1, type: "bootstrap", storeRoot: this.options.storeRoot,
       scope: { sessionId: id, ownerId: this.options.ownerId, generation, reservationId: randomUUID(), workerExecutable: entry,
-        cwd, nativeConfigRoot: this.options.nativeConfigRoot }, nativeOptions: this.options.nativeOptions }));
+        cwd, nativeConfigRoot }, nativeOptions: this.nativeOptions }));
   }
-  private nativeRoot(m: ClaudeCodeManagedManifest): void {
-    if (m.policy.nativeConfigRoot !== this.options.nativeConfigRoot) throw unavailable();
+  private async nativeRoot(m: ClaudeCodeManagedManifest): Promise<void> {
+    if (m.policy.nativeConfigRoot !== await this.root()) throw unavailable();
   }
   private session(m: ClaudeCodeManagedManifest): ManagedAgentSession {
     return { id: m.id, ownerId: m.ownerId, runtime: "claude-code", ownership: "owned", cwd: m.launchConfig.cwd };
   }
   private async live(id: string) {
-    const m = await this.store.read(id, this.options.ownerId); if (!m) throw unavailable(); this.nativeRoot(m);
+    const m = await this.store.read(id, this.options.ownerId); if (!m) throw unavailable(); await this.nativeRoot(m);
     const live = claudeCodeLiveWorker(m, await this.host());
     await this.store.withWorkerAdmission(live.scope, live.bytes, async () => {});
     return { ...live, manifest: m, client: new ClaudeCodeWorkerClient(live.registration, 2_000) };
@@ -85,11 +97,11 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
   private inputClient(registration: ClaudeCodeWorkerConnection): ClaudeCodeWorkerClient {
     // First input may allocate/initialize native lazily. Short status budgets must
     // not time out a healthy SDK startup after accepting uncertain input.
-    return new ClaudeCodeWorkerClient(registration, Math.min(2_147_483_647, (this.options.nativeOptions.startupTimeoutMs ?? 30_000) + 5_000));
+    return new ClaudeCodeWorkerClient(registration, Math.min(2_147_483_647, (this.nativeOptions.startupTimeoutMs ?? 30_000) + 5_000));
   }
   private async launch(id: string): Promise<ManagedAgentSession> {
     const attempt = await launchClaudeCodeWorker({ storeRoot: this.options.storeRoot, sessionId: id, ownerId: this.options.ownerId,
-      workerExecutable: await this.host(), nodeExecutable: this.options.nodeExecutable, nativeOptions: this.options.nativeOptions });
+      workerExecutable: await this.host(), nodeExecutable: this.options.nodeExecutable, nativeOptions: this.nativeOptions });
     if (attempt.child) {
       this.ownedChildren.set(id, attempt.child); attempt.child.unref();
       (attempt.child.stdin as Socket | null)?.unref();
@@ -110,10 +122,14 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       const cwd = await realpath(config.cwd ?? process.cwd()), entry = await this.host(), id = randomUUID(), generation = randomUUID();
       if (!(await lstat(cwd)).isDirectory()) throw unavailable();
       // Reuse the real preflight decoder BEFORE creating launch metadata.
-      this.preflight(id, generation, cwd, entry);
+      await this.preflight(id, generation, cwd, entry);
+      // Auth preflight: a short-lived query that sends no prompt. Unauthenticated throws the specific error
+      // BEFORE any manifest or worker exists.
+      await requireClaudeCodeAuth({ cwd, executable: this.nativeOptions.executable, env: claudeCodeNativeEnvironment(this.nativeOptions.env),
+        startupTimeoutMs: this.nativeOptions.startupTimeoutMs, shutdownTimeoutMs: this.nativeOptions.shutdownTimeoutMs });
       await this.store.create({ version: 4, runtime: "claude-code", id, ownerId, revision: 0, generation, requiresExplicitResume: false,
         native: { state: "pending" }, worker: { state: "none" }, lastDispatch: { state: "none" }, launchConfig: { ...config, cwd },
-        policy: { configuration: "isolated", permissionMode: "default", nativeConfigRoot: this.options.nativeConfigRoot, tools: ["Read", "Grep", "Glob"] }, createdAt: new Date().toISOString() });
+        policy: { configuration: "isolated", permissionMode: "default", nativeConfigRoot: await this.root(), tools: ["Read", "Grep", "Glob"] }, createdAt: new Date().toISOString() });
       // A failed launch/readiness must not orphan the manifest or a worker: run the stop path, and drop the
       // record only once absence is proven. Otherwise it stays fenced and listed for a later forceStopManaged.
       try { return await this.launch(id); }
@@ -122,7 +138,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
   }
   suspend(id: string, ownerId: string): Promise<void> {
     return this.guard(async () => {
-      this.owner(ownerId); const m = await this.store.read(id, ownerId); if (!m) throw unavailable(); this.nativeRoot(m);
+      this.owner(ownerId); const m = await this.store.read(id, ownerId); if (!m) throw unavailable(); await this.nativeRoot(m);
       await suspendClaudeCodeWorker(this.store, id, ownerId, await this.host(), this.options.timeoutMs);
     });
   }
@@ -145,7 +161,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
   }
   resume(id: string, ownerId: string, options?: { allowStopped?: boolean }): Promise<ManagedAgentSession> {
     return this.guard(async () => {
-      this.owner(ownerId); const m = await this.store.read(id, ownerId); if (!m) throw unavailable(); this.nativeRoot(m);
+      this.owner(ownerId); const m = await this.store.read(id, ownerId); if (!m) throw unavailable(); await this.nativeRoot(m);
       if (m.worker.state === "live" && !m.requiresExplicitResume) {
         const live = await this.live(id);
         if ((await waitForClaudeCodeWorkerReady({ store: this.store, scope: live.scope, registration: live.bytes,
@@ -153,7 +169,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
         return this.session(m); // Reconnect only; no launch or input replay.
       }
       if (options?.allowStopped !== true) throw unavailable();
-      this.preflight(id, m.generation, m.launchConfig.cwd, await this.host());
+      await this.preflight(id, m.generation, m.launchConfig.cwd, await this.host());
       await prepareClaudeCodeResume(this.store, id, ownerId);
       // A failed relaunch leaves the session fenced and suspended (never a half-started occupied slot).
       try { return await this.launch(id); }
@@ -165,7 +181,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
     let state: ManagedSessionSummary["state"] = "unavailable";
     if (m.worker.state === "none" && m.requiresExplicitResume) state = "suspended";
     else if (m.worker.state === "live" && requestMs > 0) try {
-      this.nativeRoot(m);
+      await this.nativeRoot(m);
       const live = claudeCodeLiveWorker(m, await this.host());
       await this.store.withWorkerAdmission(live.scope, live.bytes, async () => {});
       if (await new ClaudeCodeWorkerClient(live.registration, requestMs).status(signal) !== "offline") state = "active";
@@ -201,7 +217,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
   }
   turn(id: string, turnId: string) { return this.guard(async () => (await this.live(id)).client.turn(turnId)); }
   status(id: string) { return this.guard(async () => {
-    const m = await this.store.read(id, this.options.ownerId); if (!m) throw unavailable(); this.nativeRoot(m);
+    const m = await this.store.read(id, this.options.ownerId); if (!m) throw unavailable(); await this.nativeRoot(m);
     if (m.worker.state === "none" && m.requiresExplicitResume) return "offline" as const;
     return (await this.live(id)).client.status();
   }); }
@@ -216,7 +232,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
   }
   messages(id: string) {
     return this.guard(async () => {
-      const m = await this.store.read(id, this.options.ownerId); if (!m) throw unavailable(); this.nativeRoot(m);
+      const m = await this.store.read(id, this.options.ownerId); if (!m) throw unavailable(); await this.nativeRoot(m);
       if (m.worker.state !== "none") return (await this.live(id)).client.messages();
       return this.store.withSessionLock(id, m.ownerId, async () => {
         const current = await this.store.read(id, m.ownerId);
