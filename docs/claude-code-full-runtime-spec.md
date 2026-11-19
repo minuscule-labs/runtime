@@ -165,6 +165,18 @@ Update `docs/claude-code-process-family-contract.md` to v3:
     `~/.minu/runtime/claude-code` (mode 0700, created if missing). `ClaudeCodeManagedRuntime` stays
     as the per-owner implementation underneath.
 
+### 4.1 Scope decision: Pi parity first
+
+The goal is functional parity with the Pi adapter; further capabilities are evaluated after that.
+
+- **Core path (Pi parity):** A1 (native auth, preflight), A3 (`permissions: "full"`), A6 (model, reasoning, skills,
+  `capabilities()`), A7 (images, steering, stop after interrupted/failed turn), A9 (headless conformance), A10
+  (owner-per-call managed API). Recovery is already on `main`.
+- **Deferred until after the parity evaluation (slim or skip):** A2 (executable version range and manifest pinning),
+  A4 (`isolateConfiguration` escape hatch), A8 (contract v3 and README polish). A5 (history widening, caps, fixture
+  corpus) is reduced to the minimum that lets real tool and image turns resume without `unsupported_format`.
+- Deferred items stay specified above; they are not dropped.
+
 ## 5. Testing rules
 
 - Credential-free by default: the existing synthetic providers and native fixtures, with dummy
