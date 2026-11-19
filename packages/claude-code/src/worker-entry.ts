@@ -110,6 +110,15 @@ export async function runClaudeCodeWorkerEntry(): Promise<ClaudeCodeManagedSessi
     await handle.closeOwnedNative(); // Privileged captured cleanup, outside admission.
     process.exit(0);
   }).catch(() => { ready = false; notify({ version: 1, type: "unavailable" }); });
+  // Recovery stop (own group only): tear down native, then exit; if teardown fails, end the whole own group so
+  // no native writer outlives the worker. The controller still proves absence independently.
+  if (group === process.pid) void bridge.forceStopped.then(async () => {
+    ready = false;
+    const backstop = setTimeout(() => { try { process.kill(-process.pid, "SIGKILL"); } catch { process.exit(1); } }, 4_000);
+    try { await bridge.close(); await handle.closeOwnedNative(); }
+    catch { try { process.kill(-process.pid, "SIGKILL"); } catch { /* Controller TERM/KILL path remains. */ } }
+    clearTimeout(backstop); process.exit(0);
+  });
   const bytes = encodeClaudeCodeWorkerRegistration({ version: 1, runtime: "claude-code", ownership: "owned", ...scope,
     pid: process.pid, processGroupId: group, endpoint: bridge.connection.endpoint, token: bridge.connection.token,
     createdAt: new Date().toISOString() }, scope);

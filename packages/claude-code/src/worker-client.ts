@@ -122,6 +122,9 @@ export class ClaudeCodeWorkerClient {
   async requestQuiesceIdle(signal?: AbortSignal): Promise<void> { workerAcknowledgment(await this.request("/quiesce-idle", {}, signal)); }
   /** Authenticated native-stop acknowledgment, NOT independent confirmation of worker/group exit. */
   async requestStop(signal?: AbortSignal): Promise<void> { workerAcknowledgment(await this.request("/stop", {}, signal)); }
+  /** Adapter-private recovery stop: bypasses idle/busy admission (not authentication). One best-effort
+   * request; the worker then tears down its native family and exits. Never proof of exit. */
+  async requestForceStop(signal?: AbortSignal): Promise<void> { workerAcknowledgment(await this.request("/force-stop", {}, signal)); }
   events(signal: AbortSignal): AsyncIterable<AgentEvent> { return this.stream("/events", signal) as AsyncIterable<AgentEvent>; }
   activityEvents(signal: AbortSignal): AsyncIterable<RuntimeActivityEvent> { return this.stream("/activity", signal, true) as AsyncIterable<RuntimeActivityEvent>; }
 

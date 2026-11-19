@@ -46,6 +46,9 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
   /** Successful idle stop after admission release and a bounded reply attempt.
    * Not worker/group exit, metadata-clear or resume authority. Generic stop does not resolve it. */
   idleQuiesced: Promise<void>;
+  /** Authenticated recovery stop, outside admission (a fenced/revoked session cannot admit). Resolves after
+   * the bounded reply attempt; the owner must then tear down natively and exit. Not exit/clear authority. */
+  forceStopped: Promise<void>;
   /** Fences admission, confirms native stop, then closes the listener and streams. */
   close(): Promise<void>;
 }> {
@@ -55,9 +58,10 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
   const activities = new Set<Queue<RuntimeActivityEvent>>();
   const responses = new Set<ServerResponse>();
   const abort = new AbortController();
-  let stopping = false, mutating = false, idleStopConfirmed = false;
-  let resolveIdleQuiesced!: () => void;
+  let stopping = false, mutating = false, idleStopConfirmed = false, forced = false;
+  let resolveIdleQuiesced!: () => void, resolveForceStopped!: () => void;
   const idleQuiesced = new Promise<void>(resolve => { resolveIdleQuiesced = resolve; });
+  const forceStopped = new Promise<void>(resolve => { resolveForceStopped = resolve; });
   let stopTask: Promise<void> | undefined;
   let transportClose: Promise<void> | undefined;
   let streams = 0, eventsEnded = false, activityEnded = false;
@@ -204,6 +208,18 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
         timer = setTimeout(complete, LIMITS.drainMs); timer.unref();
         try { reply(response, { acknowledged: true }); }
         finally { if (response.destroyed || response.writableFinished) complete(); }
+      } else if (request.method === "POST" && url.pathname === "/force-stop") {
+        // Deliberately no admit/mutate: recovery must work while busy, fenced or with a dead registration.
+        stopping = true; forced = true;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const complete = () => {
+          clearTimeout(timer); response.off("finish", complete); response.off("close", complete);
+          resolveForceStopped();
+        };
+        response.once("finish", complete); response.once("close", complete);
+        timer = setTimeout(complete, LIMITS.drainMs); timer.unref();
+        try { reply(response, { acknowledged: true }); }
+        finally { if (response.destroyed || response.writableFinished) complete(); }
       } else if (request.method === "POST" && url.pathname === "/stop") {
         await stop();
         // This acknowledges native stop only. The owning supervisor must separately observe worker exit.
@@ -243,11 +259,11 @@ export async function createClaudeCodeWorkerBridge(options: ClaudeCodeWorkerBrid
   catch (error) { abort.abort(); await runtime.stop(id); await Promise.all([eventPump, activityPump]); throw error; }
   const address = server.address() as AddressInfo;
   return {
-    idleQuiesced,
+    idleQuiesced, forceStopped,
     connection: { sessionId: options.sessionId, ownerId: options.ownerId, generation: options.generation,
       endpoint: `http://127.0.0.1:${address.port}`, token: options.token },
     async close() {
-      if (!idleStopConfirmed) await stop();
+      if (!idleStopConfirmed && !forced) await stop();
       if (!transportClose) transportClose = (async () => {
         abort.abort();
         for (const response of responses) response.destroy();

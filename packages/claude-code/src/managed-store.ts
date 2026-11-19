@@ -112,6 +112,9 @@ export interface ClaudeCodeManifestLease {
    * registration. The caller MUST have independently proven absence (`proof`); the store only checks that the
    * claimed proof is coherent with the record. Keeps native binding/dispatch; rotates the generation. */
   forceClearWorker(expectedRevision: number, generation: string, reservationId: string, proof: ClaudeCodeWorkerAbsenceProof): Promise<ClaudeCodeManagedManifest>;
+  /** Destroy: drop the Runtime resume metadata of a session whose worker slot is already `none`. Native history
+   * lives under the native config root and is never touched. Returns the removed snapshot. */
+  removeSession(expectedRevision: number): Promise<ClaudeCodeManagedManifest>;
 }
 
 export class ClaudeCodeManifestConflictError extends Error {}
@@ -273,6 +276,7 @@ export class ClaudeCodeManagedStore {
         publishWorker: (revision, generation, reservationId, payload) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "publish", reservationId, payload })),
         releaseWorkerReservation: (revision, generation, reservationId) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "release", reservationId })),
         clearWorkerAfterExit: (revision, generation, reservationId, pid) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "clear", reservationId, pid })),
+        removeSession: revision => mutate(() => this.removeLocked(id, ownerId, revision)),
         forceClearWorker: (revision, generation, reservationId, proof) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "force-clear", reservationId, proof })),
       };
       try { return await operation(lease); }
@@ -392,6 +396,15 @@ export class ClaudeCodeManagedStore {
       ? { ...snapshot, state: "dispatching", generation }
       : { ...snapshot, state: "settled", generation, outcome };
     return this.publishUpdate({ ...current, revision: current.revision + 1, lastDispatch });
+  }
+  private async removeLocked(id: string, ownerId: string, revision: number): Promise<ClaudeCodeManagedManifest> {
+    const current = await this.current(id, ownerId, revision);
+    if (current.worker.state !== "none") throw new ClaudeCodeManifestConflictError("Claude Code worker slot is occupied; absence is unproven");
+    const owner = this.directory(ownerId), directory = join(owner, `${id}.session`), removed = join(owner, `.${randomUUID()}.removed`);
+    // Rename first so a crash leaves either the whole record or none; the staging name is never an identity.
+    await rename(directory, removed);
+    try { await syncDirectory(owner); } finally { await rm(removed, { recursive: true, force: true }); }
+    return current;
   }
   private async workerLocked(
     id: string, ownerId: string, revision: number, generation: string, operation: WorkerOperation,

@@ -12,6 +12,7 @@ import { launchClaudeCodeWorker } from "./worker-launch.js";
 import { waitForClaudeCodeWorkerReady } from "./worker-readiness.js";
 import { ClaudeCodeWorkerClient } from "./worker-client.js";
 import { workerIdentity, type ClaudeCodeWorkerConnection } from "./worker-protocol.js";
+import { recoverClaudeCodeWorker } from "./worker-recovery.js";
 import { claudeCodeCleanHistory, claudeCodeLiveWorker, prepareClaudeCodeResume, suspendClaudeCodeWorker } from "./worker-lifecycle.js";
 
 export interface ClaudeCodeManagedRuntimeOptions {
@@ -28,8 +29,8 @@ export interface ClaudeCodeManagedRuntimeOptions {
 }
 const unavailable = () => new Error("Claude Code managed operation unavailable");
 
-/** Durable text-only controller. Native owns its loop/tools/auth. No forced recovery,
- * configuration inheritance, transcript repair, input replay or durable turn ledger. */
+/** Durable text-only controller. Native owns its loop/tools/auth. Forced recovery is explicit
+ * (forceStopManaged/destroy) and absence-proven; no configuration inheritance, transcript repair, input replay or durable turn ledger. */
 export class ClaudeCodeManagedRuntime implements AgentRuntime {
   private readonly options: ClaudeCodeManagedRuntimeOptions;
   private readonly store: ClaudeCodeManagedStore;
@@ -113,7 +114,10 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       await this.store.create({ version: 4, runtime: "claude-code", id, ownerId, revision: 0, generation, requiresExplicitResume: false,
         native: { state: "pending" }, worker: { state: "none" }, lastDispatch: { state: "none" }, launchConfig: { ...config, cwd },
         policy: { configuration: "isolated", permissionMode: "default", nativeConfigRoot: this.options.nativeConfigRoot, tools: ["Read", "Grep", "Glob"] }, createdAt: new Date().toISOString() });
-      return this.launch(id);
+      // A failed launch/readiness must not orphan the manifest or a worker: run the stop path, and drop the
+      // record only once absence is proven. Otherwise it stays fenced and listed for a later forceStopManaged.
+      try { return await this.launch(id); }
+      catch (error) { await recoverClaudeCodeWorker(this.store, id, ownerId, { remove: true }).catch(() => {}); throw error; }
     });
   }
   suspend(id: string, ownerId: string): Promise<void> {
@@ -123,6 +127,22 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
     });
   }
   stop(id: string) { return this.suspend(id, this.options.ownerId); }
+  /** Fence, one admission-bypassing stop, then absence proof or verified termination. Never clears on uncertainty. */
+  forceStopManaged(id: string, ownerId: string): Promise<void> {
+    return this.guard(async () => {
+      this.owner(ownerId);
+      if (await recoverClaudeCodeWorker(this.store, id, ownerId) === "missing") throw unavailable();
+      this.ownedChildren.delete(id);
+    });
+  }
+  /** Stops (with absence proof) unless already stopped, then drops Runtime resume metadata; native history stays. */
+  destroy(id: string, ownerId: string): Promise<void> {
+    return this.guard(async () => {
+      this.owner(ownerId);
+      await recoverClaudeCodeWorker(this.store, id, ownerId, { remove: true });
+      this.ownedChildren.delete(id);
+    });
+  }
   resume(id: string, ownerId: string, options?: { allowStopped?: boolean }): Promise<ManagedAgentSession> {
     return this.guard(async () => {
       this.owner(ownerId); const m = await this.store.read(id, ownerId); if (!m) throw unavailable(); this.nativeRoot(m);
@@ -134,7 +154,10 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       }
       if (options?.allowStopped !== true) throw unavailable();
       this.preflight(id, m.generation, m.launchConfig.cwd, await this.host());
-      await prepareClaudeCodeResume(this.store, id, ownerId); return this.launch(id);
+      await prepareClaudeCodeResume(this.store, id, ownerId);
+      // A failed relaunch leaves the session fenced and suspended (never a half-started occupied slot).
+      try { return await this.launch(id); }
+      catch (error) { await recoverClaudeCodeWorker(this.store, id, ownerId).catch(() => {}); throw error; }
     });
   }
   private async summary(m: ClaudeCodeManagedManifest, signal?: AbortSignal, requestMs = 1_000): Promise<ManagedSessionSummary> {
