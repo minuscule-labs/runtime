@@ -206,7 +206,7 @@ class ManagedSession implements AgentRuntime {
     this.openingAbort = new AbortController();
     this.openingUnknown = true;
     const common = { runtimeSessionId: this.session.id, nativeSessionId, canonicalCwd: context.manifest.launchConfig.cwd,
-      nativeConfigRoot: context.manifest.policy.nativeConfigRoot, nativeRoot: true, signal: this.openingAbort.signal };
+      nativeConfigRoot: context.manifest.policy.nativeConfigRoot, nativeRoot: true, ...(context.manifest.policy.engineVersion ? { engineVersion: context.manifest.policy.engineVersion } : {}), signal: this.openingAbort.signal };
     const opening = (async () => {
       this.native = await openClaudeCodeNativeSession(context.manifest.launchConfig,
         mode === "create" ? { ...common, mode, firstInput: firstInput! } : { ...common, mode }, this.options);

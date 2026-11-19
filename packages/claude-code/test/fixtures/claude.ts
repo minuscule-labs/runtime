@@ -70,7 +70,7 @@ lines.on("line", (line) => {
   if (process.env.MINU_CLAUDE_FIXTURE_IMAGES) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_IMAGES, JSON.stringify(blocks.filter((block: any) => block.type === "image")));
   if (process.env.MINU_CLAUDE_FIXTURE_INPUT) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_INPUT, input);
   output({ ...base(), type: "system", subtype: "init", permissionMode: flag("--permission-mode") ?? "default",
-    cwd: mode === "wrong-workspace-init" ? "/" : process.cwd(), model: "fixture-model", claude_code_version: "2.1.321" });
+    cwd: mode === "wrong-workspace-init" ? "/" : process.cwd(), model: "fixture-model", claude_code_version: process.env.MINU_CLAUDE_FIXTURE_VERSION ?? "2.1.321" });
   if (input === "hold") return;
   if (input === "wait-steer") { current.waitSteer = true; return; }
   if (input === "crash") process.exit(3);

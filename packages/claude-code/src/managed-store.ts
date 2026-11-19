@@ -34,6 +34,9 @@ export interface ClaudeCodeManagedPolicy {
   permissions?: ClaudeCodePermissionLabel;
   allowedTools?: string[];
   disallowedTools?: string[];
+  /** v5+. claude_code_version the session was created with. Resume refuses a changed MAJOR; minor/patch changes are accepted
+   * when the history parser accepts the file. */
+  engineVersion?: string;
 }
 
 export interface ClaudeCodeDispatchIdentity {
@@ -200,7 +203,8 @@ function validPolicy(policy: Record<string, unknown>, version: number): boolean 
   if (!["native", "isolated"].includes(policy.configuration as string) || !normalizedPath(policy.nativeConfigRoot)
     || !(policy.tools === null || stringList(policy.tools, 128))) return false;
   if (version < 5) return policy.permissionMode === "default" && keys(policy, ["configuration", "permissionMode", "tools", "nativeConfigRoot"]);
-  if (!keys(policy, ["configuration", "permissionMode", "tools", "nativeConfigRoot", "permissions", "allowedTools", "disallowedTools"])
+  if (!keys(policy, ["configuration", "permissionMode", "tools", "nativeConfigRoot", "permissions", "allowedTools", "disallowedTools", "engineVersion"])
+    || (policy.engineVersion !== undefined && (typeof policy.engineVersion !== "string" || !/^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/.test(policy.engineVersion)))
     || !CLAUDE_CODE_PERMISSION_MODES.includes(policy.permissionMode as string) || !LABELS.includes(policy.permissions as string)
     || (policy.allowedTools !== undefined && !stringList(policy.allowedTools, 128))
     || (policy.disallowedTools !== undefined && !stringList(policy.disallowedTools, 128))) return false;

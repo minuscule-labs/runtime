@@ -152,7 +152,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       const policy = resolveClaudeCodePermissions(this.options.permissions);
       await this.store.create({ version: 5, runtime: "claude-code", id, ownerId, revision: 0, generation, requiresExplicitResume: false,
         native: { state: "pending" }, worker: { state: "none" }, lastDispatch: { state: "none" }, launchConfig: { ...config, cwd },
-        policy: { configuration: this.options.isolateConfiguration ? "isolated" : "native", nativeConfigRoot: await this.root(), ...policy }, createdAt: new Date().toISOString() });
+        policy: { configuration: this.options.isolateConfiguration ? "isolated" : "native", nativeConfigRoot: await this.root(), ...policy, ...(probe.version ? { engineVersion: probe.version } : {}) }, createdAt: new Date().toISOString() });
       // A failed launch/readiness must not orphan the manifest or a worker: run the stop path, and drop the
       // record only once absence is proven. Otherwise it stays fenced and listed for a later forceStopManaged.
       try { return await this.launch(id); }

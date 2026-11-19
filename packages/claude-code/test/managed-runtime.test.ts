@@ -414,3 +414,20 @@ test("a resumed session whose stored model is no longer offered fails closed and
   const after = await f.read(session.id);
   assert.equal(after!.worker.state, "none"); assert.equal(after!.requiresExplicitResume, true); assert.equal(after!.native.state, stopped!.native.state);
 });
+
+test("engine version is recorded; resume accepts a newer minor/patch and refuses an unsupported engine, staying fenced", async t => {
+  const f = await fixture(t), runtime = f.controller(), session = await runtime.startManaged({ cwd: f.cwd }, "owner");
+  assert.equal((await f.read(session.id))!.policy.engineVersion, "2.1.321");
+  await runtime.send(session.id, "first"); await runtime.stop(session.id);
+  const children = (c: ClaudeCodeManagedRuntime) => (c as unknown as { ownedChildren: Map<string, ChildProcess> }).ownedChildren;
+  f.options.nativeOptions!.env!.MINU_CLAUDE_FIXTURE_VERSION = "3.0.0";
+  const refused = f.controller();
+  await assert.rejects(refused.resume(session.id, "owner", { allowStopped: true }));
+  for (const child of children(refused).values()) await until(async () => child.exitCode ?? child.signalCode, code => code !== null);
+  children(refused).clear();
+  assert.equal((await f.read(session.id))!.worker.state, "none"); assert.equal((await f.read(session.id))!.requiresExplicitResume, true);
+  f.options.nativeOptions!.env!.MINU_CLAUDE_FIXTURE_VERSION = "2.1.999";
+  const next = f.controller(); await next.resume(session.id, "owner", { allowStopped: true });
+  assert.equal((await f.read(session.id))!.policy.engineVersion, "2.1.321", "the pin is the creation version");
+  await next.send(session.id, "newer patch"); await next.stop(session.id);
+});

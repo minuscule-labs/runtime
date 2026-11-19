@@ -53,6 +53,8 @@ export interface ClaudeCodeNativeLaunch {
   /** The root is the user's NATIVE Claude Code configuration: inherited environment overlaid by `env`, owned (not
    * private) directories, never created/chmodded/written by Runtime. Omitted keeps the private-root behavior. */
   nativeRoot?: boolean;
+  /** Engine version recorded at creation; a different major refuses the launch (minor/patch changes are accepted). */
+  engineVersion?: string;
   signal?: AbortSignal;
 }
 export type ClaudeCodeSettlementEvidence = "native" | "undispatched" | "uncertain";
@@ -312,6 +314,9 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       verifyClaudeCodeSelection(config, discovery);
       state.images = claudeCodeSupportsImages(config, discovery);
       if (native && !claudeCodeVersionSupported(initialized.claude_code_version)) throw new Error("Unsupported persistent Claude Code version");
+      if (native?.engineVersion && String(initialized.claude_code_version).split(".")[0] !== native.engineVersion.split(".")[0]) {
+        throw new Error("Persistent Claude Code engine major version changed");
+      }
       if (state.status === "offline") throw new Error("Claude Code exited during startup");
       this.sessions.set(id, state);
       return { ...state.session };
