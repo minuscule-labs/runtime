@@ -13,10 +13,17 @@ import {
   type RuntimeSessionCapabilities,
 } from "@minu/runtime-core";
 import { Queue } from "./queue.js";
+import { claudeCodePermissionOptions, resolveClaudeCodePermissions, type ClaudeCodePermissionPolicy, type ClaudeCodePermissions } from "./permissions.js";
 import { claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
 
 export interface ClaudeCodeRuntimeOptions {
-  /** Defaults to Read/Grep/Glob only. Not an OS sandbox or a filesystem boundary. */
+  /** What sessions may do natively; the library default is "readOnly" so callers opt in to "full". Not an OS sandbox
+   * or a filesystem boundary. See ClaudeCodePermissions. */
+  permissions?: ClaudeCodePermissions;
+  /** Restore the isolated behavior: no user/project/local settings, hooks, MCP servers or plugins. Default: native
+   * configuration, i.e. what running `claude` in that cwd would load (no new trust is granted). */
+  isolateConfiguration?: boolean;
+  /** Explicit tool list; overrides the policy's tools (legacy). */
   tools?: string[];
   /** Denied when omitted; configured decisions use controlTimeoutMs and a request/turn abort signal.
    * Null/out-of-band replies are unsupported. Does not gate native auto-allowed tools. */
@@ -69,6 +76,8 @@ interface Execution {
   written: ReturnType<typeof deferred>;
   done: ReturnType<typeof deferred>;
   interruptRequested: boolean;
+  /** Set when the turn must end failed (e.g. a human-in-the-loop dialog); settled by its native result. */
+  failure?: string;
   permissionAbort: AbortController;
   evidence: ClaudeCodeSettlementEvidence;
 }
@@ -77,6 +86,7 @@ interface SessionState {
   session: AgentSession;
   nativeId: string;
   persistent: boolean;
+  policy: ClaudeCodePermissionPolicy;
   status: AgentStatus;
   query?: Query;
   process?: ChildProcess;
@@ -215,12 +225,13 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       } else if (snapshot.state === "present") throw new Error("Claude Code native history already exists; creation refused");
       native.signal?.throwIfAborted();
     }
+    const policy = resolveClaudeCodePermissions(this.options.permissions);
     const id = native?.runtimeSessionId ?? randomUUID();
     if (this.sessions.has(id) || this.starting.has(id)) throw new Error("Claude Code Runtime identity is already in use");
     this.starting.add(id);
     const state: SessionState = {
       session: { id, runtime: "claude-code", ownership: "owned", cwd },
-      nativeId: native?.nativeSessionId ?? id, persistent: !!native,
+      nativeId: native?.nativeSessionId ?? id, persistent: !!native, policy,
       status: "idle", abort: new AbortController(), exited: deferred(),
       inputs: new Queue<Execution>(this.retention), turns: new Map(), messages: history.map(message => ({ ...message })), tools: new Map(),
       events: new Set(), activities: new Set(),
@@ -238,17 +249,19 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
           systemPrompt: config.systemPrompt ?? {
             type: "preset", preset: "claude_code", append: config.appendSystemPrompt,
           },
-          tools: this.options.tools ?? ["Read", "Grep", "Glob"],
-          permissionMode: "default", allowDangerouslySkipPermissions: false,
-          canUseTool: (name, input, options) => this.permissionDecision(state, name, input, options),
-          // Owned stdio has no dialog renderer. Do not invent a dismissal/answer.
+          ...claudeCodePermissionOptions(policy, this.options.tools),
+          // bypassPermissions auto-approves before the callback is consulted (the SDK warns), so none is registered.
+          ...(policy.permissionMode === "bypassPermissions" ? {}
+            : { canUseTool: (name: string, input: Record<string, unknown>, options: Parameters<CanUseTool>[2]) => this.permissionDecision(state, name, input, options) }),
+          // Headless: no dialog renderer, so never invent an answer. Only the active turn fails; the session stays usable.
           onUserDialog: async () => {
-            this.offline(state, "Claude Code requested unsupported interactive input");
-            await this.shutdown(state);
-            throw new Error("Claude Code interactive input is unsupported by Runtime");
+            const execution = state.active;
+            if (execution && state.status === "working") execution.failure ??= "Claude Code requested unsupported interactive input";
+            return { behavior: "cancelled" };
           },
-          settingSources: [], settings: { disableAllHooks: true },
-          strictMcpConfig: true, mcpServers: {}, plugins: [],
+          ...(this.options.isolateConfiguration
+            ? { settingSources: [], settings: { disableAllHooks: true }, strictMcpConfig: true, mcpServers: {}, plugins: [] }
+            : { settingSources: ["user", "project", "local"] }),
           persistSession: state.persistent, includePartialMessages: true, verbatimPrompts: true,
           spawnClaudeCodeProcess: (options) => {
             const child = spawn(options.command, options.args, {
@@ -512,7 +525,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
           throw new Error("Claude Code session identity mismatch");
         }
         if (state.persistent && message.type === "system" && message.subtype === "init"
-          && (message.cwd !== state.session.cwd || message.claude_code_version !== "2.1.321" || message.permissionMode !== "default")) {
+          && (message.cwd !== state.session.cwd || message.claude_code_version !== "2.1.321" || message.permissionMode !== state.policy.permissionMode)) {
           throw new Error("Persistent Claude Code launch metadata mismatch");
         }
         this.observe(state, message);
@@ -565,6 +578,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       }
     } else if (message.type === "result") {
       if (execution.interruptRequested) this.finish(state, execution, "interrupted", undefined, undefined, "native");
+      else if (execution.failure) this.finish(state, execution, "failed", undefined, execution.failure, "native");
       else if (message.subtype !== "success" || message.is_error) {
         this.finish(state, execution, "failed", undefined, "Claude Code turn failed", "native");
       } else {

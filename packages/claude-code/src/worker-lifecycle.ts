@@ -6,14 +6,17 @@ import { encodeClaudeCodeWorkerRegistration } from "./worker-registration.js";
 
 const unavailable = () => new Error("Claude Code managed lifecycle unavailable");
 
-/** Trusted-host/pinned-family eligibility, NOT OS containment or PID attestation. */
-export function requireClaudeCodeMvpPolicy(m: ClaudeCodeManagedManifest): void {
-  if (process.platform === "win32" || m.policy.configuration !== "isolated" || m.policy.permissionMode !== "default"
+/** Trusted-host eligibility, NOT OS containment or PID attestation. v3/v4 manifests predate the permission policy and
+ * launch selections, so they keep the strict read-only MVP rules; v5 manifests carry a validated policy. */
+export function requireClaudeCodePolicy(m: ClaudeCodeManagedManifest): void {
+  if (process.platform === "win32") throw unavailable();
+  if (m.version >= 5) return;
+  if (m.policy.configuration !== "isolated" || m.policy.permissionMode !== "default"
     || !m.policy.tools || m.policy.tools.some(tool => !["Read", "Grep", "Glob"].includes(tool))
     || m.launchConfig.model !== undefined || m.launchConfig.reasoningLevel !== undefined || m.launchConfig.skillIds !== undefined) throw unavailable();
 }
 export function claudeCodeLiveWorker(m: ClaudeCodeManagedManifest, workerExecutable: string) {
-  requireClaudeCodeMvpPolicy(m);
+  requireClaudeCodePolicy(m);
   if (m.requiresExplicitResume || m.worker.state !== "live" || m.worker.generation !== m.generation
     || m.worker.workerExecutable !== workerExecutable || m.worker.registration.processGroupId !== m.worker.registration.pid) throw unavailable();
   const scope = { sessionId: m.id, ownerId: m.ownerId, generation: m.generation, reservationId: m.worker.reservationId,
@@ -25,7 +28,7 @@ export function claudeCodeLiveWorker(m: ClaudeCodeManagedManifest, workerExecuta
  * only an independently committed completed dispatch may request this extra check.
  * Failed/interrupted/uncertain latest inputs remain unavailable in the MVP. */
 export async function claudeCodeCleanHistory(m: ClaudeCodeManagedManifest) {
-  requireClaudeCodeMvpPolicy(m);
+  requireClaudeCodePolicy(m);
   if (m.native.state === "pending" && m.lastDispatch.state === "none") return [];
   if (m.native.state !== "bound" || m.lastDispatch.state !== "settled" || m.lastDispatch.outcome !== "completed") throw unavailable();
   const history = await inspectClaudeCodeHistory({ nativeSessionId: m.native.sessionId, canonicalCwd: m.launchConfig.cwd,

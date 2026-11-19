@@ -107,6 +107,8 @@ test("a legacy unmarked worker is never signalled: it stays fenced until absence
   const before = f.track(await f.read(session.id)), group = groupOf(before)!;
   const record = JSON.parse(await readFile(f.manifestPath(session.id), "utf8"));
   delete record.worker.marked; delete record.worker.bootIdentity; record.version = 3;
+  // A genuinely legacy record also predates the permission policy fields.
+  record.policy = { configuration: "isolated", permissionMode: "default", nativeConfigRoot: record.policy.nativeConfigRoot, tools: ["Read", "Grep", "Glob"] };
   await writeFile(f.manifestPath(session.id), JSON.stringify(record) + "\n", { mode: 0o600 });
   process.kill(group, "SIGSTOP");
   await assert.rejects(recoverClaudeCodeWorker(f.store, session.id, "owner", { timeouts: { requestMs: 100, graceMs: 200, termMs: 100, killMs: 100 } }));

@@ -9,6 +9,7 @@ import { ClaudeCodeAgentRuntime, type ClaudeCodeRuntimeOptions } from "./client.
 import { openClaudeCodeNativeSession } from "./native-session.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest, type ClaudeCodeManifestLease, type ClaudeCodeDispatchIdentity } from "./managed-store.js";
 import { decodeClaudeCodeWorkerRegistration, encodeClaudeCodeWorkerRegistration, type ClaudeCodeWorkerRegistrationScope } from "./worker-registration.js";
+import { requireClaudeCodePolicy } from "./worker-lifecycle.js";
 import { turnId as callerTurnId } from "./worker-protocol.js";
 import { Queue } from "./queue.js";
 import { CLAUDE_CODE_FORBIDDEN_ENV, claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
@@ -93,10 +94,14 @@ class ManagedSession implements AgentRuntime {
       if (claimed.has(key)) throw new Error("Managed Claude Code worker epoch was already claimed");
       claimed.add(key);
       const context = this.current(this.session.id), manifest = context.manifest;
-      if (manifest.policy.configuration !== "isolated" || manifest.policy.tools === null) throw new Error("Managed native configuration inheritance is not implemented");
-      if (manifest.launchConfig.model || manifest.launchConfig.reasoningLevel !== undefined || manifest.launchConfig.skillIds !== undefined) {
-        throw new Error("Managed Claude Code launch selections are not implemented");
-      }
+      // v3/v4 manifests predate the policy and are the read-only MVP policy (their stored tool list applies verbatim).
+      try { requireClaudeCodePolicy(manifest); } catch { throw new Error("Managed Claude Code policy is not supported"); }
+      const policy = manifest.policy;
+      Object.assign(this.options, manifest.version < 5 ? { permissions: "readOnly" as const, tools: [...(policy.tools ?? [])] }
+        : { permissions: policy.permissions !== "custom" ? policy.permissions! : { mode: policy.permissionMode,
+          ...(policy.allowedTools ? { allowedTools: [...policy.allowedTools] } : {}),
+          ...(policy.disallowedTools ? { disallowedTools: [...policy.disallowedTools] } : {}) } },
+      { isolateConfiguration: policy.configuration === "isolated" });
       if (await resolveClaudeCodeConfigRoot(undefined, this.options.env!).catch(() => undefined) !== manifest.policy.nativeConfigRoot) {
         throw new Error("Managed Claude Code native environment is not verified");
       }
@@ -111,7 +116,6 @@ class ManagedSession implements AgentRuntime {
       // after all prelaunch awaits, before entering any bound native opening.
       if (this.stopped) throw new Error("Managed Claude Code session stopped during initialization");
       this.policy = this.policyKey(manifest);
-      this.options.tools = [...manifest.policy.tools];
       if (manifest.native.state === "bound") {
         await this.openNative(context, manifest.native.sessionId, "resume");
         this.nativeId = manifest.native.sessionId;

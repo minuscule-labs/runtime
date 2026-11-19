@@ -11,6 +11,9 @@ else if (probe && process.env.MINU_CLAUDE_FIXTURE_PROBE) appendFileSync(process.
 if (process.env.MINU_CLAUDE_FIXTURE_PROJECT_DIR) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_PROJECT_DIR, process.env.CLAUDE_CODE_PROJECT_DIR_NAME ?? "<default>");
 let current: any;
 let pendingPermission: any;
+if (process.env.MINU_CLAUDE_FIXTURE_ARGV) appendFileSync(process.env.MINU_CLAUDE_FIXTURE_ARGV, JSON.stringify({ probe, argv: process.argv.slice(2),
+  env: { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR } }) + "\n", { mode: 0o600 });
+const flag = (name: string) => process.argv.find(arg => arg.startsWith(`${name}=`))?.slice(name.length + 1);
 const output = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const base = () => ({ session_id: current.session_id, uuid: crypto.randomUUID() });
 function result(text: string, extra: Record<string, unknown> = {}) {
@@ -53,7 +56,7 @@ lines.on("line", (line) => {
   current = message;
   const input = typeof message.message.content === "string" ? message.message.content : message.message.content[0].text;
   if (process.env.MINU_CLAUDE_FIXTURE_INPUT) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_INPUT, input);
-  output({ ...base(), type: "system", subtype: "init", permissionMode: "default",
+  output({ ...base(), type: "system", subtype: "init", permissionMode: flag("--permission-mode") ?? "default",
     cwd: mode === "wrong-workspace-init" ? "/" : process.cwd(), model: "fixture-model", claude_code_version: "2.1.321" });
   if (input === "hold") return;
   if (input === "crash") process.exit(3);

@@ -7,6 +7,7 @@ import type { ChildProcess } from "node:child_process";
 import { runtimeInput, type AgentRuntime, type AgentStartConfig, type ManagedAgentSession, type ManagedSessionSummary,
   type RuntimeImageContent, type RuntimeActivityOptions } from "@minu/runtime-core";
 import { CLAUDE_CODE_FORBIDDEN_ENV, ClaudeCodeAuthRequiredError, claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
+import { resolveClaudeCodePermissions, type ClaudeCodePermissions } from "./permissions.js";
 import { requireClaudeCodeAuth } from "./probe.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest } from "./managed-store.js";
 import { decodeClaudeCodeWorkerBootstrap, type ClaudeCodeWorkerBootstrap } from "./worker-entry.js";
@@ -24,6 +25,11 @@ export interface ClaudeCodeManagedRuntimeOptions {
   /** Optional. Omitted resolves as Claude Code does ($CLAUDE_CONFIG_DIR, else ~/.claude), realpath'd and owned by this user.
    * Authentication stays native-owned: never read, copied, stored or prompted for. Never created, chmodded or written. */
   nativeConfigRoot?: string;
+  /** Library default "readOnly": callers opt in to "full" (Pi parity) explicitly. Stored per session in the manifest;
+   * resume uses the stored policy, and changing it needs a new session. */
+  permissions?: ClaudeCodePermissions;
+  /** Restore the isolated behavior (no user/project/local settings, hooks, MCP or plugins). Default: native configuration. */
+  isolateConfiguration?: boolean;
   /** `env` OVERLAYS the inherited process environment; it never replaces it. */
   nativeOptions?: ClaudeCodeWorkerBootstrap["nativeOptions"];
   /** Trusted host overrides, not user/tool-selected commands. Must obey the family contract. */
@@ -35,8 +41,8 @@ const unavailable = () => new Error("Claude Code managed operation unavailable")
 /** The only public error that stays distinguishable: callers show a "not logged in" state for it. */
 const publicError = (error: unknown) => error instanceof ClaudeCodeAuthRequiredError ? error : unavailable();
 
-/** Durable text-only controller. Native owns its loop/tools/auth. Forced recovery is explicit
- * (forceStopManaged/destroy) and absence-proven; no configuration inheritance, transcript repair, input replay or durable turn ledger. */
+/** Durable controller. Native owns its loop/tools/auth and (unless isolated) its configuration. Forced recovery is explicit
+ * (forceStopManaged/destroy) and absence-proven; no transcript repair, input replay or durable turn ledger. */
 export class ClaudeCodeManagedRuntime implements AgentRuntime {
   private readonly options: ClaudeCodeManagedRuntimeOptions;
   private readonly nativeOptions: NonNullable<ClaudeCodeManagedRuntimeOptions["nativeOptions"]>;
@@ -54,6 +60,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
         || !isAbsolute(explicit) || resolve(explicit) !== explicit || explicit.includes("\0")))
         || CLAUDE_CODE_FORBIDDEN_ENV.some(key => env[key] !== undefined)
         || (explicit !== undefined && env.CLAUDE_CONFIG_DIR !== undefined && env.CLAUDE_CONFIG_DIR !== explicit)) throw unavailable();
+      resolveClaudeCodePermissions(options.permissions); // Invalid policies fail at construction.
       this.store = new ClaudeCodeManagedStore(options.storeRoot);
       // CLAUDE_CONFIG_DIR is set for the worker only when the caller passed a root (or an explicit override).
       this.nativeOptions = { ...options.nativeOptions, env: { ...env, ...(explicit !== undefined ? { CLAUDE_CONFIG_DIR: explicit } : {}) } };
@@ -127,9 +134,10 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       // BEFORE any manifest or worker exists.
       await requireClaudeCodeAuth({ cwd, executable: this.nativeOptions.executable, env: claudeCodeNativeEnvironment(this.nativeOptions.env),
         startupTimeoutMs: this.nativeOptions.startupTimeoutMs, shutdownTimeoutMs: this.nativeOptions.shutdownTimeoutMs });
-      await this.store.create({ version: 4, runtime: "claude-code", id, ownerId, revision: 0, generation, requiresExplicitResume: false,
+      const policy = resolveClaudeCodePermissions(this.options.permissions);
+      await this.store.create({ version: 5, runtime: "claude-code", id, ownerId, revision: 0, generation, requiresExplicitResume: false,
         native: { state: "pending" }, worker: { state: "none" }, lastDispatch: { state: "none" }, launchConfig: { ...config, cwd },
-        policy: { configuration: "isolated", permissionMode: "default", nativeConfigRoot: await this.root(), tools: ["Read", "Grep", "Glob"] }, createdAt: new Date().toISOString() });
+        policy: { configuration: this.options.isolateConfiguration ? "isolated" : "native", nativeConfigRoot: await this.root(), ...policy }, createdAt: new Date().toISOString() });
       // A failed launch/readiness must not orphan the manifest or a worker: run the stop path, and drop the
       // record only once absence is proven. Otherwise it stays fenced and listed for a later forceStopManaged.
       try { return await this.launch(id); }
