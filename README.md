@@ -9,7 +9,7 @@ Runtime does not provide shared communication, durable session analytics, remote
 - `core` — normalized `AgentRuntime`, lifecycle, status, events, messages, and start configuration.
 - `pi` — Pi RPC worker, attached-TUI bridge, local registry, client, and legacy Pi CLI module.
 - `codex` — native Codex app-server adapter with managed execution, reconnect, and macOS idle suspend/exact-thread resume.
-- `claude-code` — native Claude SDK adapter with durable owner-per-call managed sessions, full tools under an explicit policy, model/skill selection, images and steering, and a standalone CLI (real-login acceptance pending; not yet in the shared adapter factory/CLI or Channels).
+- `claude-code` — native Claude SDK adapter with durable owner-per-call managed sessions, full tools under an explicit policy, model/skill selection, images and steering, and a standalone CLI (live-tested on a subscription login; available through the shared factory/CLI).
 - `runtime` — `@minu/runtime` public adapter factory and the `minu-runtime` CLI.
 
 ## Shared API and CLI
@@ -371,8 +371,9 @@ arguments.
 drives the real bundled engine (Write/Bash turns, stop/resume) against a local synthetic
 provider with dummy keys. Credential-free by default. An opt-in smoke test
 (`MINU_CLAUDE_REAL_SMOKE=1 node --test packages/claude-code/dist/test/real-smoke.test.js`)
-uses the real login and model; it has not been run. The adapter is not yet wired into
-the shared adapter factory/CLI or Channels.
+uses the real login and model; it passed on a subscription login during acceptance. The adapter is wired into the shared `createRuntime("claude-code", ...)` factory and the `minu-runtime` CLI
+(`--adapter claude-code`, `--permissions`, `--executable`, `claude-code:`-qualified ids), so projects can load Pi, Codex and
+Claude Code the same way.
 
 
 ## Contract
