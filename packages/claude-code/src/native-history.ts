@@ -172,10 +172,12 @@ export async function inspectClaudeCodeHistory(options: ClaudeCodeHistoryOptions
 
 const CHAIN = new Set(["user", "assistant", "attachment"]);
 // Non-chain records observed in the pinned engine's persisted text sessions.
-const METADATA = new Set(["queue-operation", "atis-latch", "api-request-shape", "api-request-blob", "api-request", "last-prompt", "cost-state", "mode", "tools-used"]);
+const METADATA = new Set(["queue-operation", "atis-latch", "api-request-shape", "api-request-blob", "api-request", "last-prompt", "cost-state", "mode", "tools-used", "ai-title"]);
 const ATTACHMENTS = new Set(["environment", "model", "session_context", "date", "prompt_snapshot",
   // Observed from the bundled engine in tool/agent turns (bookkeeping, never input).
   "deferred_tools_delta", "agent_listing_delta", "skill_listing", "auto_mode", "remote_session_change",
+  // Observed from the installed engine on a real subscription login (2.1.311).
+  "credential_org", "mcp_instructions_delta", "deferred_tools_record",
   // Written after Write/Edit/Bash change a tracked file (observed from the real engine).
   "edited_text_file"]);
 function opaqueBlock(block: Record<string, unknown>): void {

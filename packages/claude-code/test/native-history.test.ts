@@ -452,6 +452,21 @@ test("truncated final records and metadata-only evidence cannot certify present 
   } finally { await f.cleanup(); }
 });
 
+test("rows observed from the installed engine on a real subscription login (2.1.311) are accepted, unknown ones still fail closed", async () => {
+  const f = await fixture();
+  try {
+    const user = f.row(), kinds = ["credential_org", "mcp_instructions_delta", "deferred_tools_record"];
+    let parent = user; const attachments = kinds.map(type => { const row = { ...f.row("attachment", "", parent.uuid), attachment: { type } }; parent = row; return row; });
+    const answer = f.row("assistant", [{ type: "text", text: "alpha" }], parent.uuid); answer.message.stop_reason = "end_turn";
+    const title = { type: "ai-title", sessionId: f.id, aiTitle: "A title" };
+    const options = { ...f.options, completedInput: { nativeMessageId: user.uuid, fingerprint: createHash("sha256").update("hello").digest("hex") } };
+    await f.save([user, ...attachments, title, answer, { type: "last-prompt", sessionId: f.id, leafUuid: answer.uuid }]);
+    assert.equal((await inspectClaudeCodeHistory(options)).state, "present");
+    await f.save([user, { ...f.row("attachment", "", user.uuid), attachment: { type: "future_unknown_attachment" } }]);
+    await assert.rejects(inspectClaudeCodeHistory(f.options), rejected("unsupported_format"));
+  } finally { await f.cleanup(); }
+});
+
 test("the supported version range (>=2.1.300 <3) accepts newer minor/patch engines", async () => {
   const f = await fixture();
   try {
