@@ -331,7 +331,8 @@ export async function removeManagedSessionManifest(managedSessionId: string, own
 export async function recordManagedSessionWorkerStarted(managedSessionId: string, ownerId: string, isolatedProcessGroup = false): Promise<void> {
   let manifest = await readManagedSessionManifest(managedSessionId, ownerId);
   const deadline = Date.now() + 5_000;
-  while (manifest && manifest.workerPid === undefined && (manifest.state === "starting" || manifest.state === "resuming") && Date.now() < deadline) {
+  // Resume can expose the previous PID until the controller publishes this worker.
+  while (manifest && manifest.workerPid !== process.pid && (manifest.state === "starting" || manifest.state === "resuming") && Date.now() < deadline) {
     await delay(25);
     manifest = await readManagedSessionManifest(managedSessionId, ownerId);
   }
