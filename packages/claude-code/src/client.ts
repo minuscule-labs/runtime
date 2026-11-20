@@ -185,8 +185,10 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     let manager = this.managers.get(ownerId);
     if (!manager) {
       const { ClaudeCodeManagedRuntime } = await import("./managed-runtime.js");
-      const storeRoot = resolve(this.options.managedRoot ?? join(homedir(), ".minu", "runtime", "claude-code"));
-      await mkdir(storeRoot, { recursive: true, mode: 0o700 });
+      const requested = resolve(this.options.managedRoot ?? join(homedir(), ".minu", "runtime", "claude-code"));
+      await mkdir(requested, { recursive: true, mode: 0o700 });
+      // The store requires a canonical root; a HOME or temp dir behind a symlink (macOS /var -> /private/var) must still work.
+      const storeRoot = await realpath(requested);
       const { executable, env, startupTimeoutMs, controlTimeoutMs, shutdownTimeoutMs, turnRetentionLimit, eventBufferLimit } = this.options;
       manager = new ClaudeCodeManagedRuntime({ ownerId, storeRoot, permissions: this.options.permissions,
         isolateConfiguration: this.options.isolateConfiguration,

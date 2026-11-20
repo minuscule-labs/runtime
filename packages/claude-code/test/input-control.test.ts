@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -180,4 +180,13 @@ test("in-process capabilities() requires the same native login as managed creati
   const loggedIn = new ClaudeCodeAgentRuntime({ executable: claude, startupTimeoutMs: 5_000, shutdownTimeoutMs: 2_000,
     env: { PATH: process.env.PATH, HOME: dir, CLAUDE_CONFIG_DIR: join(dir, "config"), MINU_CLAUDE_FIXTURE_MODELS: MODELS } });
   assert.deepEqual((await loggedIn.capabilities({ cwd: dir })).models.map(m => m.id), ["default"]);
+});
+
+test("a managed root behind a symlink is canonicalized instead of refused", async t => {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "claude-root-link-")));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const real = join(dir, "real"), link = join(dir, "link"); await mkdir(real, { mode: 0o700 }); await symlink(real, link);
+  const runtime = new ClaudeCodeAgentRuntime({ managedRoot: join(link, "managed") });
+  assert.deepEqual(await runtime.listManagedSessions("owner"), []);
+  assert.ok((await lstat(join(real, "managed"))).isDirectory());
 });
