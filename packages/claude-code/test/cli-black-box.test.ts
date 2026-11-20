@@ -201,12 +201,15 @@ test("CLI black box: cancelling an event reader exits the consumer but leaves th
   phase = "waiting for the first event";
   const output = await new Promise<string>((resolve, reject) => {
     let received = "", interrupted = false;
-    const child = execFile(process.execPath, f.args("events", flags), {
+    const child = execFile(process.execPath, ["--import", new URL("./fixtures/cli-cancel-probe.js", import.meta.url).href, ...f.args("events", flags)], {
       env: f.env, timeout: 30_000, maxBuffer: 128 * 1024,
     }, (error, stdout, stderr) => {
       if (error) { reject(error); return; }
       if (!interrupted || stderr.includes(dummyKey)) { reject(new Error("Event reader did not cancel safely")); return; }
       resolve(stdout);
+    });
+    child.stderr!.on("data", chunk => {
+      for (const line of String(chunk).split("\n")) if (line.startsWith("CLI_CANCEL_PROBE ")) t.diagnostic(line);
     });
     child.once("exit", () => { phase = "consumer exited; waiting for execFile completion"; });
     child.stdin!.end();
