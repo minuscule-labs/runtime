@@ -6,14 +6,17 @@ import { encodeClaudeCodeWorkerRegistration } from "./worker-registration.js";
 
 const unavailable = () => new Error("Claude Code managed lifecycle unavailable");
 
-/** Trusted-host/pinned-family eligibility, NOT OS containment or PID attestation. */
-export function requireClaudeCodeMvpPolicy(m: ClaudeCodeManagedManifest): void {
-  if (process.platform === "win32" || m.policy.configuration !== "isolated" || m.policy.permissionMode !== "default"
+/** Trusted-host eligibility, NOT OS containment or PID attestation. v3/v4 manifests predate the permission policy and
+ * launch selections, so they keep the strict read-only MVP rules; v5 manifests carry a validated policy. */
+export function requireClaudeCodePolicy(m: ClaudeCodeManagedManifest): void {
+  if (process.platform === "win32") throw unavailable();
+  if (m.version >= 5) return;
+  if (m.policy.configuration !== "isolated" || m.policy.permissionMode !== "default"
     || !m.policy.tools || m.policy.tools.some(tool => !["Read", "Grep", "Glob"].includes(tool))
     || m.launchConfig.model !== undefined || m.launchConfig.reasoningLevel !== undefined || m.launchConfig.skillIds !== undefined) throw unavailable();
 }
 export function claudeCodeLiveWorker(m: ClaudeCodeManagedManifest, workerExecutable: string) {
-  requireClaudeCodeMvpPolicy(m);
+  requireClaudeCodePolicy(m);
   if (m.requiresExplicitResume || m.worker.state !== "live" || m.worker.generation !== m.generation
     || m.worker.workerExecutable !== workerExecutable || m.worker.registration.processGroupId !== m.worker.registration.pid) throw unavailable();
   const scope = { sessionId: m.id, ownerId: m.ownerId, generation: m.generation, reservationId: m.worker.reservationId,
@@ -21,23 +24,30 @@ export function claudeCodeLiveWorker(m: ClaudeCodeManagedManifest, workerExecuta
   return { scope, registration: m.worker.registration, bytes: encodeClaudeCodeWorkerRegistration(m.worker.registration, scope) };
 }
 
-/** Call under the session lease with no native writer. Does NOT derive settlement:
- * only an independently committed completed dispatch may request this extra check.
- * Failed/interrupted/uncertain latest inputs remain unavailable in the MVP. */
+/** Call under the session lease with no native writer (after PROVEN ABSENCE: the real engine finalizes its transcript only
+ * after exit). Does NOT derive settlement: only a committed dispatch outcome requests this check.
+ * - completed: exact input match, terminal end_turn, final leaf, drained queue (and exactly the recorded steering).
+ * - failed/interrupted: structure only. The transcript legitimately ends mid-turn, so there is no tail to match; it must still
+ *   parse (or be absent: nothing was materialized). Stop never validates total size. */
 export async function claudeCodeCleanHistory(m: ClaudeCodeManagedManifest) {
-  requireClaudeCodeMvpPolicy(m);
+  requireClaudeCodePolicy(m);
   if (m.native.state === "pending" && m.lastDispatch.state === "none") return [];
-  if (m.native.state !== "bound" || m.lastDispatch.state !== "settled" || m.lastDispatch.outcome !== "completed") throw unavailable();
-  const history = await inspectClaudeCodeHistory({ nativeSessionId: m.native.sessionId, canonicalCwd: m.launchConfig.cwd,
-    nativeConfigRoot: m.policy.nativeConfigRoot, completedInput: {
-      nativeMessageId: m.lastDispatch.nativeMessageId, fingerprint: m.lastDispatch.fingerprint,
-    } });
+  if (m.native.state !== "bound" || m.lastDispatch.state !== "settled") throw unavailable();
+  const common = { nativeSessionId: m.native.sessionId, canonicalCwd: m.launchConfig.cwd, nativeConfigRoot: m.policy.nativeConfigRoot, nativeRoot: true, acceptQueuedDeliveries: true };
+  if (m.lastDispatch.outcome !== "completed") {
+    const history = await inspectClaudeCodeHistory(common);
+    return history.state === "present" ? history.messages : [];
+  }
+  const history = await inspectClaudeCodeHistory({ ...common, completedInput: {
+    nativeMessageId: m.lastDispatch.nativeMessageId, fingerprint: m.lastDispatch.fingerprint,
+    ...(m.lastDispatch.steers ? { steers: m.lastDispatch.steers } : {}),
+  } });
   if (history.state !== "present") throw unavailable();
   return history.messages;
 }
 function cleanDispatch(m: ClaudeCodeManagedManifest): boolean {
   return m.native.state === "pending" ? m.lastDispatch.state === "none"
-    : m.native.state === "bound" && m.lastDispatch.state === "settled" && m.lastDispatch.outcome === "completed";
+    : m.native.state === "bound" && m.lastDispatch.state === "settled";
 }
 /** Signal 0 ONLY: ESRCH means absent. EPERM leaves absence unproven, allowing
  * the caller's bounded read-only wait to continue; it never authorizes clearing.
@@ -79,12 +89,17 @@ export async function suspendClaudeCodeWorker(store: ClaudeCodeManagedStore, id:
     await store.withSessionLock(id, ownerId, async lease => {
       const current = await store.read(id, ownerId); exact(current); remaining();
       if (!groupAbsent(live.registration.pid)) throw unavailable();
-      await claudeCodeCleanHistory(current!); remaining();
+      // History is only judged AFTER proven absence (the real engine finalizes on exit). Whatever it says, the worker is gone:
+      // always fence and clear so a dead worker is never left recorded as live; an ineligible history then refuses resume and
+      // fails this call.
+      let history: unknown;
+      try { await claudeCodeCleanHistory(current!); } catch (error) { history = error ?? unavailable(); }
       if (!groupAbsent(live.registration.pid)) throw unavailable();
       // Fence BEFORE clear. A lost mutation return cannot leave an automatically
       // resumable slot. Clear preserves binding/input/fence and rotates generation.
       const fenced = await lease.update(current!.revision, { requiresExplicitResume: true });
       await lease.clearWorkerAfterExit(fenced.revision, snapshot.generation, live.scope.reservationId, live.registration.pid);
+      if (history !== undefined) throw unavailable();
     }, remaining());
     remaining(); // A late committed return is uncertainty, never an on-time success.
   } catch { throw unavailable(); }

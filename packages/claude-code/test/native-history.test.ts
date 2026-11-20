@@ -133,6 +133,44 @@ for (const [name, patch, code] of invalidToolsUsed) test(`tools-used refuses ${n
   } finally { await f.cleanup(); }
 });
 
+test("a final last-prompt may name an ancestor when everything after it is the completed dispatch's own response (real-engine ordering)", async () => {
+  const f = await fixture();
+  try {
+    // Observed from the real engine: `last-prompt` and `atis-latch` land BEFORE the final assistant row and are not rewritten at exit.
+    const user = f.row(), call = f.row("assistant", [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "echo" } }], user.uuid);
+    call.message.stop_reason = "tool_use";
+    const result = f.row("user", [{ type: "tool_result", tool_use_id: "t1", content: "ok" }], call.uuid);
+    const answer = f.row("assistant", [{ type: "text", text: "tools finished" }], result.uuid); answer.message.stop_reason = "end_turn";
+    const completedInput = { nativeMessageId: user.uuid, fingerprint: createHash("sha256").update("hello").digest("hex") };
+    const last = (leafUuid: string) => ({ type: "last-prompt", sessionId: f.id, leafUuid });
+    const latch = { type: "atis-latch", sessionId: f.id };
+    // The real engine names its FINAL assistant row before writing it, so any later row of the chain is a valid leaf here too.
+    for (const leaf of [user.uuid, call.uuid, result.uuid, answer.uuid]) {
+      await f.save([user, call, last(leaf), latch, result, answer]);
+      assert.equal((await inspectClaudeCodeHistory({ ...f.options, completedInput })).state, "present", `leaf ${leaf}`);
+    }
+    for (const leaf of [user.uuid, call.uuid, result.uuid, answer.uuid]) {
+      await f.save([user, call, result, answer, last(leaf)]);
+      assert.equal((await inspectClaudeCodeHistory({ ...f.options, completedInput })).state, "present", `final leaf ${leaf}`);
+    }
+    // Still refused: a trailing hidden/visible user row, a leaf from an EARLIER turn, an unknown leaf, no last-prompt at all.
+    const earlier = f.row("user", "earlier turn"), earlierAnswer = f.row("assistant", [{ type: "text", text: "earlier" }], earlier.uuid); earlierAnswer.message.stop_reason = "end_turn";
+    const second = { ...f.row("user", "hello", earlierAnswer.uuid) }, secondAnswer = f.row("assistant", [{ type: "text", text: "done" }], second.uuid); secondAnswer.message.stop_reason = "end_turn";
+    const secondInput = { nativeMessageId: second.uuid, fingerprint: completedInput.fingerprint };
+    const cases: [string, Record<string, any>[], typeof completedInput][] = [
+      ["trailing user row", [user, call, last(call.uuid), result, answer, f.row("user", "later input", answer.uuid)], completedInput],
+      ["trailing hidden row", [user, call, last(call.uuid), result, answer, { ...f.row("user", "hidden", answer.uuid), isMeta: true }], completedInput],
+      ["leaf from an earlier turn", [earlier, earlierAnswer, second, secondAnswer, last(earlier.uuid)], secondInput],
+      ["unknown leaf", [user, call, last(randomUUID()), result, answer], completedInput],
+      ["no last-prompt", [user, call, result, answer], completedInput],
+    ];
+    for (const [name, rows, input] of cases) {
+      await f.save(rows);
+      await assert.rejects(inspectClaudeCodeHistory({ ...f.options, completedInput: input }), rejected("invalid_history"), name);
+    }
+  } finally { await f.cleanup(); }
+});
+
 test("completed-input eligibility requires the committed mapped text, terminal end_turn, final leaf and drained native queue", async () => {
   const f = await fixture();
   try {
@@ -332,6 +370,22 @@ for (const which of ["file", "project", "projects", "config"]) {
   });
 }
 
+for (const which of ["file", "project", "projects", "config"]) {
+  test(`native roots accept a world-readable ${which} but still refuse group/other writable ones`, async () => {
+    const f = await fixture();
+    try {
+      await f.save();
+      const path = which === "file" ? f.path : which === "project" ? f.project : which === "projects" ? join(f.config, "projects") : f.config;
+      const native = { ...f.options, nativeRoot: true };
+      await chmod(path, which === "file" ? 0o644 : 0o755);
+      assert.equal((await inspectClaudeCodeHistory(native)).state, "present");
+      await assert.rejects(inspectClaudeCodeHistory(f.options), rejected("unsafe_file"), "private mode still refuses it");
+      await chmod(path, which === "file" ? 0o664 : 0o775);
+      await assert.rejects(inspectClaudeCodeHistory(native), rejected("unsafe_file"));
+    } finally { await f.cleanup(); }
+  });
+}
+
 test("hardlinks and nonregular transcript paths are refused", async () => {
   const f = await fixture();
   try {
@@ -364,7 +418,9 @@ const mutations: [string, (f: Awaited<ReturnType<typeof fixture>>) => Record<str
   ["bad reasoning", f => [f.row("assistant", [{ type: "thinking", thinking: 42 }])], "invalid_history"],
   ["orphan tool result", f => [f.row("user", [{ type: "tool_result", tool_use_id: "absent", content: "no" }])], "invalid_history"],
   ["bad tool input", f => [f.row("assistant", [{ type: "tool_use", id: "tool", name: "Read", input: "no" }])], "invalid_history"],
-  ["unsupported version", f => [{ ...f.row(), version: "2.2.0" }], "unsupported_format"],
+  ["unsupported version (major)", f => [{ ...f.row(), version: "3.0.0" }], "unsupported_format"],
+  ["unsupported version (below range)", f => [{ ...f.row(), version: "2.1.299" }], "unsupported_format"],
+  ["malformed version", f => [{ ...f.row(), version: "latest" }], "unsupported_format"],
   ["compaction", f => [f.row(), { type: "system", subtype: "compact_boundary", sessionId: f.id }], "unsupported_format"],
   ["unknown record", f => [f.row(), { type: "future-record", sessionId: f.id }], "unsupported_format"],
   ["wrong last-prompt leaf", f => [f.row(), { type: "last-prompt", sessionId: f.id, leafUuid: randomUUID() }], "invalid_history"],
@@ -396,6 +452,31 @@ test("truncated final records and metadata-only evidence cannot certify present 
   } finally { await f.cleanup(); }
 });
 
+test("rows observed from the installed engine on a real subscription login (2.1.311) are accepted, unknown ones still fail closed", async () => {
+  const f = await fixture();
+  try {
+    const user = f.row(), kinds = ["credential_org", "mcp_instructions_delta", "deferred_tools_record"];
+    let parent = user; const attachments = kinds.map(type => { const row = { ...f.row("attachment", "", parent.uuid), attachment: { type } }; parent = row; return row; });
+    const answer = f.row("assistant", [{ type: "text", text: "alpha" }], parent.uuid); answer.message.stop_reason = "end_turn";
+    const title = { type: "ai-title", sessionId: f.id, aiTitle: "A title" };
+    const options = { ...f.options, completedInput: { nativeMessageId: user.uuid, fingerprint: createHash("sha256").update("hello").digest("hex") } };
+    await f.save([user, ...attachments, title, answer, { type: "last-prompt", sessionId: f.id, leafUuid: answer.uuid }]);
+    assert.equal((await inspectClaudeCodeHistory(options)).state, "present");
+    await f.save([user, { ...f.row("attachment", "", user.uuid), attachment: { type: "future_unknown_attachment" } }]);
+    await assert.rejects(inspectClaudeCodeHistory(f.options), rejected("unsupported_format"));
+  } finally { await f.cleanup(); }
+});
+
+test("the supported version range (>=2.1.300 <3) accepts newer minor/patch engines", async () => {
+  const f = await fixture();
+  try {
+    for (const version of ["2.1.300", "2.1.321", "2.1.999", "2.2.0", "2.9.4"]) {
+      await f.save([{ ...f.row(), version }]);
+      assert.equal((await inspectClaudeCodeHistory(f.options)).state, "present", version);
+    }
+  } finally { await f.cleanup(); }
+});
+
 test("normalization excludes private metadata, hidden prompts, image bytes, reasoning and synthetic fillers", async () => {
   const f = await fixture();
   try {
@@ -409,7 +490,7 @@ test("normalization excludes private metadata, hidden prompts, image bytes, reas
     const result = await inspectClaudeCodeHistory(f.options);
     assert.equal(result.state, "present");
     if (result.state !== "present") return;
-    assert.deepEqual(result.messages.map(m => [m.role, m.content]), [["user", "visible"], ["assistant", "answer"], ["tool", "tool text"]]);
+    assert.deepEqual(result.messages.map(m => [m.role, m.content]), [["user", "visible\n[image]"], ["assistant", "answer"], ["tool", "tool text\n[image]"]]);
     assert.equal(result.messages[2].toolName, "Read");
     assert.doesNotMatch(JSON.stringify(result), /PRIVATE_|No response requested|sessionId|cwd/);
   } finally { await f.cleanup(); }

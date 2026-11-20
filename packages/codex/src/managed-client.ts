@@ -3,7 +3,8 @@ import type { AgentEvent, AgentStartConfig, AgentStatus, AgentTurn, ManagedAgent
 import { SESSION_PROFILE_LIMITS, SESSION_EVENTS_LIMITS, sessionProfile, sessionEvents } from "@minu/runtime-core";
 import { diagnosticAvailable, openCodexDiagnostic } from "./diagnostic.js";
 import { CodexAgentRuntime, type CodexAgentRuntimeOptions } from "./client.js";
-import { CodexManagedStore, codexManagedRoot, codexResumeEligible, sameCodexHistory } from "./managed-store.js";
+import { CodexManagedStore, codexManagedRoot, codexResumeEligible, codexResumeEpoch, sameCodexHistory } from "./managed-store.js";
+import { recoverCodexWorker } from "./worker-recovery.js";
 import { createPendingCodexSession } from "./managed-native.js";
 import { launchOrReconnectCodexWorker, reconnectCodexWorker, finalizeCodexWorkerRetirement } from "./managed-worker.js";
 import { CodexWorkerClient, type CodexWorkerMethod } from "./worker-client.js";
@@ -92,14 +93,25 @@ export class CodexManagedClient {
     } finally { release(); }
   }
 
-  async resume(id: string, ownerId: string): Promise<ManagedAgentSession> {
+  async resume(id: string, ownerId: string, allowStopped = false): Promise<ManagedAgentSession> {
     const release = this.begin(id, ownerId);
     try {
       let manifest;
       try { manifest = await this.store.read(id, ownerId); }
       catch { throw new Error("Codex managed resume material is unavailable or unsafe"); }
-      if (!manifest || manifest.requiresExplicitResume) throw new Error("Codex managed session is unavailable or fenced");
       if (this.suspending.has(id) || this.destroying.has(id)) throw new Error("Codex lifecycle operation is pending");
+      // A force-stopped slot (fenced, worker none) relaunches only on explicit request and only where a fresh launch
+      // is already permitted: native never started, or a verified resume epoch. Anything else stays fenced.
+      if (allowStopped && manifest?.requiresExplicitResume && manifest.worker.state === "none"
+        && (manifest.native.state === "pending" || codexResumeEpoch(manifest))) {
+        const expected = manifest;
+        manifest = await this.store.withSessionLock(id, ownerId, async lease => {
+          const current = await this.store.read(id, ownerId);
+          if (!current || current.revision !== expected.revision || current.generation !== expected.generation) throw new Error("Codex resume authority changed");
+          return lease.update(current.revision, { requiresExplicitResume: false });
+        });
+      }
+      if (!manifest || manifest.requiresExplicitResume) throw new Error("Codex managed session is unavailable or fenced");
       if (manifest.worker.state === "retired") {
         if (process.platform !== "darwin" || !codexResumeEligible(manifest)) throw new Error("Codex clean cold resume is unavailable");
         const expected = manifest;
@@ -117,13 +129,14 @@ export class CodexManagedClient {
     } finally { release(); }
   }
 
-  async inventory(ownerId: string): Promise<ManagedSessionSummary[]> {
+  async inventory(ownerId: string, only?: string): Promise<ManagedSessionSummary[]> {
     try {
-      const manifests = await this.store.list(ownerId);
+      const manifests = only === undefined ? await this.store.list(ownerId) : [await this.store.read(only, ownerId)].filter(m => m !== undefined);
       const summaries: ManagedSessionSummary[] = [];
       for (const manifest of manifests) {
         let state: ManagedSessionSummary["state"] = "unavailable";
         if (process.platform === "darwin" && codexResumeEligible(manifest)) state = "suspended";
+        else if (manifest.requiresExplicitResume && manifest.worker.state === "none") state = "suspended"; // Force-stopped.
         else if (!manifest.requiresExplicitResume && manifest.native.state === "pending" && manifest.worker.state === "none") state = "suspended";
         else if (!manifest.requiresExplicitResume && manifest.worker.state === "ready") {
           let connection: CodexWorkerConnection | undefined;
@@ -208,6 +221,16 @@ export class CodexManagedClient {
     } catch { throw new Error("Codex local diagnostic is unavailable"); }
   }
 
+  /** Fence, one admission-bypassing stop, then absence proof or verified termination. Never clears on uncertainty. */
+  async forceStop(id: string, ownerId: string): Promise<void> {
+    const release = this.begin(id, ownerId);
+    try {
+      if (await recoverCodexWorker(this.store, id, ownerId) === "missing") throw new Error("Codex managed session is unavailable");
+      const bound = this.bindings.get(id); if (bound?.ownerId === ownerId) bound.stopped = true;
+    } catch { throw new Error("Codex managed force-stop is unavailable or uncertain"); }
+    finally { release(); }
+  }
+
   async destroy(id: string, ownerId: string): Promise<void> {
     const pending = this.destroying.get(id);
     if (pending) {
@@ -217,17 +240,26 @@ export class CodexManagedClient {
     const release = this.begin(id, ownerId);
     const result = Promise.resolve().then(async () => {
       const addressed = await this.store.read(id, ownerId);
-      if (!addressed || addressed.requiresExplicitResume) throw new Error("Codex destruction material is unavailable");
-      const neverStarted = addressed.worker.state === "none" && addressed.native.state === "pending";
-      if (!neverStarted && !codexResumeEligible(addressed)) await this.suspend(id, ownerId, addressed.generation);
+      if (!addressed) throw new Error("Codex destruction material is unavailable");
+      const neverStarted = addressed.worker.state === "none" && addressed.native.state === "pending" && !addressed.requiresExplicitResume;
+      // Prefer the clean idle retirement (keeps verified history) where it exists; its failure is not an error.
+      if (!neverStarted && !addressed.requiresExplicitResume && addressed.worker.state === "ready") await this.suspend(id, ownerId, addressed.generation).catch(() => {});
       const expected = await this.store.read(id, ownerId);
       if (!expected || expected.generation !== addressed.generation) throw new Error("Codex destruction authority changed");
-      await this.store.withSessionLock(id, ownerId, async lease => {
-        const current = await this.store.read(id, ownerId);
-        if (!current || current.generation !== addressed.generation || current.revision !== expected.revision) throw new Error("Codex destruction is stale");
-        await lease.removeResumeMetadata(current.revision);
-        if (await this.store.read(id, ownerId)) throw new Error("Codex destruction readback is uncertain");
-      });
+      // An unfenced none slot with a bound thread may still have an unregistered (legacy) worker: refuse it.
+      if (expected.worker.state === "none" && !expected.requiresExplicitResume && expected.native.state !== "pending") throw new Error("Codex destruction material is uncertain");
+      // Absence is proven (or the slot is already none/retired) before the resume metadata goes; history stays.
+      if (expected.worker.state !== "none" && expected.worker.state !== "retired") {
+        if (await recoverCodexWorker(this.store, id, ownerId, { remove: true }) !== "removed") throw new Error("Codex destruction is uncertain");
+      } else {
+        await this.store.withSessionLock(id, ownerId, async lease => {
+          const current = await this.store.read(id, ownerId);
+          if (!current || current.generation !== addressed.generation || current.revision !== expected.revision) throw new Error("Codex destruction is stale");
+          if (current.worker.state === "retired" || current.requiresExplicitResume) await lease.removeStoppedSession(current.revision);
+          else await lease.removeResumeMetadata(current.revision);
+        });
+      }
+      if (await this.store.read(id, ownerId)) throw new Error("Codex destruction readback is uncertain");
       if (this.bindings.get(id)?.ownerId === ownerId) this.bindings.delete(id);
     }).catch(() => { throw new Error("Codex managed destruction is unavailable or uncertain"); });
     this.destroying.set(id, { ownerId, result });

@@ -2,7 +2,9 @@ import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
+import { readBootIdentity, readProcessGroup } from "@minu/runtime-core";
 import { fileURLToPath } from "node:url";
+import { claudeCodeNativeEnvironment } from "./native-config.js";
 import { ClaudeCodeManagedStore } from "./managed-store.js";
 import { decodeClaudeCodeWorkerBootstrap, type ClaudeCodeWorkerBootstrap } from "./worker-entry.js";
 import {
@@ -64,14 +66,18 @@ export async function launchClaudeCodeWorker(options: ClaudeCodeWorkerLaunchOpti
       const frame = JSON.stringify({ version: 1, type: "bootstrap", scope: expected, storeRoot, nativeOptions, publicationTimeoutMs });
       const validated = decodeClaudeCodeWorkerBootstrap(frame); // Before reservation/fork, including size/env/options validation.
       scope = expected;
-      manifest = await lease.reserveWorker(manifest.revision, expected.generation, expected.reservationId, workerExecutable);
+      // Boot identity is recorded before fork so even a process-less starting record can later be cleared by a reboot.
+      const bootIdentity = await readBootIdentity();
+      manifest = await lease.reserveWorker(manifest.revision, expected.generation, expected.reservationId, workerExecutable,
+        bootIdentity ? { bootIdentity } : {});
       manifest = await lease.beginWorkerStart(manifest.revision, expected.generation, expected.reservationId);
       const end = performance.now() + timeout;
-      // Only startup essentials enter the worker environment. Provider auth/config
-      // remains in the private frame; never inherit process.env or Node preloads.
-      const env: NodeJS.ProcessEnv = { CLAUDE_CONFIG_DIR: expected.nativeConfigRoot };
-      for (const key of ["PATH", "HOME", "TMPDIR"]) if (validated.nativeOptions.env[key] !== undefined) env[key] = validated.nativeOptions.env[key];
-      child = fork(workerExecutable, [], { cwd: expected.cwd, execPath: nodeExecutable, execArgv: [], env,
+      // The worker INHERITS this process's environment (HOME is needed for keychain access) overlaid by the private
+      // frame's overrides; Node preloads and the identity-breaking Claude keys are always dropped. Secrets stay out of argv/metadata.
+      const env = claudeCodeNativeEnvironment(validated.nativeOptions.env);
+      // Exact identity markers let a later controller verify the command line before any group signal.
+      const markers = ["--minu-runtime-session", sessionId, "--minu-runtime-owner", ownerId, "--minu-runtime-generation", expected.generation];
+      child = fork(workerExecutable, markers, { cwd: expected.cwd, execPath: nodeExecutable, execArgv: [], env,
         detached: true, stdio: ["pipe", "ignore", "ignore", "ipc"] });
       const known = child;
       let required = false, bootstrapped = false, candidate: string | undefined, failed = false;
@@ -93,7 +99,11 @@ export async function launchClaudeCodeWorker(options: ClaudeCodeWorkerLaunchOpti
         while (true) { eligible(); if (done()) return; await delay(Math.min(10, Math.max(1, end - performance.now()))); }
       };
       if (known.pid === undefined) throw unavailable(); // starting/no PID remains uncertain; never release/reset.
-      manifest = await lease.recordWorkerProcess(manifest.revision, expected.generation, expected.reservationId, known.pid, known.pid);
+      // ps must confirm the fork leads its own group before it is recorded; otherwise record no group (never
+      // eligible for signals), send no bootstrap and let the worker's bootstrap deadline end it.
+      const ownGroup = await readProcessGroup(known.pid) === known.pid;
+      manifest = await lease.recordWorkerProcess(manifest.revision, expected.generation, expected.reservationId, known.pid, ownGroup ? known.pid : null);
+      if (!ownGroup) throw unavailable();
       await wait(() => required);
       let sent = false; bootstrapped = true;
       known.send(frame, error => { if (error) failed = true; sent = true; });

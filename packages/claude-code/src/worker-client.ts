@@ -4,7 +4,7 @@ import type {
   AgentEvent, AgentStatus, AgentTurn, RuntimeActivityEvent, RuntimeImageContent,
   RuntimeInputCapabilities, RuntimeMessage, RuntimeSessionCapabilities,
 } from "@minu/runtime-core";
-import { runtimeInput } from "@minu/runtime-core";
+import { runtimeInput, sessionEvents, sessionIntegrations, sessionProfile, type RuntimeIntegrationSnapshot, type RuntimeSessionEvents, type RuntimeSessionProfile } from "@minu/runtime-core";
 import {
   CLAUDE_WORKER_LIMITS as LIMITS, ClaudeCodeWorkerError, turnId, unseal,
   workerAcknowledgment, workerActivity, workerCapabilities, workerEvent, workerIdentity, workerMessage, workerStatus, workerToken, workerTurn,
@@ -105,6 +105,9 @@ export class ClaudeCodeWorkerClient {
     if (!value || value.version !== 1 || typeof value.images !== "boolean") throw new ClaudeCodeWorkerError("invalid_response");
     return { version: 1, images: value.images };
   }
+  async inspectProfile(signal?: AbortSignal): Promise<RuntimeSessionProfile> { return sessionProfile(await this.request("/session-profile", undefined, signal)); }
+  async inspectEvents(signal?: AbortSignal): Promise<RuntimeSessionEvents> { return sessionEvents(await this.request("/session-events", undefined, signal)); }
+  async inspectIntegrations(signal?: AbortSignal): Promise<RuntimeIntegrationSnapshot> { return sessionIntegrations(await this.request("/session-integrations", undefined, signal)); }
   async sessionCapabilities(signal?: AbortSignal): Promise<RuntimeSessionCapabilities | null> {
     return workerCapabilities(await this.request("/capabilities", undefined, signal));
   }
@@ -122,6 +125,9 @@ export class ClaudeCodeWorkerClient {
   async requestQuiesceIdle(signal?: AbortSignal): Promise<void> { workerAcknowledgment(await this.request("/quiesce-idle", {}, signal)); }
   /** Authenticated native-stop acknowledgment, NOT independent confirmation of worker/group exit. */
   async requestStop(signal?: AbortSignal): Promise<void> { workerAcknowledgment(await this.request("/stop", {}, signal)); }
+  /** Adapter-private recovery stop: bypasses idle/busy admission (not authentication). One best-effort
+   * request; the worker then tears down its native family and exits. Never proof of exit. */
+  async requestForceStop(signal?: AbortSignal): Promise<void> { workerAcknowledgment(await this.request("/force-stop", {}, signal)); }
   events(signal: AbortSignal): AsyncIterable<AgentEvent> { return this.stream("/events", signal) as AsyncIterable<AgentEvent>; }
   activityEvents(signal: AbortSignal): AsyncIterable<RuntimeActivityEvent> { return this.stream("/activity", signal, true) as AsyncIterable<RuntimeActivityEvent>; }
 

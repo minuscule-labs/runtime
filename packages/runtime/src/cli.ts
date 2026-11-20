@@ -1,12 +1,21 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
 import { open } from "node:fs/promises";
-import { constants } from "node:fs";
-import { extname, resolve } from "node:path";
-import { createRuntime, runtimeReference, CodexAgentRuntime, runtimeInput, RUNTIME_INPUT_LIMITS,
+import { constants, realpathSync } from "node:fs";
+import { basename, dirname, extname, resolve } from "node:path";
+import { createRuntime, runtimeReference, CodexAgentRuntime, ClaudeCodeAgentRuntime, runtimeInput, RUNTIME_INPUT_LIMITS,
   type AgentRuntime, type AgentStartConfig, type AgentEvent, type RuntimeAdapterId, type RuntimeImageContent } from "./index.js";
 import { listRegistrations, readRegistration } from "@minu/runtime-pi";
 
+/** Canonical path even when the leaf does not exist yet: the managed store requires a real, non-symlinked root. */
+export function canonicalRoot(path: string): string {
+  const absolute = resolve(path);
+  try { return realpathSync(absolute); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(absolute) === absolute) throw error;
+    return resolve(canonicalRoot(dirname(absolute)), basename(absolute));
+  }
+}
 function render(event: AgentEvent): void {
   if (event.type === "message_delta") process.stdout.write(event.delta);
   else if (event.type === "tool_started") console.log(`\n[tool] ${event.toolName}`);
@@ -47,25 +56,36 @@ async function follow(runtime: AgentRuntime, id: string, input: string, pixels: 
 /** No parsing or adapter construction occurs when this module is imported. */
 export function createRuntimeProgram(): Command {
   const program = new Command().name("minu-runtime").description("Manage native Runtime sessions").showHelpAfterError()
-    .addOption(new Option("--adapter <adapter>").choices(["pi", "codex"]))
-    .option("--owner <owner-id>").option("--managed-root <path>");
+    .addOption(new Option("--adapter <adapter>").choices(["pi", "codex", "claude-code"]))
+    .option("--owner <owner-id>").option("--managed-root <path>")
+    .addOption(new Option("--permissions <mode>", "claude-code tool policy (default full)").choices(["full", "edits", "readOnly"]))
+    .option("--executable <path>", "claude-code executable: a path, or \"bundled\" for the SDK engine (default: installed claude on PATH)");
   const runtimes = new Map<RuntimeAdapterId, AgentRuntime>();
   const select = (reference?: string) => {
-    const options = program.opts<{ adapter?: RuntimeAdapterId; owner?: string; managedRoot?: string }>();
+    const options = program.opts<{ adapter?: RuntimeAdapterId; owner?: string; managedRoot?: string; permissions?: "full" | "edits" | "readOnly"; executable?: string }>();
     const { adapter, id } = runtimeReference(reference ?? "", options.adapter);
-    if (options.managedRoot && adapter !== "codex") throw new Error("--managed-root requires Codex");
+    if (options.managedRoot && adapter === "pi") throw new Error("--managed-root requires Codex or Claude Code");
+    if ((options.permissions || options.executable) && adapter !== "claude-code") throw new Error("--permissions and --executable require Claude Code");
     let runtime = runtimes.get(adapter);
-    if (!runtime) { runtime = adapter === "codex" ? createRuntime("codex", { managedRoot: options.managedRoot ? resolve(options.managedRoot) : undefined }) : createRuntime("pi"); runtimes.set(adapter, runtime); }
+    if (!runtime) {
+      const managedRoot = options.managedRoot ? canonicalRoot(options.managedRoot) : undefined;
+      runtime = adapter === "codex" ? createRuntime("codex", { managedRoot })
+        : adapter === "claude-code" ? createRuntime("claude-code", { permissions: options.permissions ?? "full", ...(managedRoot ? { managedRoot } : {}), ...(options.executable ? { executable: options.executable } : {}) })
+          : createRuntime("pi");
+      runtimes.set(adapter, runtime);
+    }
     return { adapter, id, runtime, owner: options.owner };
   };
   const owner = (value: string | undefined) => { if (!value) throw new Error("An explicit --owner is required"); return value; };
   const connected = async (reference: string) => {
     const value = select(reference);
     if (value.adapter === "codex") await (value.runtime as CodexAgentRuntime).connectManaged(value.id, owner(value.owner));
+    // Reconnect only: without allowStopped this attaches to a living worker and never relaunches a stopped session.
+    else if (value.adapter === "claude-code") await (value.runtime as ClaudeCodeAgentRuntime).resume(value.id, owner(value.owner));
     else if (value.owner && (await readRegistration(value.id))?.ownerId !== value.owner) throw new Error("Session is unavailable for this owner");
     return value;
   };
-  const qualified = (adapter: RuntimeAdapterId, id: string) => adapter === "codex" ? `codex:${id}` : id;
+  const qualified = (adapter: RuntimeAdapterId, id: string) => adapter === "pi" ? id : `${adapter}:${id}`;
   const config = (options: { cwd?: string; systemPrompt?: string; appendSystemPrompt?: string; model?: string; modelProvider?: string; reasoning?: AgentStartConfig["reasoningLevel"]; skill?: string[]; skills?: boolean }): AgentStartConfig => {
     if ((options.model === undefined) !== (options.modelProvider === undefined)) throw new Error("--model and --model-provider must be supplied together");
     return { ...(options.cwd !== undefined ? { cwd: options.cwd } : {}), ...(options.systemPrompt !== undefined ? { systemPrompt: options.systemPrompt } : {}),
@@ -81,12 +101,12 @@ export function createRuntimeProgram(): Command {
     .option("--skill <id...>").addOption(new Option("--no-skills").conflicts("skill"))
     .action(async options => {
       const value = select(); const launch = config(options);
-      const session = value.adapter === "codex" || value.owner ? await value.runtime.startManaged!(launch, owner(value.owner)) : await value.runtime.start(launch);
+      const session = value.adapter !== "pi" || value.owner ? await value.runtime.startManaged!(launch, owner(value.owner)) : await value.runtime.start(launch);
       console.log(`${qualified(value.adapter, session.id)}\t${session.ownership}\t${session.cwd}`);
     });
   program.command("sessions").action(async () => {
     const value = select();
-    if (value.adapter === "codex" || value.owner) {
+    if (value.adapter !== "pi" || value.owner) {
       for (const session of await value.runtime.listManagedSessions!(owner(value.owner))) console.log(`${qualified(value.adapter, session.id)}\t${session.state}\towned`);
     } else {
       const sessions = await listRegistrations(); if (!sessions.length) console.log("No online Pi sessions.");
@@ -95,7 +115,8 @@ export function createRuntimeProgram(): Command {
   });
   for (const method of ["resume", "suspend", "destroy"] as const) program.command(method).argument("<session-id>").action(async reference => {
     const value = select(reference), scopedOwner = owner(value.owner);
-    if (method === "resume") { const session = await value.runtime.resume!(value.id, scopedOwner); console.log(`${qualified(value.adapter, session.id)}\t${session.ownership}\t${session.cwd}`); }
+    if (method === "resume") { // The command itself is the explicit request, so a deliberately stopped session may be resumed.
+      const session = await value.runtime.resume!(value.id, scopedOwner, { allowStopped: true }); console.log(`${qualified(value.adapter, session.id)}\t${session.ownership}\t${session.cwd}`); }
     else { await value.runtime[method]!(value.id, scopedOwner); console.log(`${qualified(value.adapter, value.id)} ${method === "suspend" ? "suspended" : "destroyed"}.`); }
   });
   program.command("capabilities").option("--cwd <path>").action(async options => console.log(JSON.stringify(await select().runtime.capabilities!({ cwd: options.cwd }))));
@@ -103,7 +124,7 @@ export function createRuntimeProgram(): Command {
   program.command("send").option("--follow").option("--image <path>", "image file", (path: string, previous: string[]) => [...previous, path], []).argument("<session-id>").argument("[message...]").action(async (reference: string, message: string[], options) => {
     const content = runtimeInput(message.join(" "), await images(options.image)); const value = await connected(reference);
     if (options.follow) await follow(value.runtime, value.id, content.input, content.images);
-    else { console.log(`Sending to ${qualified(value.adapter, value.id)}; waiting for ${value.adapter === "pi" ? "Pi" : "Codex"} to settle...`);
+    else { console.log(`Sending to ${qualified(value.adapter, value.id)}; waiting for ${value.adapter === "pi" ? "Pi" : value.adapter === "codex" ? "Codex" : "Claude Code"} to settle...`);
       await value.runtime.send(value.id, content.input, content.images.length ? content.images : undefined); console.log(value.adapter === "pi" ? `${value.id} is idle.` : `${qualified(value.adapter, value.id)} turn completed.`); }
   });
   program.command("start-turn").option("--image <path>", "image file", (path: string, previous: string[]) => [...previous, path], []).argument("<session-id>").argument("<turn-id>").argument("[message...]").action(async (reference: string, turnId: string, message: string[], options) => {

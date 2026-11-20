@@ -482,3 +482,70 @@ test("local timeouts and ASCII case aliases cannot release a holder or permit a 
     if (child.connected) child.send("release");
   }
 });
+
+const RESERVATION = "11111111-2222-4333-8444-555555555555", BOOT = "linux:0123456789abcdef0123456789abcdef";
+async function started(f: Awaited<ReturnType<typeof fixture>>, launch?: { bootIdentity?: string }, group: number | null = 4242) {
+  await f.store.create({ ...f.manifest, version: 4 });
+  return f.store.withSessionLock(f.manifest.id, f.manifest.ownerId, async lease => {
+    let m = await lease.reserveWorker(0, "generation-a", RESERVATION, join(f.directory, "entry.js"), launch);
+    m = await lease.beginWorkerStart(m.revision, "generation-a", RESERVATION);
+    return lease.recordWorkerProcess(m.revision, "generation-a", RESERVATION, 4242, group);
+  });
+}
+
+test("v4 launch identity is recorded on the worker; v3 manifests stay readable and cannot carry it", async t => {
+  const f = await fixture(t);
+  const m = await started(f, { bootIdentity: BOOT });
+  assert.equal(m.version, 4);
+  assert.deepEqual([m.worker.state === "starting" && m.worker.marked, m.worker.state === "starting" && m.worker.bootIdentity], [true, BOOT]);
+  assert.deepEqual(await new ClaudeCodeManagedStore(f.root).read(f.manifest.id, f.manifest.ownerId), m);
+  const g = await fixture(t); // a version 3 record with no identity still reads and reserves as before
+  await g.store.create(g.manifest);
+  assert.equal((await g.store.read(g.manifest.id, g.manifest.ownerId))!.version, 3);
+  const bytes = JSON.parse(await readFile(f.path, "utf8"));
+  bytes.version = 3; await writeFile(f.path, JSON.stringify(bytes) + "\n", { mode: 0o600 });
+  await assert.rejects(f.store.read(f.manifest.id, f.manifest.ownerId), "v3 cannot carry launch identity");
+});
+
+test("a launch without readable boot identity records marked but no boot proof", async t => {
+  const f = await fixture(t), m = await started(f, {});
+  assert.equal(m.worker.state === "starting" && m.worker.marked, true);
+  assert.equal(m.worker.state === "starting" && m.worker.bootIdentity, undefined);
+});
+
+test("forceClearWorker requires the fence and a coherent proof, keeps binding and dispatch, and rotates the generation", async t => {
+  const f = await fixture(t), m = await started(f, { bootIdentity: BOOT });
+  await f.store.withSessionLock(f.manifest.id, f.manifest.ownerId, async lease => {
+    await assert.rejects(lease.forceClearWorker(m.revision, "generation-a", RESERVATION, "group"), ClaudeCodeManifestConflictError, "unfenced");
+    const fenced = await lease.update(m.revision, { requiresExplicitResume: true });
+    await assert.rejects(lease.forceClearWorker(fenced.revision, "generation-a", RESERVATION, "unstarted"), ClaudeCodeManifestConflictError, "started worker");
+    await assert.rejects(lease.forceClearWorker(fenced.revision, "generation-a", "99999999-2222-4333-8444-555555555555", "group"), ClaudeCodeManifestConflictError);
+    const cleared = await lease.forceClearWorker(fenced.revision, "generation-a", RESERVATION, "group");
+    assert.deepEqual(cleared.worker, { state: "none" }); assert.equal(cleared.requiresExplicitResume, true);
+    assert.notEqual(cleared.generation, "generation-a"); assert.deepEqual(cleared.native, m.native); assert.deepEqual(cleared.lastDispatch, m.lastDispatch);
+  });
+});
+
+test("forceClearWorker proofs must match the record: no group for group proof, no boot identity for boot proof", async t => {
+  const f = await fixture(t), m = await started(f, {}, null);
+  await f.store.withSessionLock(f.manifest.id, f.manifest.ownerId, async lease => {
+    const fenced = await lease.update(m.revision, { requiresExplicitResume: true });
+    await assert.rejects(lease.forceClearWorker(fenced.revision, "generation-a", RESERVATION, "group"), ClaudeCodeManifestConflictError);
+    await assert.rejects(lease.forceClearWorker(fenced.revision, "generation-a", RESERVATION, "boot"), ClaudeCodeManifestConflictError);
+  });
+  const g = await fixture(t), n = await started(g, { bootIdentity: BOOT }, null);
+  await g.store.withSessionLock(g.manifest.id, g.manifest.ownerId, async lease => {
+    const fenced = await lease.update(n.revision, { requiresExplicitResume: true });
+    assert.equal((await lease.forceClearWorker(fenced.revision, "generation-a", RESERVATION, "boot")).worker.state, "none");
+  });
+});
+
+test("a reserved slot that never forked clears with the unstarted proof", async t => {
+  const f = await fixture(t);
+  await f.store.create({ ...f.manifest, version: 4 });
+  await f.store.withSessionLock(f.manifest.id, f.manifest.ownerId, async lease => {
+    const m = await lease.reserveWorker(0, "generation-a", RESERVATION, join(f.directory, "entry.js"), {});
+    const fenced = await lease.update(m.revision, { requiresExplicitResume: true });
+    assert.equal((await lease.forceClearWorker(fenced.revision, "generation-a", RESERVATION, "unstarted")).worker.state, "none");
+  });
+});

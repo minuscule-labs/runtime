@@ -1,4 +1,5 @@
 import { fork, type ChildProcess } from "node:child_process";
+import { readBootIdentity, readProcessGroup } from "@minu/runtime-core";
 import { randomUUID } from "node:crypto";
 import type { CodexAgentRuntimeOptions } from "./client.js";
 import type { CodexManagedIdentity } from "./managed-native.js";
@@ -183,12 +184,19 @@ export async function launchOrReconnectCodexWorker(
   let ready: Promise<ReadyReport> | undefined;
   let launcherObservation: DarwinProcessDomainObservation | undefined;
   const reserveAndFork = async (lease: CodexManifestLease, revision: number) => {
-    const reserved = await lease.reserveWorker(revision, claimId);
-    child = fork(new URL("./owned-worker.js", import.meta.url), [], { stdio: ["ignore", "ignore", "ignore", "ipc"], execArgv: [] });
+    // Boot identity is recorded before fork so a reboot can later prove even a pid-less reservation gone.
+    const bootIdentity = await readBootIdentity();
+    const reserved = await lease.reserveWorker(revision, claimId, bootIdentity ? { bootIdentity } : {});
+    // Own group + exact argv identity markers: the only workers a later controller may ever signal.
+    child = fork(new URL("./owned-worker.js", import.meta.url), ["--minu-runtime-session", identity.id, "--minu-runtime-owner", identity.ownerId,
+      "--minu-runtime-generation", identity.generation], { stdio: ["ignore", "ignore", "ignore", "ipc"], execArgv: [], detached: true });
     ready = awaitReady(child, timeoutMs);
     void ready.catch(() => {});
     if (!child.pid) throw new Error("Codex worker has no verified launch PID");
-    await lease.recordWorkerPid(reserved.revision, claimId, child.pid);
+    // ps must confirm the group before it is recorded; otherwise record none (legacy, never signalled) and fail.
+    const ownGroup = process.platform !== "win32" && await readProcessGroup(child.pid) === child.pid;
+    await lease.recordWorkerPid(reserved.revision, claimId, child.pid, ownGroup ? child.pid : undefined);
+    if (!ownGroup) throw new Error("Codex worker process group could not be verified");
     return false;
   };
   try {

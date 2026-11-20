@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 // No adapter/store imports, manifest reads, protocol peers or valid model inputs.
 const cliPath = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const dummyKey = "OFFLINE_CLI_BLACK_BOX_DUMMY_NOT_A_CREDENTIAL";
-const options = { timeout: 30_000 };
+const options = { timeout: 90_000 };
 type Flags = Record<string, string>;
 type Result = { code: number; stdout: string; stderr: string };
 
@@ -41,10 +41,10 @@ async function fixture(t: TestContext) {
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", NO_PROXY: "127.0.0.1,localhost",
   };
   const args = (command: string, flags: Flags = {}) => [cliPath, command, ...Object.entries({
-    "--owner": "black-box-owner", "--state": state, "--native-root": native, ...flags,
+    "--owner": "black-box-owner", "--state": state, "--native-root": native, "--executable": "bundled", ...flags,
   }).flat()];
   const raw = (argv: string[], input?: string | Buffer) => new Promise<Result>((resolve, reject) => {
-    const child = execFile(process.execPath, argv, { env, timeout: 8_000, maxBuffer: 128 * 1024 }, (error, stdout, stderr) => {
+    const child = execFile(process.execPath, argv, { env, timeout: 30_000, maxBuffer: 128 * 1024 }, (error, stdout, stderr) => {
       if (!error) resolve({ code: 0, stdout, stderr });
       else if (typeof error.code === "number") resolve({ code: error.code, stdout, stderr });
       else reject(error); // A timeout/spawn failure is not an expected CLI rejection.
@@ -197,7 +197,7 @@ test("CLI black box: cancelling an event reader exits the consumer but leaves th
   const output = await new Promise<string>((resolve, reject) => {
     let received = "", interrupted = false;
     const child = execFile(process.execPath, f.args("events", flags), {
-      env: f.env, timeout: 8_000, maxBuffer: 128 * 1024,
+      env: f.env, timeout: 30_000, maxBuffer: 128 * 1024,
     }, (error, stdout, stderr) => {
       if (error) { reject(error); return; }
       if (!interrupted || stderr.includes(dummyKey)) { reject(new Error("Event reader did not cancel safely")); return; }

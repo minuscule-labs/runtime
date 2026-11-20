@@ -1,14 +1,17 @@
 // Shared assertions over public Runtime APIs; native protocol details stay in this fixture factory.
 import assert from "node:assert/strict";
 import test from "node:test";
-import { access, copyFile, chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, copyFile, chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { ClaudeCodeAgentRuntime } from "../packages/claude-code/dist/src/index.js";
+import { ClaudeCodeAgentRuntime, ClaudeCodeManagedRuntime } from "../packages/claude-code/dist/src/index.js";
+import { ClaudeCodeManagedStore } from "../packages/claude-code/dist/src/managed-store.js";
+import { readManagedSessionManifest } from "../packages/pi/dist/src/managed-sessions.js";
 import { PiAgentRuntime } from "../packages/pi/dist/src/index.js";
+import { scriptedProvider } from "../packages/claude-code/dist/test/fixtures/scripted-provider.js";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const codexRoot = process.env.MINU_RUNTIME_CODEX_TEST_ROOT ?? root;
@@ -17,6 +20,7 @@ const codexModule = join(codexRoot, "packages/codex/dist/src/index.js");
 try { await access(codexModule); }
 catch { throw new Error("Build all three adapters, or set MINU_RUNTIME_CODEX_TEST_ROOT to an explicit built Codex snapshot; no adapter is skipped"); }
 const { CodexAgentRuntime } = await import(pathToFileURL(codexModule));
+const { CodexManagedStore } = await import(pathToFileURL(join(codexRoot, "packages/codex/dist/src/managed-store.js")));
 
 async function until(check) {
   const expiry = performance.now() + 5_000;
@@ -25,11 +29,11 @@ async function until(check) {
     await delay(10);
   }
 }
-async function bounded(task) {
+async function bounded(task, ms = 5_000) {
   let timer;
   try {
     return await Promise.race([task, new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error("headless operation exceeded its bounded wait")), 5_000);
+      timer = setTimeout(() => reject(new Error("headless operation exceeded its bounded wait")), ms);
     })]);
   } finally { clearTimeout(timer); }
 }
@@ -50,7 +54,7 @@ async function open(adapter, scenario) {
   if (adapter === "claude-code") {
     runtime = new ClaudeCodeAgentRuntime({
       executable: join(root, "packages/claude-code/dist/test/fixtures/claude.js"),
-      startupTimeoutMs: 10_000,
+      permissions: "full", startupTimeoutMs: 10_000,
       env: { PATH: process.env.PATH, HOME: directory, CLAUDE_CONFIG_DIR: join(directory, "config"),
         MINU_CLAUDE_FIXTURE_PID: join(directory, "pid"), MINU_CLAUDE_FIXTURE_INPUT: inputFile,
         MINU_CLAUDE_FIXTURE_REPLIES: logFile },
@@ -184,3 +188,246 @@ for (const adapter of ["claude-code", "pi", "codex"]) {
     } finally { await f.close(); }
   });
 }
+
+// Shared forced-recovery contract over managed sessions. Native protocol details stay in this factory.
+const OWNER = "headless-owner";
+const groupAbsent = group => { try { process.kill(-group, 0); return false; } catch (error) { return error.code === "ESRCH"; } };
+async function openManaged(adapter) {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "runtime-headless-managed-")));
+  const logFile = join(directory, "native-input.jsonl");
+  let runtime, nativePid, workerGroup, busy;
+  const cwd = join(directory, "workspace"); await mkdir(cwd);
+  if (adapter === "claude-code") {
+    const native = join(directory, "config"), storeRoot = join(directory, "managed"); await mkdir(native, { mode: 0o700 });
+    // Owner-per-call managed API on the runtime itself, constructed like Channels will: no owner, just a root and policy.
+    runtime = new ClaudeCodeAgentRuntime({ managedRoot: storeRoot, nativeConfigRoot: native, managedTimeoutMs: 8_000, permissions: "full",
+      workerExecutable: join(root, "packages/claude-code/dist/test/fixtures/worker-entry.js"),
+      executable: join(root, "packages/claude-code/dist/test/fixtures/persistent-native.js"),
+      startupTimeoutMs: 4_000, shutdownTimeoutMs: 1_000, controlTimeoutMs: 1_000,
+      env: { PATH: process.env.PATH, HOME: directory, TMPDIR: directory, CLAUDE_CONFIG_DIR: native, MINU_CLAUDE_FIXTURE_PID: join(directory, "pid") } });
+    const store = new ClaudeCodeManagedStore(storeRoot);
+    nativePid = async () => Number(await readFile(join(directory, "pid"), "utf8"));
+    workerGroup = async id => (await store.read(id, OWNER)).worker.registration.processGroupId;
+    busy = (id) => runtime.startTurn(id, "held-turn", "hold");
+  } else if (adapter === "pi") {
+    const command = join(directory, "pi.mjs");
+    await copyFile(new URL("./fixtures/pi-headless.mjs", import.meta.url), command); await chmod(command, 0o700);
+    process.env.PI_COMMAND = command;
+    runtime = new PiAgentRuntime({ controlRequestTimeoutMs: 3_000 });
+    nativePid = async () => JSON.parse(await readFile(join(cwd, "native-meta.json"), "utf8")).pid;
+    workerGroup = async id => (await readManagedSessionManifest(id, OWNER)).workerProcessGroup;
+    busy = id => { void runtime.send(id, "hold").catch(() => {}); return delay(300); };
+  } else {
+    const root_ = join(directory, "managed"), peer = join(codexRoot, "packages/codex/dist/test/fixtures/app-server.js");
+    runtime = new CodexAgentRuntime({ managedRoot: root_, command: process.execPath, args: [peer, "held", logFile], requestTimeoutMs: 2_000, shutdownTimeoutMs: 100 });
+    const store = new CodexManagedStore(root_);
+    nativePid = async () => (await jsonLines(logFile))[0].pid;
+    workerGroup = async id => (await store.read(id, OWNER)).worker.pgid;
+    busy = async id => { await runtime.startTurn(id, "held-turn", "hello"); await until(async () => (await jsonLines(logFile)).some(r => r.method === "turn/start")); };
+  }
+  const session = await runtime.startManaged({ cwd: adapter === "pi" ? cwd : adapter === "codex" ? directory : cwd }, OWNER);
+  const groups = new Set();
+  return { runtime, id: session.id, directory, cwd, busy: () => busy(session.id), nativePid, async group() { const g = await workerGroup(session.id); groups.add(g); return g; },
+    async close() {
+      for (const g of groups) { try { process.kill(-g, "SIGKILL"); } catch { /* Gone. */ } }
+      for (const g of groups) await until(() => groupAbsent(g));
+      await rm(directory, { recursive: true, force: true });
+    } };
+}
+
+for (const adapter of ["claude-code", "pi", "codex"]) {
+  test(`${adapter}: shared forceStopManaged contract (busy session)`, { timeout: 60_000 }, async () => {
+    const f = await openManaged(adapter);
+    try {
+      await bounded(f.busy());
+      const group = await f.group(), native = await f.nativePid();
+      assert.ok(alive(native), "native process must be running before force-stop");
+      await f.runtime.forceStopManaged(f.id, OWNER);
+      await until(() => !alive(native)); assert.equal(groupAbsent(group), true, "no live worker group may remain");
+      assert.equal((await f.runtime.getManagedSession(f.id, OWNER))?.state, "suspended");
+      await f.runtime.forceStopManaged(f.id, OWNER); // A second call is a no-op.
+      assert.equal((await f.runtime.getManagedSession(f.id, OWNER))?.state, "suspended");
+      await f.runtime.destroy(f.id, OWNER);
+      assert.equal(await f.runtime.getManagedSession(f.id, OWNER), undefined);
+    } finally { await f.close(); }
+  });
+
+  test(`${adapter}: shared forceStopManaged contract (worker killed externally)`, { timeout: 60_000 }, async () => {
+    const f = await openManaged(adapter);
+    try {
+      const group = await f.group(), native = await f.nativePid().catch(() => undefined);
+      process.kill(-group, "SIGKILL"); await until(() => groupAbsent(group));
+      await f.runtime.forceStopManaged(f.id, OWNER); // Succeeds through group-absence proof.
+      if (native !== undefined) await until(() => !alive(native));
+      assert.equal((await f.runtime.getManagedSession(f.id, OWNER))?.state, "suspended");
+      await f.runtime.destroy(f.id, OWNER);
+      assert.equal(await f.runtime.getManagedSession(f.id, OWNER), undefined);
+    } finally { await f.close(); }
+  });
+}
+
+// Full-permission tool turns through the REAL bundled engine against a local synthetic provider (no credentials, no network).
+async function bundled(name) {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), `runtime-headless-${name}-`)));
+  const cwd = join(directory, "workspace"), config = join(directory, "config"), storeRoot = join(directory, "managed");
+  await mkdir(cwd); await mkdir(config, { mode: 0o700 });
+  const target = join(cwd, "edited.txt");
+  const provider = await scriptedProvider([
+    [{ type: "tool_use", name: "Write", input: { file_path: target, content: "written by the full-permission turn\n" } }],
+    [{ type: "tool_use", name: "Bash", input: { command: "echo bash-ran >> edited.txt" } }],
+    [{ type: "text", text: "tools finished" }],
+    [{ type: "text", text: "second turn after resume" }],
+  ]);
+  const env = { PATH: process.env.PATH, HOME: directory, TMPDIR: directory, CLAUDE_CONFIG_DIR: config, ANTHROPIC_API_KEY: "dummy-local-only",
+    ANTHROPIC_BASE_URL: provider.url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", NO_PROXY: "127.0.0.1,localhost" };
+  return { directory, cwd, config, storeRoot, target, provider, env,
+    async close() { await provider.close(); await rm(directory, { recursive: true, force: true }); } };
+}
+
+test("claude-code: full permissions run Write and Bash through the bundled engine; events and history are public", { timeout: 60_000 }, async () => {
+  const f = await bundled("tools");
+  const runtime = new ClaudeCodeAgentRuntime({ permissions: "full", executable: "bundled", env: f.env, startupTimeoutMs: 20_000 });
+  const session = await runtime.start({ cwd: f.cwd });
+  const events = [], iterator = runtime.events(session.id)[Symbol.asyncIterator]();
+  const observing = (async () => { for await (const event of { [Symbol.asyncIterator]: () => iterator }) events.push(event); })().catch(() => {});
+  try {
+    await bounded(runtime.send(session.id, "edit the file"), 30_000);
+    assert.equal(await readFile(f.target, "utf8"), "written by the full-permission turn\nbash-ran\n");
+    for (const tool of ["Write", "Bash"]) {
+      await until(() => events.some(e => e.type === "tool_started" && e.toolName === tool));
+      await until(() => events.some(e => e.type === "tool_completed" && e.toolName === tool && e.isError === false));
+    }
+    assert.equal((await runtime.messages(session.id)).at(-1).content, "tools finished");
+    assert.equal(await runtime.status(session.id), "idle");
+  } finally { await runtime.stop(session.id); await bounded(observing); await f.close(); }
+});
+
+test("claude-code: read-only (the library default) cannot run Write", { timeout: 60_000 }, async () => {
+  const f = await bundled("readonly");
+  const runtime = new ClaudeCodeAgentRuntime({ executable: "bundled", env: f.env, startupTimeoutMs: 20_000 });
+  const session = await runtime.start({ cwd: f.cwd });
+  try {
+    await bounded(runtime.send(session.id, "edit the file").catch(() => {}), 30_000);
+    await assert.rejects(access(f.target), { code: "ENOENT" });
+  } finally { await runtime.stop(session.id); await f.close(); }
+});
+
+test("claude-code: a managed full-permission tool turn survives stop and resume (real engine history)", { timeout: 90_000 }, async () => {
+  const f = await bundled("managed");
+  const options = { ownerId: OWNER, storeRoot: f.storeRoot, nativeConfigRoot: f.config, timeoutMs: 20_000, permissions: "full",
+    nativeOptions: { executable: "bundled", startupTimeoutMs: 20_000, shutdownTimeoutMs: 5_000, controlTimeoutMs: 5_000, env: f.env } };
+  const runtime = new ClaudeCodeManagedRuntime(options);
+  let session;
+  try {
+    session = await runtime.startManaged({ cwd: f.cwd }, OWNER);
+    await bounded(runtime.send(session.id, "edit the file").catch(error => { throw error; }), 30_000);
+    assert.equal(await readFile(f.target, "utf8"), "written by the full-permission turn\nbash-ran\n");
+    await runtime.suspend(session.id, OWNER);
+    assert.equal((await runtime.getManagedSession(session.id, OWNER))?.state, "suspended");
+    const history = await runtime.messages(session.id);
+    assert.ok(history.some(m => m.role === "tool" && m.toolName === "Write") && history.some(m => m.role === "tool" && m.toolName === "Bash"));
+    const next = new ClaudeCodeManagedRuntime(options);
+    await next.resume(session.id, OWNER, { allowStopped: true });
+    await bounded(next.send(session.id, "after resume"), 30_000);
+    assert.equal((await next.messages(session.id)).at(-1).content, "second turn after resume");
+    await next.suspend(session.id, OWNER);
+  } finally {
+    if (session) await runtime.forceStopManaged(session.id, OWNER).catch(() => {});
+    if (session) await runtime.destroy(session.id, OWNER).catch(() => {});
+    await f.close();
+  }
+});
+
+test("claude-code: one runtime built without an owner serves several owners per call, isolated and durable across instances", { timeout: 60_000 }, async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "runtime-headless-owners-")));
+  const native = join(directory, "config"), managedRoot = join(directory, "managed");
+  await mkdir(native, { mode: 0o700 }); await mkdir(join(directory, "a")); await mkdir(join(directory, "b"));
+  const options = { managedRoot, nativeConfigRoot: native, managedTimeoutMs: 8_000, permissions: "full",
+    workerExecutable: join(root, "packages/claude-code/dist/test/fixtures/worker-entry.js"),
+    executable: join(root, "packages/claude-code/dist/test/fixtures/persistent-native.js"),
+    startupTimeoutMs: 4_000, shutdownTimeoutMs: 1_000, controlTimeoutMs: 1_000,
+    env: { PATH: process.env.PATH, HOME: directory, TMPDIR: directory, CLAUDE_CONFIG_DIR: native } };
+  const runtime = new ClaudeCodeAgentRuntime(options), groups = [];
+  const store = new ClaudeCodeManagedStore(managedRoot);
+  try {
+    const a = await runtime.startManaged({ cwd: join(directory, "a") }, "owner-a"), b = await runtime.startManaged({ cwd: join(directory, "b") }, "owner-b");
+    assert.equal(a.ownerId, "owner-a"); assert.equal(b.ownerId, "owner-b");
+    for (const [id, owner] of [[a.id, "owner-a"], [b.id, "owner-b"]]) groups.push((await store.read(id, owner)).worker.registration.processGroupId);
+    await bounded(runtime.send(a.id, "hello from a")); await bounded(runtime.send(b.id, "hello from b"));
+    assert.equal(await runtime.status(a.id), "idle");
+    assert.equal((await runtime.messages(a.id)).at(-1).content, "reply: hello from a");
+    assert.equal((await runtime.messages(b.id)).at(-1).content, "reply: hello from b");
+    // Owners never see or touch each other's sessions.
+    assert.deepEqual((await runtime.listManagedSessions("owner-a")).map(s => s.id), [a.id]);
+    assert.deepEqual((await runtime.listManagedSessions("owner-b")).map(s => s.id), [b.id]);
+    assert.equal(await runtime.getManagedSession(a.id, "owner-b"), undefined);
+    await assert.rejects(runtime.suspend(a.id, "owner-b"));
+    await runtime.destroy(a.id, "owner-b"); // Another owner's destroy finds nothing and must not touch it.
+    assert.equal((await runtime.getManagedSession(a.id, "owner-a")).state, "active");
+    await runtime.suspend(a.id, "owner-a");
+    assert.equal((await runtime.getManagedSession(a.id, "owner-a")).state, "suspended");
+    // A fresh instance (an app restart) resumes durable sessions without replaying input.
+    const restarted = new ClaudeCodeAgentRuntime(options);
+    assert.equal((await restarted.getManagedSession(b.id, "owner-b")).state, "active");
+    await restarted.resume(a.id, "owner-a", { allowStopped: true });
+    await bounded(restarted.send(a.id, "after restart"));
+    assert.deepEqual((await restarted.messages(a.id)).map(m => m.content), ["hello from a", "reply: hello from a", "after restart", "reply: after restart"]);
+    await restarted.suspend(a.id, "owner-a"); await runtime.suspend(b.id, "owner-b");
+    await restarted.destroy(a.id, "owner-a"); await runtime.destroy(b.id, "owner-b");
+    assert.deepEqual(await runtime.listManagedSessions("owner-a"), []);
+  } finally {
+    for (const g of groups) { try { process.kill(-g, "SIGKILL"); } catch { /* Gone. */ } }
+    for (const g of groups) await until(() => groupAbsent(g));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// Read-only observation contract (profile, bridge events, integrations) on an existing managed worker.
+test("claude-code: session profile, bridge events and integrations are observable on a live worker and never wake a stopped one", { timeout: 60_000 }, async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "runtime-headless-observe-")));
+  const native = join(directory, "config"), managedRoot = join(directory, "managed");
+  await mkdir(native, { mode: 0o700 }); await mkdir(join(directory, "ws"));
+  const models = JSON.stringify([{ value: "default", displayName: "Default", description: "", supportsEffort: true, supportedEffortLevels: ["low", "high"] }]);
+  const commands = JSON.stringify([{ name: "compact", description: "builtin", argumentHint: "", builtin: true }, { name: "review", description: "private description", argumentHint: "" }]);
+  const mcp = JSON.stringify([{ name: "docs server", status: "connected", scope: "user", config: { type: "http", url: "https://PRIVATE.example/mcp" },
+    tools: [{ name: "mcp__docs__search", description: "PRIVATE tool text" }, { name: "mcp__docs__read" }] }, { name: "broken", status: "failed", error: "PRIVATE failure text", scope: "project" }]);
+  const runtime = new ClaudeCodeAgentRuntime({ managedRoot, nativeConfigRoot: native, managedTimeoutMs: 8_000, permissions: "full",
+    workerExecutable: join(root, "packages/claude-code/dist/test/fixtures/worker-entry.js"),
+    executable: join(root, "packages/claude-code/dist/test/fixtures/persistent-native.js"),
+    startupTimeoutMs: 4_000, shutdownTimeoutMs: 1_000, controlTimeoutMs: 1_000,
+    env: { PATH: process.env.PATH, HOME: directory, TMPDIR: directory, CLAUDE_CONFIG_DIR: native, MINU_CLAUDE_FIXTURE_MODELS: models,
+      MINU_CLAUDE_FIXTURE_COMMANDS: commands, MINU_CLAUDE_FIXTURE_MCP: mcp } });
+  const store = new ClaudeCodeManagedStore(managedRoot);
+  let group;
+  try {
+    const session = await runtime.startManaged({ cwd: join(directory, "ws"), reasoningLevel: "high" }, OWNER);
+    group = (await store.read(session.id, OWNER)).worker.registration.processGroupId;
+    // Before the lazy native opening nothing is promised.
+    assert.deepEqual((await runtime.inspectSessionProfile(session.id, OWNER)).model, { status: "not_verified" });
+    assert.equal((await runtime.inspectSessionIntegrations(session.id, OWNER)).status, "unavailable");
+    await bounded(runtime.send(session.id, "observe me"));
+    const profile = await runtime.inspectSessionProfile(session.id, OWNER);
+    assert.deepEqual(profile.model, { status: "verified", provider: "anthropic", id: "fixture-model" });
+    assert.deepEqual(profile.reasoning, { status: "verified", level: "high" });
+    assert.deepEqual(profile.skills, { status: "verified", commandIds: ["review"], complete: true });
+    const events = await runtime.inspectSessionEvents(session.id, OWNER);
+    assert.equal(events.source, "runtime_bridge");
+    const codes = events.events.map(e => e.code);
+    for (const code of ["bridge_ready", "turn_dispatch_requested", "turn_dispatch_returned", "turn_accepted", "turn_completed"]) assert.ok(codes.includes(code), code);
+    const integrations = await runtime.inspectSessionIntegrations(session.id, OWNER);
+    assert.equal(integrations.status, "partial", "a failed server makes the tool coverage partial");
+    assert.deepEqual(integrations.integrations.map(i => [i.id, i.kind, i.source, i.connection, i.failureCode, i.registeredCount]),
+      [["docs_server", "mcp", "user", "connected", undefined, 2], ["broken", "mcp", "project", "failed", "connection_failed", undefined]]);
+    assert.deepEqual(integrations.tools.map(t => [t.name, t.integrationId, t.visibility]), [["mcp__docs__search", "docs_server", "declared"], ["mcp__docs__read", "docs_server", "declared"]]);
+    assert.doesNotMatch(JSON.stringify({ profile, events, integrations }), /PRIVATE|example\.com|description|https?:/i);
+    // Observation only: a stopped session is never woken, another owner sees nothing.
+    assert.equal(await runtime.inspectSessionProfile(session.id, "other-owner"), undefined);
+    await runtime.suspend(session.id, OWNER);
+    for (const inspect of ["inspectSessionProfile", "inspectSessionEvents", "inspectSessionIntegrations"]) assert.equal(await runtime[inspect](session.id, OWNER), undefined, inspect);
+    assert.equal((await runtime.getManagedSession(session.id, OWNER)).state, "suspended");
+    await runtime.destroy(session.id, OWNER);
+  } finally {
+    if (group) { try { process.kill(-group, "SIGKILL"); } catch { /* Gone. */ } await until(() => groupAbsent(group)); }
+    await rm(directory, { recursive: true, force: true });
+  }
+});

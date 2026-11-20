@@ -177,7 +177,10 @@ test("a redirected workspace cannot be silently used or rebound", async t => {
   const alias = join(f.directory, "alias");
   await symlink(f.directory, alias);
   f.config.cwd = alias;
-  await f.create();
+  // createPendingCodexSession now canonicalizes the workspace, so a redirected record can only exist from older
+  // metadata: persist one directly. Allocation must still refuse it (unchanged assertions below).
+  await f.store.create({ ...f.identity, version: 4, runtime: "codex", revision: 0, requiresExplicitResume: false, native: { state: "pending" },
+    worker: { state: "none" }, launchConfig: { ...f.config, cwd: alias }, sandbox: "read-only", createdAt: new Date().toISOString() });
   await assert.rejects(f.allocate(), /redirected/);
   assert.deepEqual((await f.read())?.native, { state: "creating" });
   assert.deepEqual(await f.log(), []);
@@ -218,3 +221,14 @@ for (const [point, state] of [["binding-failure", "creating"], ["post-binding-fa
     assert.equal((await f.log()).some(call => call.method === "turn/start"), false);
   });
 }
+
+test("a symlinked workspace is canonicalized before anything is persisted (macOS /tmp is a symlink)", async t => {
+  const f = await fixture(t), real = join(f.directory, "real-workspace"), link = join(f.directory, "linked-workspace");
+  await (await import("node:fs/promises")).mkdir(real); await symlink(real, link);
+  const session = await createPendingCodexSession(f.store, { id: "link-session", ownerId: "owner-a", generation: "generation-a" }, { cwd: link });
+  assert.equal(session.cwd, real);
+  assert.equal((await f.store.read("link-session", "owner-a"))!.launchConfig.cwd, real);
+  // A missing workspace fails before any metadata exists.
+  await assert.rejects(createPendingCodexSession(f.store, { id: "missing-cwd", ownerId: "owner-a", generation: "generation-a" }, { cwd: join(f.directory, "absent") }));
+  assert.equal(await f.store.read("missing-cwd", "owner-a"), undefined);
+});

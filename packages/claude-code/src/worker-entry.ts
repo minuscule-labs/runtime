@@ -6,11 +6,13 @@ import { fileURLToPath } from "node:url";
 import type { ClaudeCodeRuntimeOptions } from "./client.js";
 import { createClaudeCodeManagedSession, type ClaudeCodeManagedSessionHandle } from "./managed-session.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest } from "./managed-store.js";
+import { CLAUDE_CODE_FORBIDDEN_ENV } from "./native-config.js";
 import { createClaudeCodeWorkerBridge } from "./worker-bridge.js";
 import { encodeClaudeCodeWorkerRegistration, type ClaudeCodeWorkerRegistrationScope } from "./worker-registration.js";
 
 export const CLAUDE_CODE_BOOTSTRAP_MAX_BYTES = 64 * 1024;
-type NativeOptions = Omit<ClaudeCodeRuntimeOptions, "tools" | "canUseTool" | "env"> & { env: Record<string, string> };
+/** `env` only OVERLAYS the worker's inherited process environment (never replaces it). */
+type NativeOptions = Omit<ClaudeCodeRuntimeOptions, "tools" | "canUseTool" | "env"> & { env?: Record<string, string> };
 /** Private IPC only. Not launch authority, a public API or serializable manifest data. */
 export interface ClaudeCodeWorkerBootstrap {
   version: 1;
@@ -39,10 +41,11 @@ export function decodeClaudeCodeWorkerBootstrap(message: unknown): ClaudeCodeWor
   if (![scope.sessionId, scope.ownerId, scope.generation, scope.reservationId].every(value => typeof value === "string")
     || ![scope.workerExecutable, scope.cwd, scope.nativeConfigRoot].every(path)) throw failed();
   const options = object(data.nativeOptions, ["env", "executable", "startupTimeoutMs", "controlTimeoutMs", "shutdownTimeoutMs", "turnRetentionLimit", "eventBufferLimit"]);
-  if (!options.env || typeof options.env !== "object" || Array.isArray(options.env)
+  if (options.env !== undefined && (!options.env || typeof options.env !== "object" || Array.isArray(options.env)
+    || CLAUDE_CODE_FORBIDDEN_ENV.some(key => (options.env as Record<string, unknown>)[key] !== undefined)
     || Object.entries(options.env).some(([key, value]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)
-      || typeof value !== "string" || value.includes("\0") || Buffer.from(value).toString() !== value)
-    || (options.executable !== undefined && !path(options.executable))) throw failed();
+      || typeof value !== "string" || value.includes("\0") || Buffer.from(value).toString() !== value))
+    || (options.executable !== undefined && options.executable !== "bundled" && !path(options.executable))) throw failed();
   for (const key of ["startupTimeoutMs", "controlTimeoutMs", "shutdownTimeoutMs", "turnRetentionLimit", "eventBufferLimit"]) {
     // Match the managed facade's ceilings before the producer reserves or forks.
     const maximum = key === "turnRetentionLimit" ? 1_000 : key === "eventBufferLimit" ? 4_096 : 2_147_483_647;
@@ -82,11 +85,14 @@ function currentScope(manifest: ClaudeCodeManagedManifest | undefined, scope: Cl
  * physical exit/group proof, recovery, public routing or metadata mutation is supplied here.
  * The returned handle is privileged LOCAL self-cleanup, never exposed over private IPC/HTTP. */
 export async function runClaudeCodeWorkerEntry(): Promise<ClaudeCodeManagedSessionHandle> {
-  if (!process.send || !process.connected || process.argv.length !== 2 || process.execArgv.length
+  if (!process.send || !process.connected || ![2, 8].includes(process.argv.length) || process.execArgv.length
     || process.env.NODE_OPTIONS !== undefined || process.env.NODE_PATH !== undefined) throw failed();
   const bootstrap = await receive();
   const { scope } = bootstrap;
   if (await realpath(process.argv[1]) !== scope.workerExecutable || await realpath(process.cwd()) !== scope.cwd) throw failed();
+  // Marked launches (argv of 8) must carry exactly this scope's identity; legacy launches carry none.
+  if (process.argv.length === 8 && process.argv.slice(2).join("\0") !== ["--minu-runtime-session", scope.sessionId,
+    "--minu-runtime-owner", scope.ownerId, "--minu-runtime-generation", scope.generation].join("\0")) throw failed();
   const store = new ClaudeCodeManagedStore(bootstrap.storeRoot);
   const initial = await store.read(scope.sessionId, scope.ownerId);
   if (!currentScope(initial, scope) || initial!.worker.state !== "starting" || initial!.worker.process?.pid !== process.pid) throw failed();
@@ -107,6 +113,15 @@ export async function runClaudeCodeWorkerEntry(): Promise<ClaudeCodeManagedSessi
     await handle.closeOwnedNative(); // Privileged captured cleanup, outside admission.
     process.exit(0);
   }).catch(() => { ready = false; notify({ version: 1, type: "unavailable" }); });
+  // Recovery stop (own group only): tear down native, then exit; if teardown fails, end the whole own group so
+  // no native writer outlives the worker. The controller still proves absence independently.
+  if (group === process.pid) void bridge.forceStopped.then(async () => {
+    ready = false;
+    const backstop = setTimeout(() => { try { process.kill(-process.pid, "SIGKILL"); } catch { process.exit(1); } }, 4_000);
+    try { await bridge.close(); await handle.closeOwnedNative(); }
+    catch { try { process.kill(-process.pid, "SIGKILL"); } catch { /* Controller TERM/KILL path remains. */ } }
+    clearTimeout(backstop); process.exit(0);
+  });
   const bytes = encodeClaudeCodeWorkerRegistration({ version: 1, runtime: "claude-code", ownership: "owned", ...scope,
     pid: process.pid, processGroupId: group, endpoint: bridge.connection.endpoint, token: bridge.connection.token,
     createdAt: new Date().toISOString() }, scope);

@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os"; import { join } from "node:path"; import { fileURLToPath } from "node:url";
 import test, { type TestContext } from "node:test";
-import { createRuntime, runtimeReference, PiAgentRuntime, CodexAgentRuntime, type AgentEvent } from "../src/index.js";
+import { createRuntime, runtimeReference, PiAgentRuntime, CodexAgentRuntime, ClaudeCodeAgentRuntime, type AgentEvent } from "../src/index.js";
 import { createRuntimeProgram } from "../src/cli.js";
 const { CodexManagedStore } = await import(new URL("../../../codex/dist/src/managed-store.js", import.meta.url).href);
 const exec = promisify(execFile), cli = fileURLToPath(new URL("../../bin/minu-runtime.js", import.meta.url));
@@ -26,8 +26,11 @@ async function fixture(t: TestContext, scenario = "lifecycle") {
   return{directory,root,log,runtime,run,scoped,sessions,async calls(){try{return(await readFile(log,"utf8")).trim().split("\n").map(s=>JSON.parse(s));}catch(e){if((e as NodeJS.ErrnoException).code==="ENOENT")return[];throw e;}}};
 }
 
-test("public factory is explicit, defaults to Pi and never falls back from Codex",()=>{
+test("public factory is explicit, defaults to Pi and never falls back between adapters",()=>{
   assert.ok(createRuntime() instanceof PiAgentRuntime);assert.ok(createRuntime("codex") instanceof CodexAgentRuntime);
+  assert.ok(createRuntime("claude-code") instanceof ClaudeCodeAgentRuntime);
+  assert.deepEqual(runtimeReference("claude-code:session"),{adapter:"claude-code",id:"session"});
+  assert.throws(()=>runtimeReference("claude-code:session","codex"),/conflicts/);assert.throws(()=>runtimeReference("claude-code:"),/Invalid/);
   assert.throws(()=>createRuntime("other" as "codex"),/Unsupported/);
   assert.deepEqual(runtimeReference("codex:session"),{adapter:"codex",id:"session"});
   assert.deepEqual(runtimeReference("pi:session"),{adapter:"pi",id:"session"});
@@ -134,4 +137,50 @@ for(const outcome of ["success","send-failure","stream-ended"] as const)test(`CL
   if(outcome==="stream-ended"){await stream.iterator.return();await assert.rejects(command,/before turn completion/);return;}
   stream.push({type:"message_delta",delta:"COMPLETE_ANSWER"});stream.push({type:"turn_completed",operationId:"turn"});
   await command;assert.ok(output.includes("COMPLETE_ANSWER"));assert.equal(stream.closed,true);
+});
+
+test("CLI canonicalizes a symlinked --managed-root and --cwd instead of leaving the session stuck",{timeout:60000},async t=>{
+  const f=await fixture(t),link=join(f.directory,"managed-link"),workspace=join(f.directory,"workspace"),workspaceLink=join(f.directory,"workspace-link");
+  await mkdir(workspace);await (await import("node:fs/promises")).symlink(f.directory,link);await (await import("node:fs/promises")).symlink(workspace,workspaceLink);
+  // The root need not exist yet: its parent is canonicalized and the leaf appended.
+  const args=["--adapter","codex","--owner","cli-owner","--managed-root",join(link,"managed")];
+  const started=await f.run([...args,"start","--cwd",workspaceLink,"--no-skills"]),reference=started.split("\t")[0];f.sessions.push(reference.slice("codex:".length));
+  assert.equal(started.split("\t")[2],workspace);
+  assert.equal(await f.run([...args,"status",reference]),"idle");
+  assert.match(await f.run([...args,"sessions"]),new RegExp(reference));
+});
+
+const claudeFixture = (name: string) => fileURLToPath(new URL(`../../../claude-code/dist/test/fixtures/${name}`, import.meta.url));
+test("Claude Code runs through the shared CLI like Codex: owner-scoped managed sessions, qualified ids, restart-safe lifecycle",{timeout:90000},async t=>{
+  const directory=await realpath(await mkdtemp(join(tmpdir(),"runtime-cli-claude-"))),root=join(directory,"managed"),config=join(directory,"config"),cwd=join(directory,"workspace");
+  await mkdir(config,{mode:0o700});await mkdir(cwd);
+  // The fake engine speaks the SDK protocol; no model, no login, no network.
+  const env={...process.env,HOME:directory,TMPDIR:directory,CLAUDE_CONFIG_DIR:config,MINU_RUNTIME_DIR:join(directory,"pi"),ANTHROPIC_API_KEY:"dummy-local-only"};
+  const scoped=["--adapter","claude-code","--owner","cli-owner","--managed-root",root,"--executable",claudeFixture("persistent-native.js")];
+  const run=async(args:string[],success=true,extra:Record<string,string>={})=>{try{const result=await exec(process.execPath,[cli,...args],{env:{...env,...extra},timeout:20000,maxBuffer:1024*1024});assert.equal(success,true,`Unexpected success: ${args.join(" ")}`);return result.stdout.trim();}
+    catch(error){if(success)throw error;assert.ok((error as any).code);return String((error as any).stderr);}};
+  let reference="";
+  t.after(async()=>{try{if(reference){await run([...scoped,"destroy",reference],true).catch(()=>{});}}finally{await rm(directory,{recursive:true,force:true});}});
+  // The worker the CLI starts must be a disposable test worker, so build a runtime with the same root to observe/clean up.
+  const started=await run([...scoped,"start","--cwd",cwd,"--permissions","full"]);reference=started.split("\t")[0];
+  assert.match(reference,/^claude-code:/);assert.equal(started.split("\t")[1],"owned");
+  assert.equal(await run([...scoped,"status",reference]),"idle");
+  assert.match(await run([...scoped,"send",reference,"hello","claude"]),/turn completed/);
+  assert.match(await run([...scoped,"messages",reference]),/\[assistant\] reply: hello claude/);
+  assert.match(await run([...scoped,"sessions"]),new RegExp(`${reference}\\tactive\\towned`));
+  assert.match(await run([...scoped,"profile",reference]),/"version":1/);
+  // Another owner sees nothing and cannot touch it.
+  assert.equal(await run(["--adapter","claude-code","--owner","other-owner","--managed-root",root,"--executable",claudeFixture("persistent-native.js"),"sessions"]),"");
+  assert.match(await run(["--adapter","claude-code","--owner","other-owner","--managed-root",root,"--executable",claudeFixture("persistent-native.js"),"suspend",reference],false),/unavailable/);
+  // Suspend, then an explicit resume; a plain status/send never relaunches a stopped session.
+  await run([...scoped,"suspend",reference]);
+  assert.match(await run([...scoped,"sessions"]),new RegExp(`${reference}\\tsuspended\\towned`));
+  await run([...scoped,"send",reference,"must not relaunch"],false);
+  assert.match(await run([...scoped,"resume",reference]),/^claude-code:/);
+  assert.match(await run([...scoped,"send",reference,"after","resume"]),/turn completed/);
+  assert.match(await run([...scoped,"messages",reference]),/\[assistant\] reply: after resume/);
+  await run([...scoped,"suspend",reference]);
+  // Flags that belong to another adapter are refused before anything starts; a missing login is the one specific error.
+  assert.match(await run(["--adapter","pi","--permissions","full","sessions"],false),/require Claude Code/);
+  assert.match(await run([...scoped,"start","--cwd",cwd],false,{MINU_CLAUDE_FIXTURE_ACCOUNT:"none"}),/not logged in/);
 });

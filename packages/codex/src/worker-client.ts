@@ -115,14 +115,20 @@ export class CodexWorkerClient {
     return { operationId, phase: "native_fact_published" };
   }
 
+  /** Recovery stop: one best-effort request that bypasses the fence/admission (not authentication). The worker
+   * stops native and exits. Never proof of exit; callers never retry it or depend on its reply. */
+  async forceStop(timeoutMs = 2_000): Promise<void> {
+    if (await this.send("/force-stop", {}, timeoutMs) !== null) throw new Error("Invalid Codex force-stop acknowledgment");
+  }
+
   async request<T = unknown>(method: CodexWorkerMethod, args: { turnId?: string; input?: string; images?: RuntimeImageContent[] } = {}): Promise<T> {
     return await this.send("/rpc", { ...args, method }) as T;
   }
 
-  private async send(path: string, payload: Record<string, unknown>): Promise<unknown> {
+  private async send(path: string, payload: Record<string, unknown>, timeoutMs = 10_000): Promise<unknown> {
     const c = this.connection;
     const response = await fetch(`${c.endpoint}${path}`, {
-      method: "POST", redirect: "error", signal: AbortSignal.timeout(10_000),
+      method: "POST", redirect: "error", signal: AbortSignal.timeout(timeoutMs),
       headers: {
         "content-type": "application/json", authorization: `Bearer ${c.token}`,
         "x-minu-runtime-owner": c.ownerId, "x-minu-runtime-session": c.sessionId,

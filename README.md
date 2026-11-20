@@ -9,7 +9,7 @@ Runtime does not provide shared communication, durable session analytics, remote
 - `core` — normalized `AgentRuntime`, lifecycle, status, events, messages, and start configuration.
 - `pi` — Pi RPC worker, attached-TUI bridge, local registry, client, and legacy Pi CLI module.
 - `codex` — native Codex app-server adapter with managed execution, reconnect, and macOS idle suspend/exact-thread resume.
-- `claude-code` — native Claude SDK adapter, durable text-only controller and standalone CLI (implementation reviewed; real-auth acceptance pending).
+- `claude-code` — native Claude SDK adapter with durable owner-per-call managed sessions, full tools under an explicit policy, model/skill selection, images and steering, and a standalone CLI (live-tested on a subscription login; available through the shared factory/CLI).
 - `runtime` — `@minu/runtime` public adapter factory and the `minu-runtime` CLI.
 
 ## Shared API and CLI
@@ -45,7 +45,9 @@ Every Codex session operation requires the exact explicit `--owner`. Optional
 `--managed-root` selects its private metadata root. Creation is managed/lazy;
 ordinary status/control/history commands only connect to living workers and never
 implicitly cold-resume. `resume` is explicit. Existing macOS/v5 suspend/destroy
-eligibility limits still apply; `stop` is not verified suspension or force recovery.
+eligibility limits still apply; `stop` is not verified suspension or force recovery
+(use `forceStopManaged`, below). `--managed-root` and workspaces are canonicalized
+(symlinks such as macOS `/tmp` are resolved) before anything is persisted.
 
 The CLI also exposes `capabilities`, model/provider/reasoning/skill launch choices,
 `start-turn`/`turn`, repeated `--image <file>` inputs (including image-only turns),
@@ -234,11 +236,23 @@ cold resume. Neither operation proves tool-descendant/group exit or establishes 
 recovery fence. Messages are hydrated from native history after clean resume.
 Caller-turn lookup/idempotency remains bounded to the original worker's retention
 window; native history is not a durable caller-turn or exactly-once tool ledger.
-`destroy(id, ownerId)` reuses verified idle suspension, then removes only Runtime
-resume metadata under the same revision-checked lifecycle lock. Codex history is
-never deleted. Never-launched pending metadata can also be removed, including v4;
-active v4/unsupported-platform, busy, fenced, stopped-without-receipt or otherwise
-uncertain material rejects without recovery or force-stop. Concurrent cold resume
+`forceStopManaged(id, ownerId)` is explicit recovery for a busy, interrupted,
+unreachable, `reserved`, `aborted` or `ready` worker. It persists a fence first,
+sends one best-effort authenticated stop that bypasses admission, then needs
+**absence proof**: a changed boot identity, or `ESRCH` on the worker's own process
+group (new workers are forked detached with exact `--minu-runtime-*` argv markers and a
+`ps`-verified group). Otherwise it verifies the group leader's command line and sends
+TERM then KILL to that group only. It never signals a bare PID or a legacy worker
+recorded without a group; those stay fenced unless a reboot proves absence. Success
+leaves the worker `none`, the session `suspended` and the native binding untouched;
+it does not validate history. `resume(id, owner, { allowStopped: true })` relaunches
+such a slot only where a fresh launch is already permitted (native never started, or
+a verified resume epoch); otherwise it stays fenced and suspended.
+`destroy(id, ownerId)` first tries verified idle suspension for a ready worker, then
+proves absence (or force-stops, on every platform including Linux) and removes only
+Runtime resume metadata under the same revision-checked lifecycle lock. Codex history is
+never deleted. An unfenced slot with a bound thread and no registered worker, or any
+slot whose absence cannot be proven, rejects. Concurrent cold resume
 and destruction cannot both mutate the same generation. Publication/lock-return
 failure remains uncertain, even when canonical metadata is already gone. Lifecycle
 lock files are retained; unexpected files in the resume directory prevent deletion.
@@ -267,8 +281,7 @@ report a gap; use retained turn lookup—not stream closure, interrupt acknowled
 or `offline` status—as evidence of actual turn settlement. Worker loss still ends
 the retention window; there is no durable stream/caller-turn ledger.
 
-**Still required and not yet implemented:** explicit force-stop recovery,
-cross-platform suspend/cold resume and legacy migration policy, native TUI
+**Still required and not yet implemented:** cross-platform suspend/cold resume and legacy migration policy, native TUI
 attachment and Conversations/CLI selection. Native launch/input capabilities are
 independently approved; profile/structured observations and managed local diagnostics
 await behavior-level independent review. Non-macOS viewers and direct/unmanaged
@@ -287,123 +300,80 @@ for Runtime requirements, acceptance criteria and remaining work, and the
 All listed functionality is required; deferred delivery and optional API methods
 do not make product functionality optional.
 
-## Claude Code adapter (initial slice)
+## Claude Code adapter
 
-`@minu/runtime-claude-code` implements Runtime using one long-lived Claude Agent
-SDK query and its native process per session. It pins SDK `0.3.321`, including its
-platform-specific Claude Code engine; a separate `claude` on PATH is not required.
-Install optional dependencies for your platform. Native authentication must already
-be configured, or supplied through the environment.
+`@minu/runtime-claude-code` implements Runtime on the Claude Agent SDK: one long-lived
+query and native `claude` process per session. Claude Code keeps its own model/tool
+loop; Runtime adds ownership, input, streaming, reconnect, interruption, stop and resume.
 
-```ts
-import { ClaudeCodeAgentRuntime } from "@minu/runtime-claude-code";
+**Executable.** Like Pi's `pi`, the installed `claude` found on `PATH` is the default
+(first executable regular file; nothing is pinned or recorded). `executable: "bundled"`
+selects the SDK's pinned engine (SDK `0.3.321`) and any other value is an explicit path.
+A missing install is an error, never a silent fallback.
 
-const runtime = new ClaudeCodeAgentRuntime();
-const session = await runtime.start({
-  cwd: process.cwd(),
-  appendSystemPrompt: "You are a skeptical code reviewer.",
-});
-try {
-  await runtime.send(session.id, "Review README.md without changing files.");
-  console.log(await runtime.messages(session.id));
-} finally {
-  await runtime.stop(session.id);
-}
-```
+**Authentication and configuration are native.** The adapter uses whatever login `claude`
+already has (a subscription in `~/.claude`/keychain, or `ANTHROPIC_API_KEY` in the
+environment). It never reads, copies, stores or prompts for credentials, and never
+creates or writes the config root (`nativeConfigRoot`, else `$CLAUDE_CONFIG_DIR`, else
+`~/.claude`; must be an owned directory, not necessarily private). Workers inherit the
+process environment overlaid by the `env` option (for managed sessions `env` only overlays; an in-process `start()` session still gets `env` as its full environment); `NODE_OPTIONS`,
+`NODE_PATH`, `CLAUDE_CODE_PROJECT_DIR_NAME` and `CLAUDE_CODE_RESUME_INTERRUPTED_TURN`
+are always removed. User/project/local settings, hooks, MCP servers, plugins and skills
+load exactly as running `claude` in that `cwd` would (no new trust is granted);
+`isolateConfiguration: true` restores the isolated behavior (no settings, hooks, MCP or
+plugins). If there is no login, `capabilities()` and `startManaged()` throw
+`ClaudeCodeAuthRequiredError` ("Claude Code is not logged in; run `claude` to sign in")
+before any session exists.
 
-The initial adapter supports text turns, caller-stable turn IDs, normalized
-messages/events, sanitized activity and interruption. Input is sent literally,
-without slash-command dispatch or file-mention expansion. Appended personas retain
-the native Claude Code prompt; full `systemPrompt` replacement is mutually exclusive.
-The native default model is used. Explicit model/reasoning/skill selections, images
-and steering are rejected rather than silently ignored.
+**Permissions.** `permissions`: `"full"` (bypassPermissions, every native tool; what
+Channels should opt into), `"edits"` (acceptEdits; Bash etc. only via `canUseTool`),
+`"readOnly"` (Read/Grep/Glob; the library default) or `{ mode, allowedTools?, disallowedTools? }`.
+Interactive tools (`AskUserQuestion`, `ExitPlanMode`, `EnterPlanMode`) are always
+disallowed; if a dialog still arrives the owned session goes offline, like Pi and Codex.
+The policy is stored per managed session and resume uses the stored one. This is not an
+OS sandbox or a filesystem boundary, and stop does not undo tool side effects.
 
-By default only `Read`, `Grep` and `Glob` are exposed. Constructor `tools` can change
-that list; `canUseTool` can answer native permission requests. Without a handler,
-requests are denied. Permission mode is explicitly `default`, never bypass/auto or
-accept-edits. **The callback is not an all-tool gate:** native auto-allowed actions
-need not ask it. Exposing more tools is an explicit policy decision. This is not an
-OS sandbox, and read tools are not confined to the workspace. Interruption and stop
-do not undo tool side effects.
+**Launch options and input.** `capabilities({ cwd })` runs a short-lived prompt-less
+query (confirmed exit) and returns models, reasoning levels (`off` plus the engine's
+effort levels) and skills. `model` (`{ provider: "anthropic", id }`), `reasoningLevel`
+and `skillIds` are validated against it; unsupported choices are rejected, never
+downgraded, and a session whose engine reports a different model than requested fails
+closed. Images are sent as SDK image blocks when the model is discovered; `steer`
+queues a message into the running turn. History projects images as `[image]`.
 
-User/project/local filesystem settings, configured hooks and MCP discovery are
-not inherited: the adapter requests SDK isolation, disables hooks and uses strict
-empty MCP/plugin configuration. Machine-admin policies and native authentication
-still apply. The subprocess otherwise inherits the host environment; constructor
-`env`, when supplied, replaces it entirely. No Pi extensions/settings are loaded.
-Native transcript persistence is disabled, not a secure-erasure or no-artifacts
-guarantee. Prompts and tool content can still reach the selected provider.
+**API.** `new ClaudeCodeAgentRuntime({ permissions, managedRoot, nativeConfigRoot, executable })`
+takes no owner: `startManaged`, `resume`, `suspend`, `forceStopManaged`, `destroy`,
+`getManagedSession`, `listManagedSessions` and the read-only `inspectSessionProfile`,
+`inspectSessionEvents`, `inspectSessionIntegrations` take `ownerId` per call
+(`managedRoot` defaults to `~/.minu/runtime/claude-code`, mode 0700).
+`ClaudeCodeManagedRuntime` is the per-owner controller underneath. `start()` still
+makes an in-process, non-durable session.
 
-Turn idempotency is instance-local within the most recent 1,000 retained turns
-(configurable with `turnRetentionLimit`). Messages live in memory for the session.
-Each event subscriber has a bounded queue; a slow consumer is disconnected without
-stalling the agent. Raw events and message text are not presentation-safe; only
-`activityEvents` has the fixed sanitized vocabulary. An interrupt acknowledgment
-is not completion: the turn remains busy until a native terminal result. Uncertain
-control failures take the session offline and stop it; no automatic replay occurs.
-`stop` confirms the exact native process exit or rejects, not independent exit of
-all tool descendants or a managed recovery fence.
+**Lifecycle.** Stop requires an idle worker, observes the worker group's absence, and
+only then reads the native transcript (the real engine finalizes it on exit). Whatever
+that check finds, the proven-gone worker is fenced and cleared; an ineligible history
+then fails the stop and refuses resume. A completed turn needs an exact tail match; an
+interrupted or failed turn only needs a structurally valid (or absent) transcript.
+Resume requires `{ allowStopped: true }`. Supported history is the engine's linear
+format for versions `>=2.1.300 <3` (tool, image and steering rows included); compaction
+and branching fail closed. The engine version is recorded and a changed major is refused.
+Recovery is explicit and absence-proven; see the
+[process-family contract](docs/claude-code-process-family-contract.md) (v2).
 
-The in-process class has no managed lifecycle. `ClaudeCodeManagedRuntime` separately
-implements the durable text-only MVP below; forced recovery, destroy, rich live
-profiles/diagnostics and native TUI attachment remain outside that implementation.
-The existing `runtime` CLI and Channels/Conversations loading remain Pi-only.
+**CLI.** `pnpm runtime:claude` (`minu-claude-runtime`): `create`, `list`, `get`, `status`,
+`run`, `turn`, `history`, `interrupt`, `stop`, `resume`, `events`, `activity`; all take
+`--owner` and `--state`, optionally `--native-root` and `--executable`; `run` reads a
+bounded JSON `{"turnId","input"}` from stdin. Credentials come from the environment, never
+arguments.
 
-### Durable text-only MVP (real-auth acceptance pending)
-
-`ClaudeCodeManagedRuntime` takes one exact `ownerId`, explicit `storeRoot`, an
-existing owner-private canonical `nativeConfigRoot`, and explicit `nativeOptions.env`
-with matching `CLAUDE_CONFIG_DIR`. There is no inherited/default credential or state
-root. The harness still owns authentication and tools. Trusted executable/env
-settings must obey the [conditional process-family contract](docs/claude-code-process-family-contract.md);
-process groups are not OS containment or a filesystem sandbox.
-
-Supported path: managed create/readiness, literal text/streams/history/status,
-interrupt, owner inventory, reconnect to a living worker, healthy idle-only stop and
-explicit same-history resume. Stop observes the eligible fresh process-family's
-absence, requires exact unchanged metadata and materialization of an independently
-completed latest input, then fences/clears the worker under CAS. Resume requires
-`{ allowStopped: true }`. No missing-history fallback, unknown-outcome replay,
-legacy null-group migration or busy/unreachable recovery. Busy stop is refused. An interrupted but healthy worker needs a fresh confirmed
-completed turn before clean suspension; failed/uncertain sessions remain refused
-rather than guessing history eligibility.
-
-Caller turn results/idempotence are retained within a living worker, not rebuilt
-from transcript text after worker restart. Use new turn IDs after explicit resume;
-the known previous-epoch last ID is refused, not redispatched or fabricated.
-Supported history is the pinned bounded linear subset, not compaction/branching.
-One verified real authentication/provider path and production acceptance remain
-pending; synthetic-provider tests do not establish subscription compatibility.
-
-Build first, then use `pnpm runtime:claude` (or the package's `minu-claude-runtime`
-bin). Commands: `create`, `list`, `get`, `status`, `run`, `turn`, `history`, `interrupt`,
-`stop`, `resume`, `events`, `activity`. All require `--owner`, `--state` and
-`--native-root`; session commands also take `--id`, `turn` takes `--turn-id`, and
-`create` accepts `--cwd`. Credentials come from the explicit operator environment,
-never arguments. `run` reads a bounded UTF-8 JSON object from stdin only:
-
-```json
-{"turnId":"fresh-caller-id","input":"Literal user input"}
-```
-
-For example, `pnpm runtime:claude run --owner OWNER --state /private/state
---native-root /private/native --id SESSION < turn.json` (one shell command).
-No automatic real-provider/authentication acceptance is authorized by these examples.
-The MVP does not complete or remove full R01–R41 requirements.
-
-Verification includes SDK protocol fixtures and a real bundled-engine integration
-with an isolated temporary home and localhost synthetic provider, covering multi-turn
-text, literal input, interruption and denied native writes. It does not establish
-real model quality, paid-provider authentication or successful tool-write behavior.
-
-CLI-only black-box tests exercise fresh-process reconnect, empty-session stop/resume,
-owner/configuration isolation, invalid input, private errors and event cancellation
-without model requests or adapter/store imports. Run them after building:
-
-```sh
-pnpm check
-node --test packages/claude-code/dist/test/cli-black-box.test.js
-```
+**Testing and status.** Fixtures speak the SDK protocol; the shared headless conformance
+(`pnpm test:headless`) runs Claude Code, Pi and Codex through the public API and also
+drives the real bundled engine (Write/Bash turns, stop/resume) against a local synthetic
+provider with dummy keys. Credential-free by default. An opt-in smoke test
+(`MINU_CLAUDE_REAL_SMOKE=1 node --test packages/claude-code/dist/test/real-smoke.test.js`)
+uses the real login and model; it passed on a subscription login during acceptance. The adapter is wired into the shared `createRuntime("claude-code", ...)` factory and the `minu-runtime` CLI
+(`--adapter claude-code`, `--permissions`, `--executable`, `claude-code:`-qualified ids), so projects can load Pi, Codex and
+Claude Code the same way.
 
 
 ## Contract
