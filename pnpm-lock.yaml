@@ -52,6 +52,9 @@ importers:
 
   packages/runtime:
     dependencies:
+      '@minu/runtime-claude-code':
+        specifier: workspace:*
+        version: link:../claude-code
       '@minu/runtime-codex':
         specifier: workspace:*
         version: link:../codex
