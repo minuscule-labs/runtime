@@ -4,6 +4,7 @@ import type { ChildProcess } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { finished } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
@@ -35,8 +36,16 @@ async function fixture(t: TestContext, extraEnv: Record<string, string> = {}) {
   t.after(async () => {
     const children = instances.flatMap(instance => [...(instance as unknown as { ownedChildren: Map<string, ChildProcess> }).ownedChildren.values()]);
     for (const child of children) {
-      if (child.exitCode === null && child.stdin?.writable) child.stdin.end("dispose-owned-fixture\n");
-      await until(async () => child.exitCode, code => code !== null); assert.equal(child.exitCode, 0);
+      if (child.exitCode === null && child.stdin?.writable) {
+        // The worker can close stdin between the writable check and end().
+        const inputClosed = finished(child.stdin, { cleanup: true }).catch(error => {
+          if ((error as NodeJS.ErrnoException).code !== "EPIPE") throw error;
+        });
+        child.stdin.end("dispose-owned-fixture\n");
+        await inputClosed;
+      }
+      await until(async () => child.exitCode, code => code !== null);
+      assert.equal(child.exitCode, 0);
     }
     if (preserve) t.diagnostic(`Private native integration artifacts: ${root}`);
     else await rm(root, { recursive: true, force: true });

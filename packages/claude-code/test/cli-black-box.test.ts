@@ -68,7 +68,6 @@ async function fixture(t: TestContext) {
   };
   t.after(async () => {
     let clean = false;
-    t.diagnostic("CLI fixture cleanup: enumerating/stopping owned sessions");
     try {
       // Use the same public boundary for cleanup. Preserve ambiguous fixtures;
       // never delete live/uncertain state or signal a recovered worker PID/group.
@@ -79,7 +78,6 @@ async function fixture(t: TestContext) {
       assert.equal(requests, 0, "Metadata/invalid-input scenarios must not call the model endpoint");
       clean = true;
     } finally {
-      t.diagnostic("CLI fixture cleanup: closing the offline HTTP guard");
       await new Promise<void>((resolve, reject) => guard.close(error => error ? reject(error) : resolve()));
       if (clean) await rm(root, { recursive: true, force: true });
       else t.diagnostic(`Uncertain black-box fixture preserved: ${root}`);
@@ -195,39 +193,29 @@ test("CLI black box: a different native root refuses control without altering th
 });
 
 test("CLI black box: cancelling an event reader exits the consumer but leaves the worker usable", options, async t => {
-  let phase = "creating the fixture/session";
-  t.after(() => t.diagnostic(`Event-reader cancellation phase: ${phase}`));
   const f = await fixture(t), session = await f.create(), flags = { "--id": session.id };
-  phase = "waiting for the first event";
   const output = await new Promise<string>((resolve, reject) => {
     let received = "", interrupted = false;
-    const child = execFile(process.execPath, ["--import", new URL("./fixtures/cli-cancel-probe.js", import.meta.url).href, ...f.args("events", flags)], {
+    const child = execFile(process.execPath, f.args("events", flags), {
       env: f.env, timeout: 30_000, maxBuffer: 128 * 1024,
     }, (error, stdout, stderr) => {
       if (error) { reject(error); return; }
       if (!interrupted || stderr.includes(dummyKey)) { reject(new Error("Event reader did not cancel safely")); return; }
       resolve(stdout);
     });
-    child.stderr!.on("data", chunk => {
-      for (const line of String(chunk).split("\n")) if (line.startsWith("CLI_CANCEL_PROBE ")) t.diagnostic(line);
-    });
-    child.once("exit", () => { phase = "consumer exited; waiting for execFile completion"; });
     child.stdin!.end();
     child.stdout!.on("data", chunk => {
       received += chunk;
       if (!interrupted && received.includes("\n")) {
         interrupted = true;
-        phase = "waiting for consumer exit after SIGINT";
         child.kill("SIGINT"); // Original local CLI consumer only, never a recovered worker PID/group.
       }
     });
   });
-  phase = "checking the surviving worker";
   const first = JSON.parse(output.trim().split("\n")[0]);
   assert.equal(first.type, "status"); assert.equal(first.status, "idle");
   assert.equal(first.sessionId, session.id);
   assert.equal(await f.json("status", flags), "idle");
   assert.equal((await f.json("get", flags)).state, "active");
   assert.deepEqual(await f.json("history", flags), []);
-  phase = "finished assertions; fixture cleanup";
 });
