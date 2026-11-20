@@ -6,11 +6,13 @@ import { fileURLToPath } from "node:url";
 import type { ClaudeCodeRuntimeOptions } from "./client.js";
 import { createClaudeCodeManagedSession, type ClaudeCodeManagedSessionHandle } from "./managed-session.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest } from "./managed-store.js";
+import { CLAUDE_CODE_FORBIDDEN_ENV } from "./native-config.js";
 import { createClaudeCodeWorkerBridge } from "./worker-bridge.js";
 import { encodeClaudeCodeWorkerRegistration, type ClaudeCodeWorkerRegistrationScope } from "./worker-registration.js";
 
 export const CLAUDE_CODE_BOOTSTRAP_MAX_BYTES = 64 * 1024;
-type NativeOptions = Omit<ClaudeCodeRuntimeOptions, "tools" | "canUseTool" | "env"> & { env: Record<string, string> };
+/** `env` only OVERLAYS the worker's inherited process environment (never replaces it). */
+type NativeOptions = Omit<ClaudeCodeRuntimeOptions, "tools" | "canUseTool" | "env"> & { env?: Record<string, string> };
 /** Private IPC only. Not launch authority, a public API or serializable manifest data. */
 export interface ClaudeCodeWorkerBootstrap {
   version: 1;
@@ -39,10 +41,11 @@ export function decodeClaudeCodeWorkerBootstrap(message: unknown): ClaudeCodeWor
   if (![scope.sessionId, scope.ownerId, scope.generation, scope.reservationId].every(value => typeof value === "string")
     || ![scope.workerExecutable, scope.cwd, scope.nativeConfigRoot].every(path)) throw failed();
   const options = object(data.nativeOptions, ["env", "executable", "startupTimeoutMs", "controlTimeoutMs", "shutdownTimeoutMs", "turnRetentionLimit", "eventBufferLimit"]);
-  if (!options.env || typeof options.env !== "object" || Array.isArray(options.env)
+  if (options.env !== undefined && (!options.env || typeof options.env !== "object" || Array.isArray(options.env)
+    || CLAUDE_CODE_FORBIDDEN_ENV.some(key => (options.env as Record<string, unknown>)[key] !== undefined)
     || Object.entries(options.env).some(([key, value]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)
-      || typeof value !== "string" || value.includes("\0") || Buffer.from(value).toString() !== value)
-    || (options.executable !== undefined && !path(options.executable))) throw failed();
+      || typeof value !== "string" || value.includes("\0") || Buffer.from(value).toString() !== value))
+    || (options.executable !== undefined && options.executable !== "bundled" && !path(options.executable))) throw failed();
   for (const key of ["startupTimeoutMs", "controlTimeoutMs", "shutdownTimeoutMs", "turnRetentionLimit", "eventBufferLimit"]) {
     // Match the managed facade's ceilings before the producer reserves or forks.
     const maximum = key === "turnRetentionLimit" ? 1_000 : key === "eventBufferLimit" ? 4_096 : 2_147_483_647;

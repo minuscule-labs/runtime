@@ -26,7 +26,7 @@ test("CLI processes survive app restart and route stdin-only text through clean 
   const root = await realpath(await mkdtemp(join(tmpdir(), "claude-cli-"))), native = join(root, "native"), cwd = join(root, "workspace"), state = join(root, "managed");
   await mkdir(native, { mode: 0o700 }); await mkdir(cwd, { mode: 0o700 });
   const path = fileURLToPath(new URL("../src/cli.js", import.meta.url));
-  const args = ["--owner", "cli-owner", "--state", state, "--native-root", native];
+  const args = ["--owner", "cli-owner", "--state", state, "--native-root", native, "--executable", "bundled"];
   const provider = await nativeHistoryProvider(2);
   const env = { HOME: root, TMPDIR: root, PATH: process.env.PATH, ANTHROPIC_API_KEY: "PRIVATE_CLI_DUMMY",
     ANTHROPIC_BASE_URL: provider.url, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", NO_PROXY: "127.0.0.1,localhost" };

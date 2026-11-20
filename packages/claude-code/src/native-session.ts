@@ -1,4 +1,5 @@
-import type { AgentRuntime, AgentSession, AgentStartConfig, AgentTurn } from "@minu/runtime-core";
+import type { McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
+import type { AgentReasoningLevel, AgentRuntime, AgentSession, AgentStartConfig, AgentTurn, RuntimeImageContent } from "@minu/runtime-core";
 import { runtimeInput } from "@minu/runtime-core";
 import {
   ClaudeCodeAgentRuntime, type ClaudeCodeNativeLaunch, type ClaudeCodeRuntimeOptions,
@@ -13,9 +14,12 @@ class NativeRuntime extends ClaudeCodeAgentRuntime {
   open(config: AgentStartConfig, native: ClaudeCodeNativeLaunch): Promise<AgentSession> {
     return this.launch(config, native);
   }
-  mappedTurn(id: string, turnId: string, input: string, nativeMessageId: string): Promise<AgentTurn> {
-    return this.acceptTurn(id, turnId, input, undefined, nativeMessageId);
+  mappedTurn(id: string, turnId: string, input: string, nativeMessageId: string, images?: RuntimeImageContent[]): Promise<AgentTurn> {
+    return this.acceptTurn(id, turnId, input, images, nativeMessageId);
   }
+  steers(id: string, turnId: string): string[] { return this.steerFingerprints(id, turnId); }
+  profile(id: string) { return this.observedProfile(id); }
+  integrations(id: string) { return this.integrationStatuses(id); }
   evidence(id: string, turnId: string): ClaudeCodeSettlementEvidence | undefined {
     return this.settlementEvidence(id, turnId);
   }
@@ -33,7 +37,11 @@ export async function openClaudeCodeNativeSession(
 ): Promise<{
   runtime: AgentRuntime;
   session: AgentSession;
-  startMappedTurn(turnId: string, input: string, nativeMessageId: string): Promise<AgentTurn>;
+  startMappedTurn(turnId: string, input: string, nativeMessageId: string, images?: RuntimeImageContent[]): Promise<AgentTurn>;
+  /** sha256 of steering messages sent during that turn. */
+  steers(turnId: string): string[];
+  profile(): { model?: string; reasoning?: AgentReasoningLevel; skills?: string[] };
+  integrations(): Promise<McpServerStatus[]>;
   evidence(turnId: string): ClaudeCodeSettlementEvidence | undefined;
 }> {
   const snapshot = { ...native };
@@ -42,7 +50,8 @@ export async function openClaudeCodeNativeSession(
   const session = await runtime.open(config, snapshot);
   return {
     runtime, session: { ...session },
-    startMappedTurn: (turnId, input, nativeMessageId) => runtime.mappedTurn(session.id, turnId, input, nativeMessageId),
+    startMappedTurn: (turnId, input, nativeMessageId, images) => runtime.mappedTurn(session.id, turnId, input, nativeMessageId, images),
+    steers: turnId => runtime.steers(session.id, turnId), profile: () => runtime.profile(session.id), integrations: () => runtime.integrations(session.id),
     evidence: turnId => runtime.evidence(session.id, turnId),
   };
 }

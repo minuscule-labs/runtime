@@ -57,7 +57,7 @@ test("bundled native engine handles multiple turns, literal input, interruption 
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as { port: number }).port;
-  const runtime = new ClaudeCodeAgentRuntime({ tools: ["Write"],
+  const runtime = new ClaudeCodeAgentRuntime({ tools: ["Write"], executable: "bundled",
     env: { PATH: process.env.PATH, HOME: dir, CLAUDE_CONFIG_DIR: join(dir, "config"),
       ANTHROPIC_API_KEY: "synthetic-local-only", ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`,
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" } });

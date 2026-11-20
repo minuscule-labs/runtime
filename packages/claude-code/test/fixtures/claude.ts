@@ -3,15 +3,32 @@ import { createInterface } from "node:readline";
 import { appendFileSync, writeFileSync } from "node:fs";
 
 const mode = process.env.MINU_CLAUDE_FIXTURE_MODE;
-if (process.env.MINU_CLAUDE_FIXTURE_PID) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_PID, String(process.pid));
+// Short-lived probes (auth/capabilities, marked MINU_RUNTIME_PROBE) never receive input: they must not look like a
+// started session, so they are recorded separately.
+const probe = process.env.MINU_RUNTIME_PROBE === "1";
+if (process.env.MINU_CLAUDE_FIXTURE_PID && !probe) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_PID, String(process.pid));
+else if (probe && process.env.MINU_CLAUDE_FIXTURE_PROBE) appendFileSync(process.env.MINU_CLAUDE_FIXTURE_PROBE, `${process.pid}\n`);
 if (process.env.MINU_CLAUDE_FIXTURE_PROJECT_DIR) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_PROJECT_DIR, process.env.CLAUDE_CODE_PROJECT_DIR_NAME ?? "<default>");
 let current: any;
 let pendingPermission: any;
+if (process.env.MINU_CLAUDE_FIXTURE_ARGV) appendFileSync(process.env.MINU_CLAUDE_FIXTURE_ARGV, JSON.stringify({ probe, argv: process.argv.slice(2),
+  env: { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR } }) + "\n", { mode: 0o600 });
+const flag = (name: string) => process.argv.find(arg => arg.startsWith(`${name}=`))?.slice(name.length + 1);
+// The engine reports the model it actually runs: the requested one resolved through its model list, unless overridden.
+const initModel = () => {
+  if (process.env.MINU_CLAUDE_FIXTURE_INIT_MODEL) return process.env.MINU_CLAUDE_FIXTURE_INIT_MODEL;
+  const requested = flag("--model");
+  const row = (JSON.parse(process.env.MINU_CLAUDE_FIXTURE_MODELS ?? "[]") as any[]).find(model => model.value === requested);
+  return requested ? (row?.resolvedModel ?? requested) : "fixture-model";
+};
 const output = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const base = () => ({ session_id: current.session_id, uuid: crypto.randomUUID() });
 function result(text: string, extra: Record<string, unknown> = {}) {
+  // A folded-in steering message makes the engine stamp ITS uuid on the turn's result frames (observed from the real engine).
+  const steered = current.steerUuid;
+  current.done = true;
   output({ ...base(), type: "result", subtype: "success", is_error: false,
-    result: text, user_message_uuid: current.uuid, ...extra });
+    result: text, user_message_uuid: steered ?? current.uuid, ...extra });
 }
 function assistant(content: unknown[], parent: string | null = null) {
   output({ ...base(), type: "assistant", parent_tool_use_id: parent, message: { role: "assistant", content } });
@@ -29,8 +46,13 @@ lines.on("line", (line) => {
     if (request.subtype === "initialize" && mode === "startup-hang") return;
     if (request.subtype === "initialize" && mode === "startup-exit") process.exit(2);
     if (request.subtype === "interrupt" && mode === "interrupt-hang") return;
+    if (request.subtype === "mcp_status") {
+      output({ type: "control_response", response: { subtype: "success", request_id: message.request_id,
+        response: { mcpServers: JSON.parse(process.env.MINU_CLAUDE_FIXTURE_MCP ?? "[]") } } });
+      return;
+    }
     output({ type: "control_response", response: { subtype: "success", request_id: message.request_id,
-      response: request.subtype === "initialize" ? { commands: [], agents: [], models: [], account: {}, output_style: "default", available_output_styles: [],
+      response: request.subtype === "initialize" ? { commands: JSON.parse(process.env.MINU_CLAUDE_FIXTURE_COMMANDS ?? "[]"), agents: [], models: JSON.parse(process.env.MINU_CLAUDE_FIXTURE_MODELS ?? "[]"), account: process.env.MINU_CLAUDE_FIXTURE_ACCOUNT === "none" ? {} : { apiKeySource: "ANTHROPIC_API_KEY" }, output_style: "default", available_output_styles: [],
         claude_code_version: process.env.MINU_CLAUDE_FIXTURE_VERSION ?? "2.1.321" } : {} } });
     if (request.subtype === "interrupt" && mode !== "interrupt-no-result") {
       setTimeout(() => result("interrupted", { subtype: "error_during_execution", is_error: true, errors: ["interrupted"] }), 20);
@@ -46,12 +68,23 @@ lines.on("line", (line) => {
     return;
   }
   if (message.type !== "user") return;
+  if (message.priority === "next" && current && !current.done) {
+    // Steering: folded into the running turn at its next boundary, never a new turn.
+    current.steerUuid = message.uuid;
+    const text = typeof message.message.content === "string" ? message.message.content : message.message.content[0].text;
+    if (process.env.MINU_CLAUDE_FIXTURE_STEERS) appendFileSync(process.env.MINU_CLAUDE_FIXTURE_STEERS, JSON.stringify({ text, uuid: message.uuid }) + "\n", { mode: 0o600 });
+    if (current.waitSteer) { assistant([{ type: "text", text: `steered: ${text}` }]); result(`steered: ${text}`); }
+    return;
+  }
   current = message;
-  const input = typeof message.message.content === "string" ? message.message.content : message.message.content[0].text;
+  const blocks = Array.isArray(message.message.content) ? message.message.content : [];
+  const input = typeof message.message.content === "string" ? message.message.content : (blocks.find((block: any) => block.type === "text")?.text ?? "");
+  if (process.env.MINU_CLAUDE_FIXTURE_IMAGES) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_IMAGES, JSON.stringify(blocks.filter((block: any) => block.type === "image")));
   if (process.env.MINU_CLAUDE_FIXTURE_INPUT) writeFileSync(process.env.MINU_CLAUDE_FIXTURE_INPUT, input);
-  output({ ...base(), type: "system", subtype: "init", permissionMode: "default",
-    cwd: mode === "wrong-workspace-init" ? "/" : process.cwd(), model: "fixture-model", claude_code_version: "2.1.321" });
+  output({ ...base(), type: "system", subtype: "init", permissionMode: flag("--permission-mode") ?? "default",
+    cwd: mode === "wrong-workspace-init" ? "/" : process.cwd(), model: initModel(), claude_code_version: process.env.MINU_CLAUDE_FIXTURE_VERSION ?? "2.1.321" });
   if (input === "hold") return;
+  if (input === "wait-steer") { current.waitSteer = true; return; }
   if (input === "crash") process.exit(3);
   if (input === "wrong-session") { result("wrong", { session_id: crypto.randomUUID() }); return; }
   if (input === "wrong-turn") { result("wrong", { user_message_uuid: crypto.randomUUID() }); return; }

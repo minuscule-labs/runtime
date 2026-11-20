@@ -50,7 +50,7 @@ async function fixture(t: TestContext, nativeProvider?: string) {
     }
   });
   const ready = once(child, "message");
-  child.send({ type: "start", cwd: directory, executable: nativeProvider ? undefined : fileURLToPath(new URL("./fixtures/claude.js", import.meta.url)),
+  child.send({ type: "start", cwd: directory, executable: nativeProvider ? "bundled" : fileURLToPath(new URL("./fixtures/claude.js", import.meta.url)),
     identity: { sessionId: "logical-runtime-id", ownerId: "owner-a", generation: "generation-a" } });
   const [message] = await Promise.race([ready, exited.then(() => { throw new Error("Worker exited before ready"); })]);
   assert.equal(message.type, "ready");
@@ -166,9 +166,11 @@ test("invalid JSON/text/images and unsupported steering are explicit; failures n
   assert.equal(invalid.status, 400); await invalid.body?.cancel();
   await assert.rejects(f.client.startTurn("pixels", "pixels", [{ type: "image", mimeType: "image/png", data: "YQ==" }]));
   await f.client.startTurn("steer-target", "hold");
-  await assert.rejects(f.client.steer("steer-target", "not supported yet"));
+  await f.client.steer("steer-target", "steer the running turn"); // Steering is a feature now: accepted for the running turn.
+  await assert.rejects(f.client.steer("stale-turn", "wrong turn"), /http_409/, "steering never falls back to another turn");
   await f.client.interrupt("steer-target");
   await until(() => f.client.turn("steer-target"), turn => turn?.status === "interrupted");
+  await assert.rejects(f.client.steer("steer-target", "after the turn ended"), /http_409/, "a settled turn cannot be steered");
   await assert.rejects(f.client.send("fail"), (error: unknown) => error instanceof ClaudeCodeWorkerError && !error.message.includes("private error"));
   assert.equal(await f.client.status(), "idle");
 });

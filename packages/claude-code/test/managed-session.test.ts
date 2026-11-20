@@ -342,10 +342,18 @@ test("recovery/generation/policy changes reject subsequent commands without disp
   }
 });
 
+test("forbidden environment overrides are refused at construction; inherited ones are stripped", async t => {
+  // Previously refused at initialize; now refused before a facade exists (still before any native allocation).
+  for (const env of [{ CLAUDE_CODE_PROJECT_DIR_NAME: "" }, { CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0" }, { NODE_OPTIONS: "--x" }, { NODE_PATH: "/x" }]) {
+    await assert.rejects(fixture(t, { env }), /environment overrides are not permitted/);
+  }
+  const previous = process.env.NODE_OPTIONS; process.env.NODE_OPTIONS = "--max-old-space-size=64";
+  try { const f = await fixture(t); await f.initialize(); await assert.rejects(readFile(f.pidFile), { code: "ENOENT" }); }
+  finally { if (previous === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = previous; }
+});
 test("unsupported launch intentions and unsafe environments refuse before native allocation", async t => {
-  for (const mode of ["native-policy", "default-tools", "model", "override", "replay", "root"]) {
-    const env = mode === "override" ? { CLAUDE_CODE_PROJECT_DIR_NAME: "" } : mode === "replay" ? { CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "0" }
-      : mode === "root" ? { CLAUDE_CONFIG_DIR: "/other" } : {};
+  for (const mode of ["native-policy", "default-tools", "model", "root"]) {
+    const env = mode === "root" ? { CLAUDE_CONFIG_DIR: "/other" } : {};
     const f = await fixture(t, { env }); const current = await f.read();
     if (mode === "native-policy" || mode === "default-tools" || mode === "model") {
       await writeFile(f.path, JSON.stringify({ ...current,

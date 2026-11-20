@@ -4,6 +4,7 @@ import { realpath } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { readBootIdentity, readProcessGroup } from "@minu/runtime-core";
 import { fileURLToPath } from "node:url";
+import { claudeCodeNativeEnvironment } from "./native-config.js";
 import { ClaudeCodeManagedStore } from "./managed-store.js";
 import { decodeClaudeCodeWorkerBootstrap, type ClaudeCodeWorkerBootstrap } from "./worker-entry.js";
 import {
@@ -71,10 +72,9 @@ export async function launchClaudeCodeWorker(options: ClaudeCodeWorkerLaunchOpti
         bootIdentity ? { bootIdentity } : {});
       manifest = await lease.beginWorkerStart(manifest.revision, expected.generation, expected.reservationId);
       const end = performance.now() + timeout;
-      // Only startup essentials enter the worker environment. Provider auth/config
-      // remains in the private frame; never inherit process.env or Node preloads.
-      const env: NodeJS.ProcessEnv = { CLAUDE_CONFIG_DIR: expected.nativeConfigRoot };
-      for (const key of ["PATH", "HOME", "TMPDIR"]) if (validated.nativeOptions.env[key] !== undefined) env[key] = validated.nativeOptions.env[key];
+      // The worker INHERITS this process's environment (HOME is needed for keychain access) overlaid by the private
+      // frame's overrides; Node preloads and the identity-breaking Claude keys are always dropped. Secrets stay out of argv/metadata.
+      const env = claudeCodeNativeEnvironment(validated.nativeOptions.env);
       // Exact identity markers let a later controller verify the command line before any group signal.
       const markers = ["--minu-runtime-session", sessionId, "--minu-runtime-owner", ownerId, "--minu-runtime-generation", expected.generation];
       child = fork(workerExecutable, markers, { cwd: expected.cwd, execPath: nodeExecutable, execArgv: [], env,

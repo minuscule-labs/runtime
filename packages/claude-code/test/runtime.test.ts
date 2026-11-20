@@ -21,6 +21,7 @@ async function waitFor<T>(read: () => Promise<T>, done: (value: T) => boolean): 
 async function terminal(runtime: ClaudeCodeAgentRuntime, session: string, id: string): Promise<AgentTurn> {
   return (await waitFor(() => runtime.turn(session, id), (value) => !!value && value.status !== "running"))!;
 }
+const dir0 = (session: { cwd: string }) => session.cwd;
 async function setup(t: { after: (fn: () => Promise<void>) => void }, options: ClaudeCodeRuntimeOptions = {}, mode = "") {
   const dir = await mkdtemp(join(tmpdir(), "minu-claude-fixture-"));
   const runtime = new ClaudeCodeAgentRuntime({ executable: fixture, startupTimeoutMs: 5_000,
@@ -233,16 +234,22 @@ test("native turn errors reject send without returning raw errors or killing a h
 
 test("unsupported launch/input/control options fail explicitly before model work", async (t) => {
   const runtime = new ClaudeCodeAgentRuntime({ executable: fixture });
-  for (const config of [{ model: { provider: "anthropic", id: "model" } }, { reasoningLevel: "high" as const },
-    { skillIds: [] }, { systemPrompt: "a", appendSystemPrompt: "b" }]) await assert.rejects(runtime.start(config));
+  // Launch selections are now supported (see the A6 tests below); malformed or conflicting configuration still fails before launch.
+  for (const config of [{ systemPrompt: "a", appendSystemPrompt: "b" }, { model: { provider: "other", id: "model" } },
+    { reasoningLevel: "ultra" as never }, { skillIds: ["a", "a"] }]) await assert.rejects(runtime.start(config));
   const { runtime: live, session } = await setup(t);
   await assert.rejects(live.startTurn(session.id, "image", "image", [{ type: "image", mimeType: "image/png", data: "YQ==" }]), /not supported/);
   await assert.rejects(live.startTurn(session.id, "empty", "  "), /required/);
   await assert.rejects(live.startTurn(session.id, "oversize", "x".repeat(1024 * 1024 + 1)), /exceeds/);
   await assert.rejects(live.startTurn(session.id, "", "text"), /Turn id/);
-  await assert.rejects(live.steer(session.id, "steer"), /not supported/);
+  await assert.rejects(live.steer(session.id, "steer"), /no running turn/, "steering needs a running turn");
   assert.equal(await live.status(session.id), "idle");
-  assert.equal("startManaged" in live, false);
+  // The owner-per-call managed API now exists on the runtime, but an in-process session is never a managed one.
+  assert.equal(typeof live.startManaged, "function");
+  const managedRoot = join(dir0(session), "managed-probe");
+  const separate = new ClaudeCodeAgentRuntime({ executable: fixture, managedRoot });
+  assert.deepEqual(await separate.listManagedSessions("some-owner"), []);
+  assert.equal(await separate.getManagedSession(session.id, "some-owner"), undefined);
 });
 
 for (const mode of ["startup-hang", "startup-exit"]) {
@@ -257,3 +264,55 @@ for (const mode of ["startup-hang", "startup-exit"]) {
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 }
+
+const MODELS = JSON.stringify([
+  { value: "default", displayName: "Default", description: "d", supportsEffort: true, supportedEffortLevels: ["low", "medium", "high"] },
+  { value: "sonnet", resolvedModel: "claude-sonnet-fixture", displayName: "Sonnet", description: "s", supportsEffort: true, supportedEffortLevels: ["low", "high", "max"] },
+  { value: "haiku", displayName: "Haiku", description: "h", supportsEffort: false },
+]);
+const COMMANDS = JSON.stringify([{ name: "compact", description: "builtin", argumentHint: "", builtin: true },
+  { name: "review", description: "Review code", argumentHint: "" }, { name: "deploy", description: "Deploy it", argumentHint: "" }]);
+async function selection(t: { after: (fn: () => Promise<void>) => void }) {
+  const dir = await mkdtemp(join(tmpdir(), "minu-claude-select-"));
+  const argv = join(dir, "argv"), pid = join(dir, "pid");
+  const runtime = new ClaudeCodeAgentRuntime({ executable: fixture, startupTimeoutMs: 5_000, shutdownTimeoutMs: 2_000,
+    env: { PATH: process.env.PATH, HOME: dir, CLAUDE_CONFIG_DIR: join(dir, "config"), MINU_CLAUDE_FIXTURE_MODELS: MODELS,
+      MINU_CLAUDE_FIXTURE_COMMANDS: COMMANDS, MINU_CLAUDE_FIXTURE_ARGV: argv, MINU_CLAUDE_FIXTURE_PID: pid } });
+  t.after(async () => { await rm(dir, { recursive: true, force: true }); });
+  const flag = async (name: string) => (await readFile(argv, "utf8")).trim().split("\n").map(line => JSON.parse(line) as { argv: string[]; probe: boolean })
+    .filter(entry => !entry.probe).at(-1)!.argv.find(arg => arg === name || arg.startsWith(`${name}=`));
+  return { dir, runtime, flag, pid };
+}
+
+test("capabilities() reports models, the union of effort levels plus off, and skills without any session or input", async t => {
+  const { dir, runtime } = await selection(t);
+  const capabilities = await runtime.capabilities({ cwd: dir });
+  assert.deepEqual(capabilities.models.map(m => [m.provider, m.id, m.name, m.reasoning]),
+    [["anthropic", "default", "Default", true], ["anthropic", "sonnet", "Sonnet", true], ["anthropic", "haiku", "Haiku", false]]);
+  assert.deepEqual(capabilities.reasoningLevels, ["off", "low", "medium", "high", "max"]);
+  assert.deepEqual(capabilities.skills, [{ id: "review", name: "review", description: "Review code" }, { id: "deploy", name: "deploy", description: "Deploy it" }]);
+  assert.deepEqual(capabilities.defaultModel, { provider: "anthropic", id: "default" });
+  await assert.rejects(readFile(join(dir, "pid")), { code: "ENOENT" }, "no session or input");
+  await assert.rejects(runtime.capabilities({ cwd: join(dir, "absent") }));
+});
+
+test("model, reasoning and skills are validated against discovery and passed to the engine", async t => {
+  const { dir, runtime, flag } = await selection(t);
+  const session = await runtime.start({ cwd: dir, model: { provider: "anthropic", id: "claude-sonnet-fixture" }, reasoningLevel: "max", skillIds: ["review"] });
+  assert.equal(await flag("--model"), "--model=claude-sonnet-fixture"); assert.equal(await flag("--effort"), "--effort=max");
+  await runtime.send(session.id, "hello"); await runtime.stop(session.id);
+  const off = await runtime.start({ cwd: dir, reasoningLevel: "off", skillIds: [] });
+  assert.equal(await flag("--thinking"), "--thinking=disabled", "off disables thinking (maxThinkingTokens: 0)"); await runtime.stop(off.id);
+  const plain = await runtime.start({ cwd: dir }); assert.equal(await flag("--model"), undefined); assert.equal(await flag("--effort"), undefined);
+  await runtime.stop(plain.id);
+});
+
+test("unsupported selections are refused after discovery with the engine confirmed gone and no session created", async t => {
+  const { dir, runtime, pid } = await selection(t);
+  for (const config of [{ model: { provider: "anthropic", id: "nonexistent" } }, { reasoningLevel: "xhigh" as const },
+    { reasoningLevel: "minimal" as const }, { model: { provider: "anthropic", id: "haiku" }, reasoningLevel: "low" as const }, { skillIds: ["compact"] }, { skillIds: ["missing"] }]) {
+    await assert.rejects(runtime.start(config), /Unsupported|Unknown/);
+    const started = Number(await readFile(pid, "utf8")); assert.throws(() => process.kill(started, 0), { code: "ESRCH" });
+  }
+  await assert.rejects(runtime.start({ model: { provider: "openai", id: "gpt" }, cwd: dir }), /Unsupported/);
+});

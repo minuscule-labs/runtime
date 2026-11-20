@@ -1,23 +1,27 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
-import { join } from "node:path";
 import {
-  runtimeInput, type AgentRuntime, type AgentSession, type AgentEvent, type AgentTurn,
+  runtimeInput, unavailableIntegrationSnapshot, type RuntimeIntegrationSnapshot, type RuntimeSessionProfile, type AgentRuntime, type AgentSession, type AgentEvent, type AgentTurn,
   type RuntimeActivityEvent, type RuntimeActivityOptions, type RuntimeImageContent,
 } from "@minu/runtime-core";
 import { ClaudeCodeAgentRuntime, type ClaudeCodeRuntimeOptions } from "./client.js";
 import { openClaudeCodeNativeSession } from "./native-session.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest, type ClaudeCodeManifestLease, type ClaudeCodeDispatchIdentity } from "./managed-store.js";
 import { decodeClaudeCodeWorkerRegistration, encodeClaudeCodeWorkerRegistration, type ClaudeCodeWorkerRegistrationScope } from "./worker-registration.js";
+import { probeClaudeCode } from "./probe.js";
+import { claudeCodeProfile, projectClaudeCodeIntegrations } from "./session-observe.js";
+import { claudeCodeSupportsImages } from "./launch-options.js";
+import { requireClaudeCodePolicy } from "./worker-lifecycle.js";
 import { turnId as callerTurnId } from "./worker-protocol.js";
 import { Queue } from "./queue.js";
+import { CLAUDE_CODE_FORBIDDEN_ENV, claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
 
 type NativeHandle = Awaited<ReturnType<typeof openClaudeCodeNativeSession>>;
 // One facade per physical worker epoch, even after failed initialization or stop.
 const claimed = new Set<string>();
 interface Admission { lease: ClaudeCodeManifestLease; manifest: ClaudeCodeManagedManifest; active: boolean }
-interface Execution { turn: AgentTurn; fingerprint: string; identity?: ClaudeCodeDispatchIdentity }
+interface Execution { turn: AgentTurn; fingerprint: string; imagesDigest: string; steers: string[]; identity?: ClaudeCodeDispatchIdentity }
 export interface ClaudeCodeManagedSessionOptions {
   store: ClaudeCodeManagedStore;
   scope: ClaudeCodeWorkerRegistrationScope;
@@ -60,6 +64,8 @@ class ManagedSession implements AgentRuntime {
   private policy?: string;
   private native?: NativeHandle;
   private nativeId?: string;
+  private readonly workerId = randomUUID();
+  private imagesProbe?: Promise<boolean>;
   private opening?: Promise<void>;
   private openingAbort?: AbortController;
   private openingUnknown = false;
@@ -73,7 +79,9 @@ class ManagedSession implements AgentRuntime {
   constructor(private readonly store: ClaudeCodeManagedStore, scope: ClaudeCodeWorkerRegistrationScope, options: ClaudeCodeManagedSessionOptions["nativeOptions"] = {}) {
     this.scope = { ...scope };
     this.session = { id: this.scope.sessionId, runtime: "claude-code", ownership: "owned", cwd: this.scope.cwd };
-    this.options = { ...options, env: { ...(options.env ?? process.env) } };
+    if (CLAUDE_CODE_FORBIDDEN_ENV.some(key => options.env?.[key] !== undefined)) throw new Error("Managed Claude Code environment overrides are not permitted");
+    // The worker inherits its process environment (HOME is needed for keychain access); `env` only overlays it.
+    this.options = { ...options, env: claudeCodeNativeEnvironment(options.env) };
     // Validate limits without launching anything. Policy tools are loaded from the manifest.
     new ClaudeCodeAgentRuntime(this.options);
     this.retention = options.turnRetentionLimit ?? 1_000;
@@ -91,13 +99,15 @@ class ManagedSession implements AgentRuntime {
       if (claimed.has(key)) throw new Error("Managed Claude Code worker epoch was already claimed");
       claimed.add(key);
       const context = this.current(this.session.id), manifest = context.manifest;
-      if (manifest.policy.configuration !== "isolated" || manifest.policy.tools === null) throw new Error("Managed native configuration inheritance is not implemented");
-      if (manifest.launchConfig.model || manifest.launchConfig.reasoningLevel !== undefined || manifest.launchConfig.skillIds !== undefined) {
-        throw new Error("Managed Claude Code launch selections are not implemented");
-      }
-      const env = this.options.env!;
-      if ((env.CLAUDE_CONFIG_DIR ?? (env.HOME ? join(env.HOME, ".claude") : undefined)) !== manifest.policy.nativeConfigRoot
-        || env.CLAUDE_CODE_PROJECT_DIR_NAME !== undefined || env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN !== undefined) {
+      // v3/v4 manifests predate the policy and are the read-only MVP policy (their stored tool list applies verbatim).
+      try { requireClaudeCodePolicy(manifest); } catch { throw new Error("Managed Claude Code policy is not supported"); }
+      const policy = manifest.policy;
+      Object.assign(this.options, manifest.version < 5 ? { permissions: "readOnly" as const, tools: [...(policy.tools ?? [])] }
+        : { permissions: policy.permissions !== "custom" ? policy.permissions! : { mode: policy.permissionMode,
+          ...(policy.allowedTools ? { allowedTools: [...policy.allowedTools] } : {}),
+          ...(policy.disallowedTools ? { disallowedTools: [...policy.disallowedTools] } : {}) } },
+      { isolateConfiguration: policy.configuration === "isolated" });
+      if (await resolveClaudeCodeConfigRoot(undefined, this.options.env!).catch(() => undefined) !== manifest.policy.nativeConfigRoot) {
         throw new Error("Managed Claude Code native environment is not verified");
       }
       if (await realpath(manifest.launchConfig.cwd) !== manifest.launchConfig.cwd || !(await stat(manifest.launchConfig.cwd)).isDirectory()) {
@@ -111,7 +121,6 @@ class ManagedSession implements AgentRuntime {
       // after all prelaunch awaits, before entering any bound native opening.
       if (this.stopped) throw new Error("Managed Claude Code session stopped during initialization");
       this.policy = this.policyKey(manifest);
-      this.options.tools = [...manifest.policy.tools];
       if (manifest.native.state === "bound") {
         await this.openNative(context, manifest.native.sessionId, "resume");
         this.nativeId = manifest.native.sessionId;
@@ -150,22 +159,25 @@ class ManagedSession implements AgentRuntime {
   async send(): Promise<void> { throw new Error("Managed worker transport requires stable caller turn IDs"); }
   async startTurn(id: string, requestedId: string, input: string, images?: RuntimeImageContent[]): Promise<AgentTurn> {
     const context = this.current(id), normalized = runtimeInput(input, images), turnId = callerTurnId(requestedId);
-    if (normalized.images.length) throw new Error("Claude Code image input is not implemented");
+    // The dispatch fingerprint identifies the prompt TEXT (what native history records); images are part of conflict detection only.
     const fingerprint = createHash("sha256").update(normalized.input).digest("hex");
+    const imagesDigest = createHash("sha256").update(JSON.stringify(normalized.images.map(image => [image.mimeType, image.data]))).digest("hex");
     const previous = this.turns.get(turnId);
     if (previous) {
-      if (previous.fingerprint !== fingerprint || previous.turn.input !== normalized.input) throw new Error("Turn id conflicts with previously accepted input");
+      if (previous.fingerprint !== fingerprint || previous.imagesDigest !== imagesDigest || previous.turn.input !== normalized.input) throw new Error("Turn id conflicts with previously accepted input");
       return copy(previous.turn);
     }
     if (this.stopped || this.unavailable) throw new Error("Managed Claude Code session is offline");
     if (this.active) throw new Error("Claude Code session is busy");
+    // Refuse before any binding/dispatch state changes, not as a failed dispatch.
+    if (normalized.images.length && !(await this.inputCapabilities(id)).images) throw new Error("Claude Code image input is not supported by the selected model");
     const last = context.manifest.lastDispatch;
     if (context.manifest.native.state === "creating" || last.state === "dispatching") throw new Error("Managed Claude Code input outcome is uncertain");
     if (last.state === "settled" && last.turnId === turnId) throw new Error("Managed Claude Code retained turn is unavailable; redispatch refused");
     // Lifetime-bounded ledger: never evict an accepted ID then silently reuse it.
     if (this.turns.size >= this.retention) throw new Error("Managed Claude Code worker turn-retention lifetime is exhausted");
     const now = new Date().toISOString();
-    const execution: Execution = { fingerprint, turn: { id: turnId, input: normalized.input, status: "running", createdAt: now, updatedAt: now } };
+    const execution: Execution = { fingerprint, imagesDigest, steers: [], turn: { id: turnId, input: normalized.input, status: "running", createdAt: now, updatedAt: now } };
     this.turns.set(turnId, execution); this.active = execution;
     this.emit({ type: "turn_started", operationId: turnId }); this.statusEvent(); this.activity({ phase: "working", observedAt: now });
     try {
@@ -183,7 +195,7 @@ class ManagedSession implements AgentRuntime {
       const identity = { turnId, fingerprint, nativeMessageId: randomUUID() };
       context.manifest = await context.lease.beginDispatch(context.manifest.revision, this.scope.generation, identity);
       execution.identity = identity;
-      await this.native!.startMappedTurn(turnId, normalized.input, identity.nativeMessageId);
+      await this.native!.startMappedTurn(turnId, normalized.input, identity.nativeMessageId, normalized.images.length ? normalized.images : undefined);
     } catch {
       this.unavailable = true;
       this.finish(execution, { ...execution.turn, status: "failed", error: "Managed Claude Code preparation or dispatch failed; outcome unavailable" });
@@ -196,7 +208,7 @@ class ManagedSession implements AgentRuntime {
     this.openingAbort = new AbortController();
     this.openingUnknown = true;
     const common = { runtimeSessionId: this.session.id, nativeSessionId, canonicalCwd: context.manifest.launchConfig.cwd,
-      nativeConfigRoot: context.manifest.policy.nativeConfigRoot, signal: this.openingAbort.signal };
+      nativeConfigRoot: context.manifest.policy.nativeConfigRoot, nativeRoot: true, ...(context.manifest.policy.engineVersion ? { engineVersion: context.manifest.policy.engineVersion } : {}), signal: this.openingAbort.signal };
     const opening = (async () => {
       this.native = await openClaudeCodeNativeSession(context.manifest.launchConfig,
         mode === "create" ? { ...common, mode, firstInput: firstInput! } : { ...common, mode }, this.options);
@@ -251,7 +263,7 @@ class ManagedSession implements AgentRuntime {
     const evidence = this.native.evidence(turn.id);
     if (evidence === "native" || evidence === "undispatched") {
       try {
-        context.manifest = await context.lease.settleDispatch(context.manifest.revision, this.scope.generation, execution.identity, turn.status);
+        context.manifest = await context.lease.settleDispatch(context.manifest.revision, this.scope.generation, execution.identity, turn.status, execution.steers);
         this.finish(execution, turn);
         return;
       } catch { /* A terminal result without confirmed persistence is not durable settlement. */ }
@@ -275,13 +287,40 @@ class ManagedSession implements AgentRuntime {
     this.current(id); return this.stopped || this.unavailable ? "offline" : this.active ? "working" : "idle";
   }
   async messages(id: string) { this.current(id); return this.native ? this.native.runtime.messages(id) : []; }
-  async inputCapabilities(id: string) { this.current(id); return { version: 1 as const, images: false }; }
+  /** Vision support of the selected model: observed from the live engine once open; before the (lazy) native opening, from a
+   * prompt-less probe. Unknown or failed means not verified (false). */
+  async inputCapabilities(id: string) {
+    const context = this.current(id);
+    if (this.native) return this.native.runtime.inputCapabilities?.(id) ?? { version: 1 as const, images: false };
+    this.imagesProbe ??= probeClaudeCode({ cwd: context.manifest.launchConfig.cwd, executable: this.options.executable, env: this.options.env as Record<string, string>,
+      isolate: context.manifest.policy.configuration === "isolated", startupTimeoutMs: this.options.startupTimeoutMs, shutdownTimeoutMs: this.options.shutdownTimeoutMs })
+      .then(probe => claudeCodeSupportsImages(context.manifest.launchConfig, probe), () => false);
+    return { version: 1 as const, images: await this.imagesProbe };
+  }
   async sessionCapabilities(id: string) {
     const live = await this.status(id) !== "offline";
     return { version: 1 as const, safeActivityEvents: live && this.activityHealthy, interrupt: live, reconnectExisting: live,
       interactiveAttach: false, openDiagnostic: false, liveSkillVerification: false };
   }
-  async steer(id: string): Promise<void> { this.current(id); throw new Error("Claude Code steering is not implemented"); }
+  /** Bounded, presentation-safe observations of the live engine. Nothing is promised before the lazy native opening. */
+  async inspectSessionProfile(id: string): Promise<RuntimeSessionProfile> {
+    this.current(id); return claudeCodeProfile(this.native ? this.native.profile() : undefined);
+  }
+  async inspectSessionIntegrations(id: string): Promise<RuntimeIntegrationSnapshot> {
+    this.current(id);
+    if (!this.native || this.stopped || this.unavailable) return unavailableIntegrationSnapshot("unavailable");
+    try { return projectClaudeCodeIntegrations(await this.native.integrations(), this.workerId); }
+    catch { return unavailableIntegrationSnapshot("unavailable"); }
+  }
+  async steer(id: string, input: string): Promise<void> {
+    this.current(id);
+    if (this.stopped || this.unavailable) throw new Error("Managed Claude Code session is offline");
+    const execution = this.active, text = runtimeInput(input, undefined).input;
+    if (!execution?.identity || !this.native) throw new Error("Claude Code session has no running turn to steer");
+    // Record BEFORE the native write: only recorded steering deliveries may appear in history at settlement.
+    execution.steers.push(createHash("sha256").update(text).digest("hex"));
+    await this.native.runtime.steer(id, text);
+  }
   async interrupt(id: string): Promise<void> {
     this.current(id);
     if (this.stopped || this.unavailable) throw new Error("Managed Claude Code session is offline");

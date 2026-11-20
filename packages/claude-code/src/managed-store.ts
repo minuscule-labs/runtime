@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import type { AgentStartConfig } from "@minu/runtime-core";
 import { withClaudeCodeLifecycleLock } from "./lifecycle-lock.js";
+import { CLAUDE_CODE_PERMISSION_MODES, CLAUDE_CODE_READ_ONLY_TOOLS, type ClaudeCodePermissionLabel, type ClaudeCodePermissionMode } from "./permissions.js";
 import {
   CLAUDE_CODE_WORKER_REGISTRATION_MAX_BYTES, decodeClaudeCodeWorkerRegistration, encodeClaudeCodeWorkerRegistration,
   type ClaudeCodeWorkerRegistration, type ClaudeCodeWorkerRegistrationScope,
@@ -22,12 +23,20 @@ export type ClaudeCodeNativeBinding =
 
 /** Serializable launch intent, not an authorization grant or verified native state. */
 export interface ClaudeCodeManagedPolicy {
+  /** "native" inherits the user's settings, hooks, MCP, plugins and skills (as running `claude` in that cwd would). */
   configuration: "native" | "isolated";
-  permissionMode: "default";
+  permissionMode: ClaudeCodePermissionMode;
   /** Immutable authorized native root; never inferred from Runtime's storage root. */
   nativeConfigRoot: string;
   /** null means native tool defaults; [] means no tools. Neither grants permission. */
   tools: string[] | null;
+  /** v5+. Absent on v3/v4 manifests, which are read as "readOnly". */
+  permissions?: ClaudeCodePermissionLabel;
+  allowedTools?: string[];
+  disallowedTools?: string[];
+  /** v5+. claude_code_version the session was created with. Resume refuses a changed MAJOR; minor/patch changes are accepted
+   * when the history parser accepts the file. */
+  engineVersion?: string;
 }
 
 export interface ClaudeCodeDispatchIdentity {
@@ -40,7 +49,9 @@ export interface ClaudeCodeDispatchIdentity {
 export type ClaudeCodeDispatchState =
   | { state: "none" }
   | (ClaudeCodeDispatchIdentity & { state: "dispatching"; generation: string })
-  | (ClaudeCodeDispatchIdentity & { state: "settled"; generation: string; outcome: "completed" | "failed" | "interrupted" });
+  | (ClaudeCodeDispatchIdentity & { state: "settled"; generation: string; outcome: "completed" | "failed" | "interrupted";
+    /** sha256 of each steering message sent during this dispatch; lets history eligibility accept exactly those deliveries. */
+    steers?: string[] });
 
 export interface ClaudeCodeWorkerProcess { pid: number; processGroupId: number | null }
 /** v4 launches carry the exact argv identity markers (`marked`) and the boot they started in. Neither
@@ -65,8 +76,8 @@ type WorkerOperation =
 
 /** Internal resume material. Never expose this as a sanitized inventory/profile. */
 export interface ClaudeCodeManagedManifest {
-  /** 3 predates launch identity (bootIdentity/markers); both stay readable. */
-  version: 3 | 4;
+  /** 3 predates launch identity (bootIdentity/markers); 4 predates the permission policy (read as readOnly). All stay readable. */
+  version: 3 | 4 | 5;
   runtime: "claude-code";
   revision: number;
   generation: string;
@@ -95,7 +106,7 @@ export interface ClaudeCodeManifestLease {
   beginDispatch(expectedRevision: number, generation: string, identity: ClaudeCodeDispatchIdentity): Promise<ClaudeCodeManagedManifest>;
   /** Only the current, unfenced generation and exact native/caller input may record a terminal result. */
   settleDispatch(expectedRevision: number, generation: string, identity: ClaudeCodeDispatchIdentity,
-    outcome: "completed" | "failed" | "interrupted"): Promise<ClaudeCodeManagedManifest>;
+    outcome: "completed" | "failed" | "interrupted", steers?: string[]): Promise<ClaudeCodeManagedManifest>;
   reserveWorker(expectedRevision: number, generation: string, reservationId: string, workerExecutable: string,
     launch?: ClaudeCodeWorkerLaunchIdentity): Promise<ClaudeCodeManagedManifest>;
   /** Commit before fork. A starting reservation with no recorded PID remains uncertain. */
@@ -145,7 +156,9 @@ function validDispatch(value: unknown): value is ClaudeCodeDispatchState {
   return dispatchIdentity(value) && typeof value.generation === "string" && ID.test(value.generation)
     && (value.state === "dispatching" ? keys(value, ["state", "turnId", "fingerprint", "nativeMessageId", "generation"])
       : value.state === "settled" && ["completed", "failed", "interrupted"].includes(value.outcome as string)
-        && keys(value, ["state", "turnId", "fingerprint", "nativeMessageId", "generation", "outcome"]));
+        && keys(value, ["state", "turnId", "fingerprint", "nativeMessageId", "generation", "outcome", "steers"])
+        && (value.steers === undefined || (Array.isArray(value.steers) && value.steers.length <= 64
+          && value.steers.every(item => typeof item === "string" && /^[a-f0-9]{64}$/.test(item)))));
 }
 function sameDispatch(left: ClaudeCodeDispatchIdentity, right: ClaudeCodeDispatchIdentity): boolean {
   return left.turnId === right.turnId && left.fingerprint === right.fingerprint && left.nativeMessageId === right.nativeMessageId;
@@ -171,7 +184,7 @@ function validateWorker(worker: unknown, manifest: ClaudeCodeManagedManifest): v
     || typeof worker.generation !== "string" || !ID.test(worker.generation)
     || typeof worker.reservationId !== "string" || !UUID.test(worker.reservationId)
     || !normalizedPath(worker.workerExecutable)) throw new Error("Invalid Claude Code worker reservation");
-  if ((worker.bootIdentity !== undefined || worker.marked !== undefined) && manifest.version !== 4) throw new Error("Invalid Claude Code worker launch identity");
+  if ((worker.bootIdentity !== undefined || worker.marked !== undefined) && manifest.version < 4) throw new Error("Invalid Claude Code worker launch identity");
   if ((worker.bootIdentity !== undefined && (typeof worker.bootIdentity !== "string" || !/^[a-z]+:[0-9a-f-]{32,36}$/.test(worker.bootIdentity)))
     || (worker.marked !== undefined && worker.marked !== true)) throw new Error("Invalid Claude Code worker launch identity");
   const common = ["state", "generation", "reservationId", "workerExecutable", "bootIdentity", "marked"];
@@ -185,6 +198,29 @@ function validateWorker(worker: unknown, manifest: ClaudeCodeManagedManifest): v
   }
   throw new Error("Invalid Claude Code worker registration state");
 }
+const LABELS = ["full", "edits", "readOnly", "custom"];
+function validPolicy(policy: Record<string, unknown>, version: number): boolean {
+  if (!["native", "isolated"].includes(policy.configuration as string) || !normalizedPath(policy.nativeConfigRoot)
+    || !(policy.tools === null || stringList(policy.tools, 128))) return false;
+  if (version < 5) return policy.permissionMode === "default" && keys(policy, ["configuration", "permissionMode", "tools", "nativeConfigRoot"]);
+  if (!keys(policy, ["configuration", "permissionMode", "tools", "nativeConfigRoot", "permissions", "allowedTools", "disallowedTools", "engineVersion"])
+    || (policy.engineVersion !== undefined && (typeof policy.engineVersion !== "string" || !/^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/.test(policy.engineVersion)))
+    || !CLAUDE_CODE_PERMISSION_MODES.includes(policy.permissionMode as string) || !LABELS.includes(policy.permissions as string)
+    || (policy.allowedTools !== undefined && !stringList(policy.allowedTools, 128))
+    || (policy.disallowedTools !== undefined && !stringList(policy.disallowedTools, 128))) return false;
+  const mode = policy.permissionMode as ClaudeCodePermissionMode;
+  // The label must describe the stored fields, so a hand-edited manifest cannot widen what a label implies.
+  if (policy.permissions === "readOnly") return mode === "default" && policy.allowedTools === undefined && policy.disallowedTools === undefined
+    && Array.isArray(policy.tools) && policy.tools.length === 3 && CLAUDE_CODE_READ_ONLY_TOOLS.every(tool => (policy.tools as string[]).includes(tool));
+  if (policy.permissions === "edits") return mode === "acceptEdits" && policy.tools === null && policy.allowedTools === undefined && policy.disallowedTools === undefined;
+  if (policy.permissions === "full") return mode === "bypassPermissions" && policy.tools === null && policy.allowedTools === undefined && policy.disallowedTools === undefined;
+  return policy.tools === null;
+}
+/** Manifests before v5 predate the policy and are always the read-only MVP policy. */
+export function claudeCodeEffectivePermissions(m: ClaudeCodeManagedManifest): ClaudeCodePermissionLabel {
+  return m.version < 5 ? "readOnly" : m.policy.permissions!;
+}
+
 function validate(value: ClaudeCodeManagedManifest): void {
   if (!record(value)) throw new Error("Invalid Claude Code manifest");
   identity(value.id);
@@ -193,7 +229,7 @@ function validate(value: ClaudeCodeManagedManifest): void {
   const config = value.launchConfig;
   const native = value.native;
   const policy = value.policy;
-  if (![3, 4].includes(value.version) || value.runtime !== "claude-code"
+  if (![3, 4, 5].includes(value.version) || value.runtime !== "claude-code"
     || !keys(value, ["version", "runtime", "revision", "generation", "requiresExplicitResume", "id", "ownerId", "native", "worker", "lastDispatch", "launchConfig", "policy", "createdAt"])
     || !Number.isSafeInteger(value.revision) || value.revision < 0 || value.revision >= Number.MAX_SAFE_INTEGER
     || typeof value.requiresExplicitResume !== "boolean"
@@ -202,9 +238,7 @@ function validate(value: ClaudeCodeManagedManifest): void {
       : ["creating", "bound"].includes(native.state) && typeof native.sessionId === "string"
         && UUID.test(native.sessionId) && keys(native, ["state", "sessionId"]))
     || !validDispatch(value.lastDispatch) || (native.state !== "bound" && value.lastDispatch.state !== "none")
-    || !record(policy) || !["native", "isolated"].includes(policy.configuration)
-    || policy.permissionMode !== "default" || !keys(policy, ["configuration", "permissionMode", "tools", "nativeConfigRoot"])
-    || !normalizedPath(policy.nativeConfigRoot) || !(policy.tools === null || stringList(policy.tools, 128))
+    || !record(policy) || !validPolicy(policy, value.version)
     || !record(config) || !normalizedPath(config.cwd)
     || !keys(config, ["cwd", "systemPrompt", "appendSystemPrompt", "model", "reasoningLevel", "skillIds"])
     || (config.systemPrompt !== undefined && typeof config.systemPrompt !== "string")
@@ -269,7 +303,7 @@ export class ClaudeCodeManagedStore {
         beginNativeCreation: (revision, sessionId) => mutate(() => this.bindLocked(id, ownerId, revision, sessionId, false)),
         bindNativeSession: (revision, sessionId) => mutate(() => this.bindLocked(id, ownerId, revision, sessionId, true)),
         beginDispatch: (revision, generation, identity) => mutate(() => this.dispatchLocked(id, ownerId, revision, generation, identity)),
-        settleDispatch: (revision, generation, identity, outcome) => mutate(() => this.dispatchLocked(id, ownerId, revision, generation, identity, { outcome })),
+        settleDispatch: (revision, generation, identity, outcome, steers) => mutate(() => this.dispatchLocked(id, ownerId, revision, generation, identity, { outcome, ...(steers?.length ? { steers } : {}) })),
         reserveWorker: (revision, generation, reservationId, workerExecutable, launch) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "reserve", reservationId, workerExecutable, ...(launch ? { launch } : {}) })),
         beginWorkerStart: (revision, generation, reservationId) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "begin", reservationId })),
         recordWorkerProcess: (revision, generation, reservationId, pid, processGroupId) => mutate(() => this.workerLocked(id, ownerId, revision, generation, { type: "process", reservationId, pid, processGroupId })),
@@ -370,7 +404,7 @@ export class ClaudeCodeManagedStore {
   }
   private async dispatchLocked(
     id: string, ownerId: string, revision: number, generation: string, identity: ClaudeCodeDispatchIdentity,
-    completion?: { outcome: "completed" | "failed" | "interrupted" },
+    completion?: { outcome: "completed" | "failed" | "interrupted"; steers?: string[] },
   ): Promise<ClaudeCodeManagedManifest> {
     const outcome = completion?.outcome;
     const snapshot = JSON.parse(JSON.stringify(identity)) as ClaudeCodeDispatchIdentity;
@@ -394,7 +428,7 @@ export class ClaudeCodeManagedStore {
     }
     const lastDispatch: ClaudeCodeDispatchState = outcome === undefined
       ? { ...snapshot, state: "dispatching", generation }
-      : { ...snapshot, state: "settled", generation, outcome };
+      : { ...snapshot, state: "settled", generation, outcome, ...(completion!.steers?.length ? { steers: [...new Set(completion!.steers)] } : {}) };
     return this.publishUpdate({ ...current, revision: current.revision + 1, lastDispatch });
   }
   private async removeLocked(id: string, ownerId: string, revision: number): Promise<ClaudeCodeManagedManifest> {
@@ -432,7 +466,7 @@ export class ClaudeCodeManagedStore {
       }
       next = { state: "reserved", generation, reservationId: operation.reservationId, workerExecutable: operation.workerExecutable,
         ...(operation.launch ? { marked: true as const, ...(operation.launch.bootIdentity ? { bootIdentity: operation.launch.bootIdentity } : {}) } : {}) };
-      return this.publishUpdate({ ...current, revision: current.revision + 1, ...(operation.launch ? { version: 4 as const } : {}), worker: next });
+      return this.publishUpdate({ ...current, revision: current.revision + 1, ...(operation.launch ? { version: Math.max(current.version, 4) as 4 | 5 } : {}), worker: next });
     } else {
       if (worker.state === "none" || worker.reservationId !== operation.reservationId) throw new ClaudeCodeManifestConflictError("Claude Code worker reservation changed");
       if (operation.type === "release") {

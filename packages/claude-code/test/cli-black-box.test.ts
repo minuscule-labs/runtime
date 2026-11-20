@@ -41,7 +41,7 @@ async function fixture(t: TestContext) {
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", NO_PROXY: "127.0.0.1,localhost",
   };
   const args = (command: string, flags: Flags = {}) => [cliPath, command, ...Object.entries({
-    "--owner": "black-box-owner", "--state": state, "--native-root": native, ...flags,
+    "--owner": "black-box-owner", "--state": state, "--native-root": native, "--executable": "bundled", ...flags,
   }).flat()];
   const raw = (argv: string[], input?: string | Buffer) => new Promise<Result>((resolve, reject) => {
     const child = execFile(process.execPath, argv, { env, timeout: 8_000, maxBuffer: 128 * 1024 }, (error, stdout, stderr) => {

@@ -11,7 +11,7 @@ export async function runClaudeCodeCli(args = process.argv.slice(2)): Promise<vo
   const verbs = ["create", "status", "list", "get", "turn", "run", "history", "interrupt", "stop", "resume", "events", "activity"];
   if (!verbs.includes(command)) throw new Error("invalid_command");
   for (let i = 0; i < rest.length; i += 2) {
-    if (!["--owner", "--state", "--native-root", "--cwd", "--id", "--turn-id"].includes(rest[i])
+    if (!["--owner", "--state", "--native-root", "--cwd", "--id", "--turn-id", "--executable"].includes(rest[i])
       || !rest[i + 1] || flags.has(rest[i])) throw new Error("invalid_arguments");
     flags.set(rest[i], rest[i + 1]);
   }
@@ -22,7 +22,7 @@ export async function runClaudeCodeCli(args = process.argv.slice(2)): Promise<vo
   for (const key of ["HOME", "PATH", "TMPDIR", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "NO_PROXY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key]!;
   }
-  const runtime = new ClaudeCodeManagedRuntime({ ownerId, storeRoot, nativeConfigRoot, nativeOptions: { env } });
+  const runtime = new ClaudeCodeManagedRuntime({ ownerId, storeRoot, nativeConfigRoot, nativeOptions: { env, ...(flags.has("--executable") ? { executable: flags.get("--executable") } : {}) } });
   const print = (value: unknown) => process.stdout.write(JSON.stringify(value) + "\n");
   if (command === "create") { print(await runtime.startManaged({ cwd: flags.get("--cwd") }, ownerId)); return; }
   if (command === "list") { print(await runtime.listManagedSessions(ownerId)); return; }

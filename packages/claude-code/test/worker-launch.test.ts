@@ -101,11 +101,17 @@ test("producer commits before real fork, records before private bootstrap, publi
   assert.deepEqual(observed.argv.slice(2), markers);
   assert.equal(observed.manifest.version, 4); assert.equal(observed.manifest.worker.marked, true);
   if (process.platform === "darwin" || process.platform === "linux") assert.match(observed.manifest.worker.bootIdentity, /^(darwin|linux):[0-9a-f-]{32,36}$/);
-  assert.equal(observed.environment.ANTHROPIC_API_KEY, undefined); assert.equal(observed.environment.NODE_OPTIONS, undefined);
-  assert.deepEqual(Object.keys(observed.environment).filter(key => key !== "__CF_USER_TEXT_ENCODING").sort(), ["CLAUDE_CONFIG_DIR", "HOME", "PATH", "TMPDIR"]);
-  assert.deepEqual(Object.keys(f.forks[0].options.env!).sort(), ["CLAUDE_CONFIG_DIR", "HOME", "PATH", "TMPDIR"]);
+  // Native auth: the worker INHERITS the process environment overlaid by the private overrides (the MVP's
+  // "exactly four keys, no provider key" rule was removed); identity-breaking keys are still stripped.
+  const expectedEnv = { ...Object.fromEntries(Object.entries(process.env).filter(([, v]) => v !== undefined)), ...f.options.nativeOptions.env };
+  for (const key of ["NODE_OPTIONS", "NODE_PATH", "CLAUDE_CODE_PROJECT_DIR_NAME", "CLAUDE_CODE_RESUME_INTERRUPTED_TURN"]) delete (expectedEnv as Record<string, unknown>)[key];
+  assert.equal(observed.environment.ANTHROPIC_API_KEY, "PRIVATE_PRODUCER_AUTH"); assert.equal(observed.environment.NODE_OPTIONS, undefined);
+  assert.equal(observed.environment.HOME, f.root);
+  for (const [key, value] of Object.entries(expectedEnv)) assert.equal(observed.environment[key], value, key);
+  assert.deepEqual(f.forks[0].options.env, expectedEnv);
   assert.deepEqual(f.forks[0].options.execArgv, []); assert.deepEqual(f.forks[0].args, markers); assert.equal(f.forks[0].options.detached, true);
-  assert.ok(!JSON.stringify(f.forks[0]).includes("PRIVATE_PRODUCER_AUTH"));
+  // The child ENVIRONMENT now legitimately carries native auth; argv, entry and options other than env must not.
+  assert.ok(!JSON.stringify({ ...f.forks[0], options: { ...f.forks[0].options, env: undefined } }).includes("PRIVATE_PRODUCER_AUTH"));
   const published = await f.read(), registration = decode(attempt.registration!, attempt.scope);
   assert.equal(published.worker.state, "live"); assert.equal(published.revision, 4);
   if (published.worker.state === "live") assert.deepEqual(published.worker.registration, registration);
@@ -269,12 +275,19 @@ test("managed limit ceilings remain valid through real bootstrap initialization"
   await assert.rejects(readFile(f.pidFile), { code: "ENOENT" });
 });
 
-for (const invalid of ["missing-env", "callback", "oversized", "limit", "retention-ceiling", "buffer-ceiling"] as const) {
+test("a minimal env override inherits the rest of the process environment", async t => {
+  const f = await fixture(t, "valid"); f.options.nativeOptions.env = { HOME: f.root, MINU_PRODUCER_PEER: "valid" };
+  const attempt = await f.launch(); assert.equal(attempt.state, "adopted");
+  const observed = JSON.parse(await readFile(join(f.root, "peer-observed.json"), "utf8"));
+  assert.equal(observed.environment.PATH, process.env.PATH); assert.equal(observed.environment.NODE_OPTIONS, undefined);
+});
+
+for (const invalid of ["forbidden-env", "callback", "oversized", "limit", "retention-ceiling", "buffer-ceiling"] as const) {
   test(`invalid private ${invalid} fails preflight before metadata mutation or fork`, async t => {
     const f = await fixture(t), before = await f.read();
-    if (invalid === "missing-env") Reflect.deleteProperty(f.options.nativeOptions, "env");
+    if (invalid === "forbidden-env") f.options.nativeOptions.env!.NODE_OPTIONS = "--require /x";
     if (invalid === "callback") Object.assign(f.options.nativeOptions, { canUseTool: async () => ({ behavior: "allow" }) });
-    if (invalid === "oversized") f.options.nativeOptions.env.SECRET = "x".repeat(65_536);
+    if (invalid === "oversized") f.options.nativeOptions.env!.SECRET = "x".repeat(65_536);
     if (invalid === "limit") f.options.nativeOptions.startupTimeoutMs = 0;
     if (invalid === "retention-ceiling") f.options.nativeOptions.turnRetentionLimit = 1_001;
     if (invalid === "buffer-ceiling") f.options.nativeOptions.eventBufferLimit = 4_097;
