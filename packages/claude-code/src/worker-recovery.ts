@@ -59,8 +59,5 @@ export async function recoverClaudeCodeWorker(store: ClaudeCodeManagedStore, id:
       if (options.remove) { await lease.removeSession(m.revision); return "removed"; }
       return "stopped";
     });
-  } catch (error) {
-    if (process.env.MINU_RECOVERY_DIAGNOSTIC === "1") console.error("RECOVERY_FAILURE_DIAGNOSTIC", error);
-    throw unavailable();
-  }
+  } catch { throw unavailable(); }
 }

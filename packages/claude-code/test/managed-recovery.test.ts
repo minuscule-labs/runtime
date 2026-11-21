@@ -7,9 +7,6 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 import { processGroupAbsent } from "@minu/runtime-core";
-
-// Temporary diagnosis of the macOS exact-main recovery failure; fixtures only.
-process.env.MINU_RECOVERY_DIAGNOSTIC = "1";
 import { ClaudeCodeManagedRuntime, type ClaudeCodeManagedRuntimeOptions } from "../src/managed-runtime.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest } from "../src/managed-store.js";
 import { claudeCodeNativeProjectKey } from "../src/native-history.js";
@@ -95,8 +92,7 @@ test("an externally SIGKILLed worker group is cleared through group-absence proo
   f.track(await f.read(session.id)); await next.send(session.id, "after recovery"); await next.stop(session.id);
 });
 
-for (let diagnosticAttempt = 1; diagnosticAttempt <= 8; diagnosticAttempt++) {
-test(`a corrupt registration or dead endpoint falls through to verified termination of the marked group [diagnostic ${diagnosticAttempt}]`, { timeout: 30_000 }, async t => {
+test("a corrupt registration or dead endpoint falls through to verified termination of the marked group", { timeout: 30_000 }, async t => {
   const f = await fixture(t), session = await f.runtime.start({ cwd: f.cwd });
   const before = f.track(await f.read(session.id)), group = groupOf(before)!, nativePid = await f.nativePid().catch(() => 0);
   assert.equal(before.worker.state === "live" && before.worker.marked, true);
@@ -105,7 +101,6 @@ test(`a corrupt registration or dead endpoint falls through to verified terminat
   assert.equal(processGroupAbsent(group), "absent"); if (nativePid) assert.equal(alive(nativePid), false);
   const stopped = await f.read(session.id); assert.equal(stopped.worker.state, "none"); assert.equal(stopped.requiresExplicitResume, true);
 });
-}
 
 test("a legacy unmarked worker is never signalled: it stays fenced until absence is proven", { timeout: 30_000 }, async t => {
   const f = await fixture(t), session = await f.runtime.start({ cwd: f.cwd });

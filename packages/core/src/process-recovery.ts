@@ -9,10 +9,7 @@ const execute = (file: string, args: string[], options: { timeout: number; env?:
     const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("Process query timed out")); }, options.timeout);
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk; if (stdout.length > 64 * 1024) child.kill("SIGKILL"); });
     child.once("error", error => { clearTimeout(timer); reject(error); });
-    child.once("close", code => {
-      if (process.env.MINU_RECOVERY_DIAGNOSTIC === "1" && file === "ps" && args.includes("args=")) console.error("RECOVERY_PS_DIAGNOSTIC", JSON.stringify({ code, stdout }));
-      clearTimeout(timer); code === 0 && stdout.length <= 64 * 1024 ? resolve({ stdout }) : reject(new Error("Process query failed"));
-    });
+    child.once("close", code => { clearTimeout(timer); code === 0 && stdout.length <= 64 * 1024 ? resolve({ stdout }) : reject(new Error("Process query failed")); });
   });
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 type Kill = (pid: number, signal: NodeJS.Signals | 0) => unknown;
@@ -49,10 +46,7 @@ export function processGroupAbsent(pgid: number, kill: Kill = process.kill): "ab
   catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ESRCH") return "absent";
-    if (code === "EPERM") {
-      if (process.env.MINU_RECOVERY_DIAGNOSTIC === "1") console.error("RECOVERY_GROUP_UNPROVEN_DIAGNOSTIC", pgid);
-      return "unproven";
-    }
+    if (code === "EPERM") return "unproven";
     throw error;
   }
 }
