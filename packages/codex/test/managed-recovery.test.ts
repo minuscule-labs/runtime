@@ -98,7 +98,8 @@ test("an externally SIGKILLed worker group is cleared through group-absence proo
   await f.runtime.destroy(session.id, "owner"); assert.equal(await f.store.read(session.id, "owner"), undefined);
 });
 
-test("an unresponsive marked worker falls through to verified termination; an unmarked one is never signalled", { timeout: 40_000 }, async t => {
+for (let diagnosticAttempt = 1; diagnosticAttempt <= 8; diagnosticAttempt++) {
+test(`an unresponsive marked worker falls through to verified termination; an unmarked one is never signalled [diagnostic ${diagnosticAttempt}]`, { timeout: 40_000 }, async t => {
   const f = await fixture(t), session = await f.runtime.startManaged({ cwd: f.directory }, "owner");
   const before = f.track(await f.read(session.id)); if (before.worker.state !== "ready") return;
   const group = before.worker.pgid!, pid = before.worker.connection.pid;
@@ -115,6 +116,7 @@ test("an unresponsive marked worker falls through to verified termination; an un
   await recoverCodexWorker(f.store, session.id, "owner", { timeouts: quick });
   assert.equal(processGroupAbsent(group), "absent"); assert.equal((await f.read(session.id)).worker.state, "none");
 });
+}
 
 test("reserved and aborted slots clear only on proof; a legacy pid without a group does not; resume then relaunches", { timeout: 40_000 }, async t => {
   const f = await fixture(t);
