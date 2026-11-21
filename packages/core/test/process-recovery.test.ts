@@ -89,6 +89,51 @@ test("a group that survives SIGKILL is reported, never assumed gone", async () =
   assert.deepEqual(sent.filter(([, s]) => s !== 0), [[-4242, "SIGTERM"], [-4242, "SIGKILL"]]);
 });
 
+test("transient EPERM after SIGKILL waits for ESRCH within the existing proof budget", async () => {
+  const signals: NodeJS.Signals[] = [];
+  let killed = false, uncertain = 0;
+  await terminateVerifiedGroup({
+    pgid: 4242, entryPath: "/e.js", markers: { session: SESSION, owner: OWNER, generation: "1" }, termMs: 0, killMs: 500,
+    kill: (_pid, signal) => {
+      if (signal !== 0) { signals.push(signal); if (signal === "SIGKILL") killed = true; return; }
+      if (!killed) return;
+      if (uncertain++ < 3) throw Object.assign(new Error("Permission temporarily unavailable"), { code: "EPERM" });
+      throw Object.assign(new Error("Gone"), { code: "ESRCH" });
+    },
+    readProcess: async () => `4242 node /e.js ${markers(1).join(" ")}`,
+  });
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+  assert.ok(uncertain >= 4, "Only ESRCH, not a transient permission failure, proves absence");
+});
+
+test("persistent EPERM after SIGKILL remains unproven", async () => {
+  const signals: NodeJS.Signals[] = [];
+  let killed = false;
+  await assert.rejects(terminateVerifiedGroup({
+    pgid: 4242, entryPath: "/e.js", markers: { session: SESSION, owner: OWNER, generation: "1" }, termMs: 0, killMs: 30,
+    kill: (_pid, signal) => {
+      if (signal !== 0) { signals.push(signal); if (signal === "SIGKILL") killed = true; return; }
+      if (killed) throw Object.assign(new Error("Unproven"), { code: "EPERM" });
+    },
+    readProcess: async () => `4242 node /e.js ${markers(1).join(" ")}`,
+  }), /could not be inspected|did not exit|could not be proven/);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("persistent EPERM after SIGTERM forbids escalation without an inspectable group", async () => {
+  const signals: NodeJS.Signals[] = [];
+  let signalled = false;
+  await assert.rejects(terminateVerifiedGroup({
+    pgid: 4242, entryPath: "/e.js", markers: { session: SESSION, owner: OWNER, generation: "1" }, termMs: 30, killMs: 30,
+    kill: (_pid, signal) => {
+      if (signal !== 0) { signals.push(signal); signalled = true; return; }
+      if (signalled) throw Object.assign(new Error("Unproven"), { code: "EPERM" });
+    },
+    readProcess: async () => `4242 node /e.js ${markers(1).join(" ")}`,
+  }), /could not be inspected|did not exit|could not be proven/);
+  assert.deepEqual(signals, ["SIGTERM"]);
+});
+
 test("boot identity: a changed boot proves absence, unknown proves nothing", async () => {
   assert.equal(await bootChanged("darwin:a", async () => "darwin:b"), true);
   assert.equal(await bootChanged("darwin:a", async () => "darwin:a"), false);

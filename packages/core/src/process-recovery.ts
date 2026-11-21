@@ -101,8 +101,16 @@ export async function terminateVerifiedGroup(options: VerifiedTerminationOptions
   for (const [signal, ms] of [["SIGTERM", termMs], ["SIGKILL", killMs]] as const) {
     try { kill(-pgid, signal); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
     const deadline = Date.now() + ms;
-    while (processGroupAbsent(pgid, kill) === "present" && Date.now() < deadline) await delay(25);
-    if (processGroupAbsent(pgid, kill) === "absent") return;
+    let state = processGroupAbsent(pgid, kill);
+    // EPERM is uncertainty, not failure to wait or proof of exit. Allow the
+    // existing budget for ESRCH, including transient uncertainty after KILL.
+    while (state !== "absent" && Date.now() < deadline) {
+      await delay(25);
+      state = processGroupAbsent(pgid, kill);
+    }
+    if (state === "absent") return;
+    // Do not escalate to another signal when the group remains uninspectable.
+    if (state === "unproven") throw new Error("Process group exit could not be proven");
   }
   throw new Error("Process group did not exit");
 }
