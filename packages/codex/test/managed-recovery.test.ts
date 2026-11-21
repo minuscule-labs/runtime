@@ -8,6 +8,9 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 import { processGroupAbsent } from "@minu/runtime-core";
+
+// Temporary diagnosis of the macOS exact-main recovery failure; fixtures only.
+process.env.MINU_RECOVERY_DIAGNOSTIC = "1";
 import { CodexAgentRuntime, type CodexAgentRuntimeOptions } from "../src/index.js";
 import { CodexManagedStore, type CodexManagedManifest } from "../src/managed-store.js";
 import { createPendingCodexSession } from "../src/managed-native.js";

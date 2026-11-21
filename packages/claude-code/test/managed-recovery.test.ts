@@ -7,6 +7,9 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 import { processGroupAbsent } from "@minu/runtime-core";
+
+// Temporary diagnosis of the macOS exact-main recovery failure; fixtures only.
+process.env.MINU_RECOVERY_DIAGNOSTIC = "1";
 import { ClaudeCodeManagedRuntime, type ClaudeCodeManagedRuntimeOptions } from "../src/managed-runtime.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest } from "../src/managed-store.js";
 import { claudeCodeNativeProjectKey } from "../src/native-history.js";
