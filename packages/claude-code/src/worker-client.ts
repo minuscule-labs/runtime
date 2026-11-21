@@ -134,10 +134,14 @@ export class ClaudeCodeWorkerClient {
   private async *stream(path: string, signal: AbortSignal, activity = false): AsyncIterable<AgentEvent | RuntimeActivityEvent> {
     if (signal.aborted) return;
     const controller = new AbortController();
-    const abort = () => controller.abort(signal.reason);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const abort = () => {
+      controller.abort(signal.reason);
+      // Settle a pending read even if fetch's abort forwarding was collected.
+      void reader?.cancel().catch(() => {});
+    };
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     // Bound connection/header wait without imposing a lifetime on a healthy stream.
     const timer = setTimeout(() => controller.abort(new ClaudeCodeWorkerError("request_timed_out")), this.requestMs);
     try {
@@ -145,6 +149,7 @@ export class ClaudeCodeWorkerClient {
       clearTimeout(timer);
       if (!response.body) throw new ClaudeCodeWorkerError("invalid_response");
       reader = response.body.getReader();
+      if (signal.aborted) return;
       let pending = Buffer.alloc(0);
       while (true) {
         const chunk = await reader.read();

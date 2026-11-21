@@ -953,9 +953,32 @@ test("a creating snapshot read in flight cannot falsely fence a newly bound work
 test("two pending workers cannot both allocate/dispatch for one identity", { timeout: 10_000 }, async t => {
   const f = await fixture(t);
   const workers = await Promise.all([f.launch(), f.launch()]);
-  await Promise.all(workers.map(w => w.client.request("startTurn", { turnId: "first", input: "hello" })));
-  await until(async () => Promise.all(workers.map(w => w.client.request<string>("status"))),
+  const admitted = await Promise.allSettled(workers.map(w => w.client.request("startTurn", { turnId: "first", input: "hello" })));
+  assert.ok(admitted.some(result => result.status === "fulfilled"), "One worker must admit the turn");
+  // The loser may observe creating/bound before admission instead of failing an
+  // already-admitted preparation. Only that explicit offline rejection is valid.
+  for (const result of admitted) if (result.status === "rejected") assert.match(String(result.reason), /Codex bridge request failed \(503\)/);
+  const states = await until(async () => Promise.all(workers.map(w => w.client.request<string>("status"))),
     states => states.includes("offline") && states.includes("idle"), "Pending workers did not settle");
+  const winner = states.indexOf("idle");
+  assert.equal(admitted[winner].status, "fulfilled");
+  assert.equal((await terminal(workers[winner].client, "first")).status, "completed");
+  for (let index = 0; index < admitted.length; index++) if (admitted[index].status === "rejected") assert.equal(states[index], "offline");
+  assert.equal((await f.log()).filter(call => call.method === "thread/start").length, 1);
+  assert.equal((await f.log()).filter(call => call.method === "turn/start").length, 1);
+});
+
+test("a competing pending worker rejects input once native creation has begun", { timeout: 10_000 }, async t => {
+  const f = await fixture(t, "paused-create");
+  const [winner, loser] = await Promise.all([f.launch(), f.launch()]);
+  await winner.client.request("startTurn", { turnId: "first", input: "hello" });
+  await until(f.log, log => log.some(call => call.method === "thread/start"), "Creation did not begin");
+  try {
+    assert.equal((await f.saved())?.native.state, "creating");
+    await assert.rejects(loser.client.request("startTurn", { turnId: "first", input: "hello" }), /Codex bridge request failed \(503\)/);
+    assert.equal(await loser.client.request("status"), "offline");
+  } finally { await f.release(); }
+  assert.equal((await terminal(winner.client, "first")).status, "completed");
   assert.equal((await f.log()).filter(call => call.method === "thread/start").length, 1);
   assert.equal((await f.log()).filter(call => call.method === "turn/start").length, 1);
 });

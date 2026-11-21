@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
-import { createManagedSessionManifest, managedSessionAvailability, validatePiSessionFile, writeManagedSessionManifest, type ManagedSessionManifest } from "../src/managed-sessions.js";
+import test, { type TestContext } from "node:test";
+import { createManagedSessionManifest, managedSessionAvailability, managedSessionManifestPath, readManagedSessionManifest, recordManagedSessionWorkerStarted, validatePiSessionFile, writeManagedSessionManifest, type ManagedSessionManifest } from "../src/managed-sessions.js";
 import { PiAgentRuntime } from "../src/client.js";
 import { writeRegistration } from "../src/registry.js";
 
@@ -39,6 +40,97 @@ test("exact managed lookup is metadata-only, owner-isolated and never enumerates
     else process.env.MINU_RUNTIME_DIR = previousDirectory;
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+async function workerLaunchFixture(t: TestContext, state: ManagedSessionManifest["state"], workerPid?: number) {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "runtime-worker-publication-")));
+  const previousDirectory = process.env.MINU_RUNTIME_DIR;
+  process.env.MINU_RUNTIME_DIR = join(directory, "registry");
+  t.after(async () => {
+    if (previousDirectory === undefined) delete process.env.MINU_RUNTIME_DIR;
+    else process.env.MINU_RUNTIME_DIR = previousDirectory;
+    await rm(directory, { recursive: true, force: true });
+  });
+  const manifest = await createManagedSessionManifest({ cwd: directory }, "owner");
+  manifest.state = state;
+  manifest.workerPid = workerPid;
+  await writeManagedSessionManifest(manifest);
+  return { manifest, path: managedSessionManifestPath(manifest.managedSessionId, manifest.ownerId) };
+}
+
+// Return the old on-disk snapshot after publishing the controller's next write.
+// This forces the read/publication ordering without sleeps or scheduler assumptions.
+function publishAfterSnapshot(t: TestContext, path: string, publish: () => Promise<void>) {
+  const fs = createRequire(import.meta.url)("node:fs/promises") as typeof import("node:fs/promises");
+  const original = fs.readFile;
+  let published = false;
+  const read = t.mock.method(fs, "readFile", (async (...args: Parameters<typeof fs.readFile>) => {
+    const snapshot = await original(...args);
+    if (String(args[0]) === path && !published) {
+      published = true;
+      await publish();
+    }
+    return snapshot;
+  }) as typeof fs.readFile);
+  syncBuiltinESMExports();
+  t.after(() => { read.mock.restore(); syncBuiltinESMExports(); });
+  return () => published;
+}
+
+for (const state of ["starting", "resuming"] as const) {
+  test(`worker authorization waits for controller PID publication (${state})`, async t => {
+    const { manifest, path } = await workerLaunchFixture(t, state, state === "resuming" ? process.pid + 1 : undefined);
+    const published = publishAfterSnapshot(t, path, async () => {
+      manifest.workerPid = process.pid;
+      await writeManagedSessionManifest(manifest);
+    });
+    await recordManagedSessionWorkerStarted(manifest.managedSessionId, manifest.ownerId, true);
+    assert.equal(published(), true, "The worker must consume the pre-publication snapshot first");
+    const authorized = await readManagedSessionManifest(manifest.managedSessionId, manifest.ownerId);
+    assert.equal(authorized?.workerPid, process.pid);
+    assert.equal(authorized?.workerProcessGroup, process.pid);
+    assert.equal(authorized?.state, state);
+  });
+}
+
+for (const state of ["starting", "resuming"] as const) {
+  test(`worker authorization rejects an unpublished PID at its deadline (${state})`, async t => {
+    const { manifest, path } = await workerLaunchFixture(t, state, process.pid + 1);
+    const before = await readFile(path, "utf8");
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now += 5_000);
+    await assert.rejects(recordManagedSessionWorkerStarted(manifest.managedSessionId, manifest.ownerId), /not in an authorized worker launch/);
+    assert.equal(await readFile(path, "utf8"), before);
+  });
+}
+
+for (const state of ["active", "suspended", "destroying"] as const) {
+  test(`worker authorization rejects a matching PID outside a launch transition (${state})`, async t => {
+    const { manifest, path } = await workerLaunchFixture(t, state, process.pid);
+    const before = await readFile(path, "utf8");
+    await assert.rejects(recordManagedSessionWorkerStarted(manifest.managedSessionId, manifest.ownerId), /not in an authorized worker launch/);
+    assert.equal(await readFile(path, "utf8"), before);
+  });
+}
+
+test("worker authorization rechecks transition state after PID publication", async t => {
+  const { manifest, path } = await workerLaunchFixture(t, "resuming", process.pid + 1);
+  const published = publishAfterSnapshot(t, path, async () => {
+    manifest.workerPid = process.pid;
+    manifest.state = "active";
+    await writeManagedSessionManifest(manifest);
+  });
+  await assert.rejects(recordManagedSessionWorkerStarted(manifest.managedSessionId, manifest.ownerId), /not in an authorized worker launch/);
+  assert.equal(published(), true);
+  assert.equal((await readManagedSessionManifest(manifest.managedSessionId, manifest.ownerId))?.state, "active");
+});
+
+test("worker authorization rejects the wrong owner and absent sessions", async t => {
+  const { manifest, path } = await workerLaunchFixture(t, "resuming", process.pid);
+  const before = await readFile(path, "utf8");
+  await assert.rejects(recordManagedSessionWorkerStarted(manifest.managedSessionId, "other-owner"), /not in an authorized worker launch/);
+  await assert.rejects(recordManagedSessionWorkerStarted("missing", manifest.ownerId), /not in an authorized worker launch/);
+  assert.equal(await readFile(path, "utf8"), before);
 });
 
 const timestamp = "2026-10-14T12:26:24.000Z";

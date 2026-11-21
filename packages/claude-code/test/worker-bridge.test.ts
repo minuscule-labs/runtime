@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
+import { execFile, fork } from "node:child_process";
 import { once } from "node:events";
 import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -23,6 +23,13 @@ async function until<T>(read: () => Promise<T>, done: (value: T) => boolean): Pr
   }
 }
 const errorStatus = (status: number) => (error: unknown) => error instanceof ClaudeCodeWorkerError && error.status === status;
+
+test("stream cancellation settles an idle reader even after garbage collection", async () => {
+  await new Promise<void>((resolve, reject) => {
+    execFile(process.execPath, ["--expose-gc", fileURLToPath(new URL("./fixtures/gc-stream-cancel.js", import.meta.url))],
+      { timeout: 5_000 }, error => error ? reject(error) : resolve());
+  });
+});
 
 async function fixture(t: TestContext, nativeProvider?: string) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "claude-worker-bridge-")));

@@ -356,6 +356,12 @@ export class CodexManagedStore {
     expected = { ...expected };
     claim = { ...claim };
     try {
+      // Denial needs no mutation lock. A published worker may disconnect and
+      // then be stopped while this cleanup check is running; do not freeze its
+      // lifecycle lock and prevent recovery from fencing it. Any actual cleanup
+      // authorization is still decided from a fresh read under the lock below.
+      const observed = await this.read(expected.id, expected.ownerId);
+      if (!observed || (observed.worker.state !== "reserved" && observed.worker.state !== "aborted")) return false;
       return await this.withSessionLock(expected.id, expected.ownerId, async lease => {
         const current = await this.read(expected.id, expected.ownerId);
         const worker = current?.worker;

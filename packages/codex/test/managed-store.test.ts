@@ -25,6 +25,40 @@ async function fixture(t: TestContext) {
   return { directory, root, store, manifest, path };
 }
 
+test("published-worker cleanup denial never acquires the lifecycle lock", async t => {
+  const f = await domainFixture(t);
+  if (f.manifest.worker.state !== "ready") throw new Error("Expected a published fixture");
+  const before = await readFile(f.path, "utf8");
+  const lock = t.mock.method(f.store, "withSessionLock", async () => { throw new CodexLifecycleBusyError("Worker was stopped while holding this lock"); });
+  assert.equal(await f.store.claimPreReadyCleanup(f.manifest, {
+    claimId: f.manifest.worker.claimId, pid: f.manifest.worker.connection.pid,
+  }), false);
+  assert.equal(lock.mock.callCount(), 0, "An already-published worker must not take a cleanup lock after readiness");
+  assert.equal(await readFile(f.path, "utf8"), before);
+});
+
+test("pre-ready cleanup rechecks publication under the lock before aborting", async t => {
+  const f = await fixture(t);
+  const claim = { claimId: "claim-a", pid: 4242 };
+  const reserved: CodexManagedManifest = { ...f.manifest, native: { state: "pending" },
+    worker: { state: "reserved", ...claim, generation: f.manifest.generation } };
+  await f.store.create(reserved);
+  const connection = { version: 1 as const, ownerId: reserved.ownerId, sessionId: reserved.id,
+    generation: reserved.generation, ...claim, endpoint: "http://127.0.0.1:42420", token: "a".repeat(64) };
+  const lock = f.store.withSessionLock.bind(f.store);
+  let published = false;
+  f.store.withSessionLock = async (id, ownerId, operation, timeoutMs) => {
+    if (!published) {
+      published = true;
+      await lock(id, ownerId, lease => lease.publishWorkerReady(reserved.revision, connection));
+    }
+    return lock(id, ownerId, operation, timeoutMs);
+  };
+  assert.equal(await f.store.claimPreReadyCleanup(reserved, claim), false);
+  assert.equal(published, true);
+  assert.equal((await f.store.read(reserved.id, reserved.ownerId))?.worker.state, "ready");
+});
+
 function copy<T>(value: T): T { return JSON.parse(JSON.stringify(value)) as T; }
 
 async function domainFixture(t: TestContext, version: 4 | 5 = 5) {
