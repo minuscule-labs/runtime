@@ -105,3 +105,11 @@ export async function requireCodexAuth(rpc: CodexRpcProcess): Promise<void> {
   catch (error) { if (error instanceof CodexRpcResponseError) return; throw error; }
   if (response && !response.account && response.requiresOpenaiAuth === true) throw new CodexAuthRequiredError();
 }
+
+/** Vision support for a session whose native thread is not open yet: the saved model, or the engine's default read from an
+ * ephemeral read-only thread. The caller owns confirmed shutdown; unknown or failed means not verified (false). */
+export async function probeNativeImageInput(rpc: CodexRpcProcess, cwd: string, config: AgentStartConfig): Promise<boolean> {
+  const models = await nativeModels(rpc);
+  const id = config.model?.id ?? (await discoverNativeLaunch(rpc, cwd)).defaultModel?.id;
+  return models.find(model => model.id === id)?.images === true;
+}

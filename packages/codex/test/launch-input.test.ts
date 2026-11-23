@@ -300,9 +300,21 @@ test("managed text keeps the legacy worker request envelope", async t => {
   assert.equal(turns, 2);
 });
 
+for (const scenario of ["normal", "text-only"] as const) test(`managed ${scenario} session answers input capabilities before its first turn without opening a thread`, { timeout: 15000 }, async t => {
+  const f = await fixture(t, scenario === "normal" ? "lifecycle" : "lifecycle-text-only"), s = await f.remember(await f.runtime.startManaged({ cwd: f.cwd, skillIds: [] }, "owner"));
+  assert.deepEqual(await f.runtime.inputCapabilities(s.id), { version: 1, images: scenario === "normal" });
+  const calls = await f.calls();
+  assert.equal(calls.some(c => c.method === "turn/start"), false);
+  assert.ok(calls.filter(c => c.method === "thread/start").every(c => c.params.ephemeral === true && c.params.sandbox === "read-only"));
+  assert.deepEqual((await f.store.read(s.id, "owner"))?.native, { state: "pending" });
+  for (const pid of new Set(calls.map(c => c.pid))) await gone(pid);
+  // The session still opens lazily and normally afterwards.
+  assert.equal((await settled(f.runtime, s.id, await f.runtime.startTurn(s.id, "after", "hello"))).status, "completed");
+});
+
 test("managed lazy image admission, authenticated live queries and cold history retain no pixel projection", { timeout: 15000 }, async t => {
   const f = await fixture(t, "lifecycle"), s = await f.remember(await f.runtime.startManaged({ cwd: f.cwd, skillIds: [] }, "owner"));
-  await assert.rejects(f.runtime.inputCapabilities(s.id)); assert.deepEqual(await f.calls(), []);
+  assert.deepEqual(await f.calls(), []);
   await assert.rejects(f.runtime.startTurn(s.id, "bad", "", [{ ...png, data: "invalid" }]));
   await assert.rejects(f.runtime.startTurn(s.id, "too-many", "", Array.from({ length: 5 }, () => png)));
   assert.deepEqual(await f.calls(), []);

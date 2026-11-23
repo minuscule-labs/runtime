@@ -122,7 +122,12 @@ test("public managed creation saves identity without native launch and reports t
   assert.equal(JSON.stringify(inventory).includes("PRIVATE_PERSONA"), false);
   assert.equal(JSON.stringify(inventory).includes(f.directory), false);
   assert.deepEqual(await f.runtime.listManagedSessions("other-owner"), []);
-  await assert.rejects(f.runtime.inputCapabilities(session.id));
+  // Before the lazy first turn the answer comes from a prompt-less probe: no persistent thread, manifest still pending.
+  const plain = await f.create(); // Engine default model: the fixture catalog only lists its default and a text-only model.
+  assert.deepEqual(await f.runtime.inputCapabilities(plain.id), { version: 1, images: true });
+  assert.deepEqual(await f.runtime.inputCapabilities(session.id), { version: 1, images: false }, "an unlisted selected model is not verified");
+  assert.equal((await f.calls()).some(call => call.method === "turn/start" || (call.method === "thread/start" && call.params.ephemeral !== true)), false);
+  assert.deepEqual(await f.store.read(session.id, session.ownerId), saved);
   assert.deepEqual(await f.runtime.sessionCapabilities(session.id), { version: 1, safeActivityEvents: true,
     interrupt: true, reconnectExisting: true, interactiveAttach: false, openDiagnostic: await diagnosticAvailable(), liveSkillVerification: false });
   const stream = f.runtime.events(session.id);
