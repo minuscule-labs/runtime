@@ -66,8 +66,14 @@ test("unknown server requests are refused, never answered with approval", async 
 
 test("spawn failure rejects promptly and stopping is repeatable", async () => {
   const rpc = new CodexRpcProcess(process.cwd(), { command: "/no-such-minu-codex-executable" });
-  await assert.rejects(rpc.initialize(), /launch|input|exited/);
+  await assert.rejects(rpc.initialize(), (error: Error) => error.name === "CodexNotInstalledError" && !error.message.includes("no-such"));
   await rpc.stop();
+  await rpc.stop();
+});
+
+test("a launch failure other than a missing executable stays generic", async () => {
+  const rpc = new CodexRpcProcess(process.cwd(), { command: "/" });
+  await assert.rejects(rpc.initialize(), (error: Error) => error.name === "Error" && /launch|input|exited/.test(error.message));
   await rpc.stop();
 });
 

@@ -63,6 +63,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   } else if (method === "skills/list") {
     result({ data: [{ cwd: process.cwd(), errors: [], skills: (scenario === "plugin-skills" ? ["alpha", "pdf:pdf"] : scenario === "malformed-skill" ? ["alpha", "a:b:c"] : ["alpha", "beta"]).map(name => ({ name, description: `Fixture ${name}`, enabled: true,
       path: `${process.cwd()}/private-skills/${name}/SKILL.md` })) }] });
+  } else if (method === "account/read") {
+    if (scenario === "account-unsupported") emit({ id, error: { code: -32601, message: "unknown method /private/path" } });
+    else if (scenario === "signed-out") result({ account: null, requiresOpenaiAuth: true });
+    else if (scenario === "custom-provider") result({ account: null, requiresOpenaiAuth: false });
+    else result({ account: { type: "apiKey" }, requiresOpenaiAuth: true });
   } else if (method === "thread/read") {
     if (scenario === "resume-missing") { emit({ id, error: { message: "missing thread" } }); return; }
     result({ thread: {

@@ -254,7 +254,7 @@ test("invalid first input, identities and explicit launch selections do not laun
 
 test("unsupported native version refuses registration and confirms spawned-process shutdown", async t => {
   const f = await fixture(t);
-  await assert.rejects(f.fake({ MINU_CLAUDE_FIXTURE_VERSION: "unknown" }), /Unsupported persistent Claude Code version/);
+  await assert.rejects(f.fake({ MINU_CLAUDE_FIXTURE_VERSION: "unknown" }), { name: "ClaudeCodeUnsupportedVersionError", message: "This Claude Code version is not supported; update `claude`" });
   const pid = Number(await readFile(join(f.root, "pid"), "utf8"));
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
   await assert.rejects(readFile(join(f.root, "input")), { code: "ENOENT" });

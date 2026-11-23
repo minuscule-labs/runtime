@@ -58,6 +58,36 @@ test("plugin-qualified skills are discovered and selected", async t => {
   assert.deepEqual(start.params.config.skills.config.map((s: any) => s.enabled), [false, true]);
 });
 
+test("a missing codex executable is a named setup error from capabilities and start, with no path", async t => {
+  const f = await fixture(t), command = join(f.cwd, "no-such-codex");
+  const runtime = new CodexAgentRuntime({ command, requestTimeoutMs: 2000, shutdownTimeoutMs: 100 });
+  for (const attempt of [() => runtime.capabilities({ cwd: f.cwd }), () => runtime.start({ cwd: f.cwd })]) {
+    const error = await attempt().then(() => undefined, caught => caught);
+    assert.equal(error?.name, "CodexNotInstalledError");
+    assert.equal(error.message, "Codex is not installed; install `codex`");
+    assert.equal(error.message.includes(f.cwd), false);
+  }
+});
+
+test("a signed-out codex is a named setup error before discovery or any thread exists", async t => {
+  const f = await fixture(t, "signed-out");
+  const error = await f.runtime.capabilities({ cwd: f.cwd }).then(() => undefined, caught => caught);
+  assert.equal(error?.name, "CodexAuthRequiredError");
+  assert.equal(error.message, "Codex is not logged in; run `codex login`");
+  const started = await f.runtime.start({ cwd: f.cwd }).then(() => undefined, caught => caught);
+  assert.equal(started?.name, "CodexAuthRequiredError");
+  const calls = await f.calls();
+  assert.ok(calls.some(c => c.method === "account/read"));
+  assert.equal(calls.some(c => c.method === "thread/start" || c.method === "model/list"), false);
+  for (const pid of new Set(calls.map(c => c.pid))) await gone(pid);
+});
+
+for (const scenario of ["custom-provider", "account-unsupported"]) test(`${scenario} is never reported as signed out`, async t => {
+  const f = await fixture(t, scenario);
+  assert.equal((await f.runtime.capabilities({ cwd: f.cwd })).defaultModel?.id, "gpt-test");
+  await f.remember(await f.runtime.start({ cwd: f.cwd }));
+});
+
 test("malformed qualified skill names keep discovery unavailable", async t => {
   const f = await fixture(t, "malformed-skill"); await assert.rejects(f.runtime.capabilities({ cwd: f.cwd }), /unavailable/);
 });

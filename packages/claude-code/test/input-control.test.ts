@@ -182,6 +182,18 @@ test("in-process capabilities() requires the same native login as managed creati
   assert.deepEqual((await loggedIn.capabilities({ cwd: dir })).models.map(m => m.id), ["default"]);
 });
 
+test("capabilities() refuses an unsupported Claude Code version with the named error", async t => {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "claude-caps-version-")));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const env = (version: string) => ({ PATH: process.env.PATH, HOME: dir, CLAUDE_CONFIG_DIR: join(dir, "config"), MINU_CLAUDE_FIXTURE_MODELS: MODELS, MINU_CLAUDE_FIXTURE_VERSION: version });
+  const old = new ClaudeCodeAgentRuntime({ executable: claude, startupTimeoutMs: 5_000, shutdownTimeoutMs: 2_000, env: env("2.0.5") });
+  const error = await old.capabilities({ cwd: dir }).then(() => undefined, caught => caught);
+  assert.equal(error?.name, "ClaudeCodeUnsupportedVersionError");
+  assert.equal(error.message, "This Claude Code version is not supported; update `claude`");
+  const current = new ClaudeCodeAgentRuntime({ executable: claude, startupTimeoutMs: 5_000, shutdownTimeoutMs: 2_000, env: env("2.1.321") });
+  assert.deepEqual((await current.capabilities({ cwd: dir })).models.map(m => m.id), ["default"]);
+});
+
 test("a managed root behind a symlink is canonicalized instead of refused", async t => {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "claude-root-link-")));
   t.after(() => rm(dir, { recursive: true, force: true }));

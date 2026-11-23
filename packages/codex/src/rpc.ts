@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 
 import { RUNTIME_INPUT_LIMITS } from "@minu/runtime-core";
+import { CodexNotInstalledError } from "./errors.js";
 const MAX_FRAME_BYTES = RUNTIME_INPUT_LIMITS.transportBytes;
 
 /** Marks a rejected native request without retaining private native diagnostics. */
@@ -65,9 +66,9 @@ export class CodexRpcProcess {
     this.child.stdout.on("data", (chunk: Buffer) => this.consume(chunk));
     this.child.stdin.on("error", () => this.abort(new Error("Codex app-server input closed")));
     this.child.stdout.on("error", () => this.abort(new Error("Codex app-server output failed")));
-    this.child.on("error", () => {
+    this.child.on("error", (error: NodeJS.ErrnoException) => {
       if (!this.child.pid) this.markExited();
-      this.abort(new Error("Unable to launch Codex app-server"));
+      this.abort(error.code === "ENOENT" ? new CodexNotInstalledError() : new Error("Unable to launch Codex app-server"));
     });
     this.child.once("exit", () => {
       this.markExited();

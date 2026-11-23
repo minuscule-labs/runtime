@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { AgentReasoningLevel, AgentStartConfig, RuntimeLaunchCapabilities } from "@minu/runtime-core";
-import { record, type CodexRpcProcess } from "./rpc.js";
+import { record, CodexRpcResponseError, type CodexRpcProcess } from "./rpc.js";
+import { CodexAuthRequiredError } from "./errors.js";
 
 export const CODEX_REASONING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const identifier = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
@@ -94,4 +95,13 @@ export async function discoverNativeLaunch(rpc: CodexRpcProcess, cwd: string): P
     reasoningLevels: CODEX_REASONING.filter(level => models.some(model => model.levels.includes(level))),
     skills: skills.map(({ id, name, description }) => ({ id, name, description })),
     defaultModel: { provider: response.modelProvider, id: response.model }, ...(level ? { defaultReasoningLevel: level } : {}) };
+}
+
+/** Signed out means no account AND the active provider needs OpenAI auth (app-server account/read), so providers that need no login pass.
+ * An engine that cannot answer is never reported as signed out; only a rejected request is tolerated, transport failures still throw. */
+export async function requireCodexAuth(rpc: CodexRpcProcess): Promise<void> {
+  let response: Record<string, unknown> | undefined;
+  try { response = record(await rpc.request("account/read", { refreshToken: false })); }
+  catch (error) { if (error instanceof CodexRpcResponseError) return; throw error; }
+  if (response && !response.account && response.requiresOpenaiAuth === true) throw new CodexAuthRequiredError();
 }

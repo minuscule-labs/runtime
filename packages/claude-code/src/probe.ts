@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { query, type ModelInfo, type SDKUserMessage, type SlashCommand } from "@anthropic-ai/claude-agent-sdk";
-import { ClaudeCodeAuthRequiredError, claudeCodeAccountStatus, resolveClaudeCodeExecutable } from "./native-config.js";
+import { ClaudeCodeAuthRequiredError, ClaudeCodeNotInstalledError, ClaudeCodeUnsupportedVersionError, claudeCodeAccountStatus, resolveClaudeCodeExecutable } from "./native-config.js";
+import { claudeCodeVersionSupported } from "./native-history.js";
 
 export interface ClaudeCodeProbeOptions {
   cwd: string;
@@ -39,6 +40,7 @@ export async function probeClaudeCode(options: ClaudeCodeProbeOptions): Promise<
   const executable = await resolveClaudeCodeExecutable(options.executable, options.env);
   const abort = new AbortController();
   let child: ChildProcess | undefined;
+  let missing = false;
   let done!: () => void;
   const gone = new Promise<void>(resolve => { done = resolve; });
   // No user message is ever yielded; the generator only parks until the probe closes.
@@ -61,7 +63,7 @@ export async function probeClaudeCode(options: ClaudeCodeProbeOptions): Promise<
         });
         child = spawned;
         spawned.once("exit", () => done());
-        spawned.once("error", () => { if (!spawned.pid) done(); });
+        spawned.once("error", error => { if ((error as NodeJS.ErrnoException).code === "ENOENT") missing = true; if (!spawned.pid) done(); });
         return spawned;
       },
     },
@@ -86,6 +88,7 @@ export async function probeClaudeCode(options: ClaudeCodeProbeOptions): Promise<
     try { await timeout(gone, options.shutdownTimeoutMs ?? 10_000, "Claude Code probe shutdown is unconfirmed"); }
     catch (error) { throw new Error("Claude Code probe shutdown is unconfirmed", { cause: failure ?? error }); }
   }
+  if (missing) throw new ClaudeCodeNotInstalledError();
   if (failure) throw failure;
   return result!;
 }
@@ -94,5 +97,7 @@ export async function probeClaudeCode(options: ClaudeCodeProbeOptions): Promise<
 export async function requireClaudeCodeAuth(options: ClaudeCodeProbeOptions): Promise<ClaudeCodeProbe> {
   const probe = await probeClaudeCode(options);
   if (!probe.authenticated) throw new ClaudeCodeAuthRequiredError();
+  // A reported but unsupported version is refused here; an engine that reports none is left to the later checks.
+  if (probe.version !== undefined && !claudeCodeVersionSupported(probe.version)) throw new ClaudeCodeUnsupportedVersionError();
   return probe;
 }

@@ -322,6 +322,23 @@ test("auth preflight: unauthenticated native login throws the specific error bef
   assert.equal(other?.name, "Error"); assert.match(other.message, /unavailable/);
 });
 
+test("setup preflight: an unsupported version or missing executable keeps its name from capabilities and start, before any session", async t => {
+  const old = await fixture(t, { MINU_CLAUDE_FIXTURE_VERSION: "2.0.5" });
+  const oldRuntime = old.controller();
+  for (const attempt of [() => oldRuntime.capabilities({ cwd: old.cwd }), () => oldRuntime.startManaged({ cwd: old.cwd }, "owner")]) {
+    const error = await attempt().then(() => undefined, caught => caught);
+    assert.equal(error?.name, "ClaudeCodeUnsupportedVersionError");
+    assert.equal(error.message, "This Claude Code version is not supported; update `claude`");
+  }
+  assert.deepEqual(await oldRuntime.listManagedSessions("owner"), [], "no manifest is created");
+  const f = await fixture(t);
+  f.options.nativeOptions!.executable = join(f.root, "missing-native");
+  const missing = f.controller();
+  const error = await missing.startManaged({ cwd: f.cwd }, "owner").then(() => undefined, caught => caught);
+  assert.equal(error?.name, "ClaudeCodeNotInstalledError"); assert.equal(error.message.includes(f.root), false);
+  assert.deepEqual(await missing.listManagedSessions("owner"), []);
+});
+
 test("auth preflight: a logged-in probe sends no input, persists nothing and exits before the session starts", async t => {
   const f = await fixture(t); const probes = join(f.root, "probes"); f.options.nativeOptions!.env!.MINU_CLAUDE_FIXTURE_PROBE = probes;
   const runtime = f.controller(), session = await runtime.startManaged({ cwd: f.cwd }, "owner");

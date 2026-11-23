@@ -10,9 +10,10 @@ import { runtimeInput, RUNTIME_INPUT_LIMITS, sessionProfile } from "@minu/runtim
 import { finalResponse, normalizeCodexItem, toolName } from "./messages.js";
 import { CodexRpcProcess, CodexRpcResponseError, record, type CodexNotification, type CodexRpcOptions } from "./rpc.js";
 import { readNativeHistory, readNativeCheckpoint, type CodexHistoryCheckpoint, validateNativeResume, validateNativeThreadId } from "./native-resume.js";
+import { CodexNotInstalledError, CodexAuthRequiredError } from "./errors.js";
 import { CodexManagedClient } from "./managed-client.js";
 import { EVENT_LIMITS, safeCodexActivity } from "./event-stream.js";
-import { validateCodexConfig, publicId, reasoning, nativeModels, skillOverrides, discoverNativeLaunch, type NativeModel } from "./native-capabilities.js";
+import { validateCodexConfig, publicId, reasoning, nativeModels, skillOverrides, discoverNativeLaunch, requireCodexAuth, type NativeModel } from "./native-capabilities.js";
 import { codexInputFingerprint, nativeInput } from "./input.js";
 
 type EventPayload<T = AgentEvent> = T extends AgentEvent ? Omit<T, "sessionId" | "timestamp"> : never;
@@ -37,6 +38,10 @@ export interface CodexAgentRuntimeOptions extends CodexRpcOptions {
   turnRetentionLimit?: number;
   /** Owner-private managed storage; defaults to ~/.minu/runtime-codex/managed. */
   managedRoot?: string;
+}
+
+function isCodexSetupError(error: unknown): error is CodexNotInstalledError | CodexAuthRequiredError {
+  return error instanceof CodexNotInstalledError || error instanceof CodexAuthRequiredError;
 }
 
 class EventStream implements AsyncIterableIterator<AgentEvent> {
@@ -142,9 +147,11 @@ export class CodexAgentRuntime implements AgentRuntime {
     try { cwd = await realpath(resolve(config.cwd ?? process.cwd())); rpc = new CodexRpcProcess(cwd, this.options); }
     catch { throw new Error("Codex launch discovery is unavailable"); }
     let result: RuntimeLaunchCapabilities | undefined;
-    try { await rpc.initialize(); result = await discoverNativeLaunch(rpc, cwd); }
-    catch { /* No guessed defaults or discovery retry. */ }
+    let setup: Error | undefined;
+    try { await rpc.initialize(); await requireCodexAuth(rpc); result = await discoverNativeLaunch(rpc, cwd); }
+    catch (error) { if (isCodexSetupError(error)) setup = error; /* Otherwise no guessed defaults or discovery retry. */ }
     try { await rpc.stop(); } catch { throw new CodexNativeStartupCleanupError(() => rpc.stop()); }
+    if (setup) throw setup;
     if (!result) throw new Error("Codex launch discovery is unavailable");
     return result;
   }
@@ -249,6 +256,7 @@ export class CodexAgentRuntime implements AgentRuntime {
     };
     try {
       await rpc.initialize();
+      await requireCodexAuth(rpc);
       const sandbox = this.options.sandbox ?? "read-only";
       if (threadId) await validateNativeResume(rpc, threadId, cwd);
       const overrides = config.skillIds === undefined ? {} : await skillOverrides(rpc, cwd, config.skillIds);
