@@ -117,7 +117,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     if (scenario === "selection-error") { emit({ id, error: { message: `${process.cwd()}/private-skills/alpha/SKILL.md PRIVATE_SECRET` } }); return; }
     if (method === "thread/start") newThread = true;
     if (!initialized) { emit({ id, error: { message: "missing initialized notification" } }); return; }
-    const mode = params.sandbox === "workspace-write" ? "workspaceWrite" : "readOnly";
+    const mode = scenario === "mismatch-sandbox" ? "readOnly" : params.sandbox === "workspace-write" ? "workspaceWrite"
+      : params.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly";
     const response = {
       thread: { id: scenario === "resume-response-id" ? "other-thread" : "native-thread",
         cwd: scenario === "resume-response-cwd" ? `${process.cwd()}/other` : process.cwd(),

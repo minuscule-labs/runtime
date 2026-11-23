@@ -17,7 +17,7 @@ export async function createPendingCodexSession(
   store: CodexManagedStore,
   identity: CodexManagedIdentity,
   config: AgentStartConfig,
-  sandbox: "read-only" | "workspace-write" = "read-only",
+  sandbox: "read-only" | "workspace-write" | "danger-full-access" = "read-only",
   version: 4 | 5 = 4,
 ): Promise<ManagedAgentSession> {
   validateCodexConfig(config);

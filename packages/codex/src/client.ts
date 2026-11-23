@@ -29,9 +29,11 @@ export class CodexNativeStartupCleanupError extends Error {
   }
 }
 
+const NATIVE_SANDBOX = { "read-only": "readOnly", "workspace-write": "workspaceWrite", "danger-full-access": "dangerFullAccess" } as const;
+
 export interface CodexAgentRuntimeOptions extends CodexRpcOptions {
-  /** Deliberately excludes unrestricted execution; default is read-only. */
-  sandbox?: "read-only" | "workspace-write";
+  /** Default is read-only. "danger-full-access" lets Codex change anything the user account can, without approvals. */
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   turnRetentionLimit?: number;
   /** Owner-private managed storage; defaults to ~/.minu/runtime-codex/managed. */
   managedRoot?: string;
@@ -129,8 +131,8 @@ export class CodexAgentRuntime implements AgentRuntime {
     this.options = { ...options, ...(options.args ? { args: [...options.args] } : {}) };
     this.retention = options.turnRetentionLimit ?? 1_000;
     if (!Number.isSafeInteger(this.retention) || this.retention < 1) throw new RangeError("turnRetentionLimit must be a positive integer");
-    if (options.sandbox !== undefined && options.sandbox !== "read-only" && options.sandbox !== "workspace-write") {
-      throw new Error("Codex Runtime only supports read-only or workspace-write sandboxing");
+    if (options.sandbox !== undefined && options.sandbox !== "read-only" && options.sandbox !== "workspace-write" && options.sandbox !== "danger-full-access") {
+      throw new Error("Codex Runtime only supports read-only, workspace-write or danger-full-access sandboxing");
     }
     this.managed = new CodexManagedClient(this.options, id => this.sessions.has(id));
   }
@@ -268,7 +270,7 @@ export class CodexAgentRuntime implements AgentRuntime {
           throw new Error("Codex did not open the exact idle thread and workspace");
         }
       }
-      if (response.approvalPolicy !== "never" || record(response.sandbox)?.type !== (sandbox === "read-only" ? "readOnly" : "workspaceWrite")) {
+      if (response.approvalPolicy !== "never" || record(response.sandbox)?.type !== NATIVE_SANDBOX[sandbox]) {
         throw new Error("Codex did not apply the requested execution policy");
       }
       if (config.model && (response.model !== config.model.id || response.modelProvider !== config.model.provider)) {

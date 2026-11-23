@@ -69,7 +69,7 @@ export class CodexManagedClient {
     this.bindings.set(id, { ownerId, client: new CodexWorkerClient(connection), connection: { ...connection }, stopped: false });
   }
 
-  async create(config: AgentStartConfig, ownerId: string, sandbox: "read-only" | "workspace-write"): Promise<ManagedAgentSession> {
+  async create(config: AgentStartConfig, ownerId: string, sandbox: "read-only" | "workspace-write" | "danger-full-access"): Promise<ManagedAgentSession> {
     const identity = { id: randomUUID(), ownerId, generation: randomUUID() };
     if (this.hasIdentity(identity.id)) throw new Error("Codex managed identity collision");
     const release = this.begin(identity.id, ownerId);

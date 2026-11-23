@@ -57,6 +57,26 @@ test("CLI keeps default Pi inventory/help and rejects unsafe selection before na
   assert.deepEqual(await f.calls(),[]);
 });
 
+test("CLI --sandbox is Codex-only and saves the chosen policy for new sessions",async t=>{
+  const f=await fixture(t);
+  assert.match(await f.run(["--adapter","pi","--sandbox","danger-full-access","sessions"],false),/--sandbox requires Codex/);
+  assert.match(await f.run(["--adapter","claude-code","--sandbox","danger-full-access","sessions"],false),/--sandbox requires Codex/);
+  assert.match(await f.run([...f.scoped,"--sandbox","unrestricted","sessions"],false),/Allowed choices/);
+  const store=new CodexManagedStore(f.root);
+  const plain=(await f.run([...f.scoped,"start","--cwd",f.directory])).split("\t")[0].replace("codex:","");f.sessions.push(plain);
+  const full=(await f.run([...f.scoped,"--sandbox","danger-full-access","start","--cwd",f.directory])).split("\t")[0].replace("codex:","");f.sessions.push(full);
+  assert.equal((await store.read(plain,"cli-owner"))?.sandbox,"read-only");
+  assert.equal((await store.read(full,"cli-owner"))?.sandbox,"danger-full-access");
+  // A later controller without the flag must not change the saved policy.
+  await f.run([...f.scoped,"suspend",`codex:${full}`]);
+  assert.equal((await store.read(full,"cli-owner"))?.sandbox,"danger-full-access");
+});
+
+test("createRuntime passes the Codex sandbox through",()=>{
+  assert.ok(createRuntime("codex",{sandbox:"danger-full-access"}) instanceof CodexAgentRuntime);
+  assert.throws(()=>createRuntime("codex",{sandbox:"unrestricted" as "read-only"}),/sandboxing/);
+});
+
 test("separate CLI controllers preserve owner-scoped native lifecycle, qualified routing and history",{timeout:60000},async t=>{
   const f=await fixture(t);const started=await f.run([...f.scoped,"start","--cwd",f.directory,"--no-skills"]),reference=started.split("\t")[0],id=reference.slice("codex:".length);f.sessions.push(id);
   assert.ok(reference.startsWith("codex:"));assert.deepEqual(await f.calls(),[]);

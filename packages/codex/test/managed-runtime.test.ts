@@ -568,6 +568,33 @@ test("pending inventory is read-only and resume launches only its never-attempte
   assert.equal((await f.calls()).find(call => call.method === "thread/start")!.params.sandbox, "read-only");
 });
 
+test("full-access managed create saves the sandbox, applies it natively, and resume keeps it", { timeout: 15_000 }, async t => {
+  const f = await fixture(t, "normal", { sandbox: "danger-full-access" });
+  const session = await f.create();
+  assert.equal((await f.store.read(session.id, session.ownerId))!.sandbox, "danger-full-access");
+  await f.runtime.send(session.id, "hello");
+  assert.equal((await f.calls()).find(call => call.method === "thread/start")!.params.sandbox, "danger-full-access");
+});
+
+test("a saved read-only session never widens under a full-access runtime", { timeout: 15_000 }, async t => {
+  const f = await fixture(t, "normal", { sandbox: "danger-full-access" });
+  const identity = { id: "old-readonly", ownerId: "owner-a", generation: "old-generation" };
+  await createPendingCodexSession(f.store, identity, { cwd: f.directory }, "read-only");
+  const session = await f.remember(await f.runtime.resume(identity.id, identity.ownerId));
+  await f.runtime.send(session.id, "hello");
+  assert.equal((await f.calls()).find(call => call.method === "thread/start")!.params.sandbox, "read-only");
+  assert.equal((await f.store.read(identity.id, identity.ownerId))!.sandbox, "read-only");
+});
+
+test("a saved full-access session keeps full access under a default runtime", { timeout: 15_000 }, async t => {
+  const f = await fixture(t);
+  const identity = { id: "saved-full", ownerId: "owner-a", generation: "full-generation" };
+  await createPendingCodexSession(f.store, identity, { cwd: f.directory }, "danger-full-access");
+  const session = await f.remember(await f.runtime.resume(identity.id, identity.ownerId));
+  await f.runtime.send(session.id, "hello");
+  assert.equal((await f.calls()).find(call => call.method === "thread/start")!.params.sandbox, "danger-full-access");
+});
+
 test("wrong-owner resume does not authorize routing or poison later correct-owner resume", { timeout: 15_000 }, async t => {
   const f = await fixture(t);
   const session = await f.create();
