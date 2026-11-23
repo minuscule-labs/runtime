@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { query, type ModelInfo, type SDKUserMessage, type SlashCommand } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeCodeAuthRequiredError, ClaudeCodeNotInstalledError, ClaudeCodeUnsupportedVersionError, claudeCodeAccountStatus, resolveClaudeCodeExecutable } from "./native-config.js";
 import { claudeCodeVersionSupported } from "./native-history.js";
@@ -63,7 +64,7 @@ export async function probeClaudeCode(options: ClaudeCodeProbeOptions): Promise<
         });
         child = spawned;
         spawned.once("exit", () => done());
-        spawned.once("error", error => { if ((error as NodeJS.ErrnoException).code === "ENOENT") missing = true; if (!spawned.pid) done(); });
+        spawned.once("error", error => { if ((error as NodeJS.ErrnoException).code === "ENOENT" && existsSync(options.cwd)) missing = true; if (!spawned.pid) done(); });
         return spawned;
       },
     },

@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { ClaudeCodeAgentRuntime } from "../src/index.js";
 import { resolveClaudeCodeExecutable } from "../src/native-config.js";
+import { probeClaudeCode } from "../src/probe.js";
 
 const fixture = fileURLToPath(new URL("./fixtures/claude.js", import.meta.url));
 
@@ -37,4 +38,8 @@ test("the installed `claude` on PATH is the default executable; bundled and expl
   const explicit = new ClaudeCodeAgentRuntime({ executable: gone, startupTimeoutMs: 5_000, env: { PATH: bin, HOME: root } });
   const error = await explicit.capabilities({ cwd: root }).then(() => undefined, caught => caught);
   assert.equal(error?.name, "ClaudeCodeNotInstalledError"); assert.equal(error.message.includes(root), false);
+  // A missing workspace reports the same native ENOENT, but is not a missing install.
+  const lost = await probeClaudeCode({ cwd: join(root, "no-such-workspace"), executable: join(bin, "claude"), env: { PATH: bin, HOME: root }, startupTimeoutMs: 5_000 })
+    .then(() => undefined, caught => caught);
+  assert.ok(lost instanceof Error); assert.notEqual(lost.name, "ClaudeCodeNotInstalledError");
 });

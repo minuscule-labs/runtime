@@ -422,6 +422,7 @@ const mutations: [string, (f: Awaited<ReturnType<typeof fixture>>) => Record<str
   ["unsupported version (below range)", f => [{ ...f.row(), version: "2.1.299" }], "unsupported_format"],
   ["malformed version", f => [{ ...f.row(), version: "latest" }], "unsupported_format"],
   ["compaction", f => [f.row(), { type: "system", subtype: "compact_boundary", sessionId: f.id }], "unsupported_format"],
+  ["summary", f => [f.row(), { type: "summary", sessionId: f.id, summary: "condensed input" }], "unsupported_format"],
   ["unknown record with a uuid", f => [f.row(), { type: "future-record", sessionId: f.id, uuid: randomUUID() }], "unsupported_format"],
   ["unknown record with a parentUuid", f => [f.row(), { type: "future-record", sessionId: f.id, parentUuid: null }], "unsupported_format"],
   ["unknown record with a message", f => [f.row(), { type: "future-record", sessionId: f.id, message: { role: "user", content: "hidden input" } }], "unsupported_format"],

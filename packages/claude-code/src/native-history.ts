@@ -236,8 +236,8 @@ async function parse(bytes: Buffer, options: ClaudeCodeHistoryOptions): Promise<
       if (row.uuid !== undefined || row.parentUuid !== undefined) reject("unsupported_format");
       // A future bookkeeping row type is tolerated only while it is plainly not conversation: no chain identity (checked above),
       // no message and no role/content. Known types keep their exact handling below; unknown chain types are never tolerated.
-      // "system" rows carry compaction boundaries: history there is incomplete, so they stay refused even without chain identity.
-      if (!METADATA.has(row.type as string) && (row.type === "system" || row.message !== undefined || row.role !== undefined || row.content !== undefined)) reject("unsupported_format");
+      // "system" (compaction boundaries) and "summary" rows mean history may be incomplete, so they stay refused even without chain identity.
+      if (!METADATA.has(row.type as string) && (row.type === "system" || row.type === "summary" || row.message !== undefined || row.role !== undefined || row.content !== undefined)) reject("unsupported_format");
       if (options.completedInput && row.type === "queue-operation") {
         if (Object.keys(row).some(key => !["type", "operation", "timestamp", "sessionId", "content"].includes(key))
           || typeof row.timestamp !== "string" || !Number.isFinite(Date.parse(row.timestamp))) reject("unsupported_format");

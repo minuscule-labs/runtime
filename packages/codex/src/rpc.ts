@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 
 import { RUNTIME_INPUT_LIMITS } from "@minu/runtime-core";
@@ -68,7 +69,8 @@ export class CodexRpcProcess {
     this.child.stdout.on("error", () => this.abort(new Error("Codex app-server output failed")));
     this.child.on("error", (error: NodeJS.ErrnoException) => {
       if (!this.child.pid) this.markExited();
-      this.abort(error.code === "ENOENT" ? new CodexNotInstalledError() : new Error("Unable to launch Codex app-server"));
+      // A missing workspace reports the same ENOENT as a missing program.
+      this.abort(error.code === "ENOENT" && existsSync(cwd) ? new CodexNotInstalledError() : new Error("Unable to launch Codex app-server"));
     });
     this.child.once("exit", () => {
       this.markExited();
