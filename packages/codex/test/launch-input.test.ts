@@ -50,6 +50,18 @@ test("explicit launch discovery uses one ephemeral thread, sanitizes identities 
   await gone(calls[0].pid); assert.deepEqual(await f.runtime.listManagedSessions("owner"), []);
 });
 
+test("plugin-qualified skills are discovered and selected", async t => {
+  const f = await fixture(t, "plugin-skills"), caps = await f.runtime.capabilities({ cwd: f.cwd });
+  assert.deepEqual(caps.skills.map(s => s.name), ["alpha", "pdf:pdf"]);
+  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [caps.skills[1].id] }));
+  const start = (await f.calls()).filter(c => c.method === "thread/start").at(-1);
+  assert.deepEqual(start.params.config.skills.config.map((s: any) => s.enabled), [false, true]);
+});
+
+test("malformed qualified skill names keep discovery unavailable", async t => {
+  const f = await fixture(t, "malformed-skill"); await assert.rejects(f.runtime.capabilities({ cwd: f.cwd }), /unavailable/);
+});
+
 test("discovery workspace failures reveal no private paths and start no process", async t => {
   const f = await fixture(t);
   await assert.rejects(f.runtime.capabilities({ cwd: join(f.cwd, "missing-private-workspace") }), error => {

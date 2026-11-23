@@ -61,7 +61,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       supportedReasoningEfforts: (model === "text-model" ? [] : ["none", "minimal", "low", "medium", "high", "xhigh", "max"]).map(reasoningEffort => ({ reasoningEffort })),
       defaultReasoningEffort: "medium", inputModalities: scenario === "text-only" || model === "text-model" ? ["text"] : ["text", "image"] })), nextCursor: null });
   } else if (method === "skills/list") {
-    result({ data: [{ cwd: process.cwd(), errors: [], skills: ["alpha", "beta"].map(name => ({ name, description: `Fixture ${name}`, enabled: true,
+    result({ data: [{ cwd: process.cwd(), errors: [], skills: (scenario === "plugin-skills" ? ["alpha", "pdf:pdf"] : scenario === "malformed-skill" ? ["alpha", "a:b:c"] : ["alpha", "beta"]).map(name => ({ name, description: `Fixture ${name}`, enabled: true,
       path: `${process.cwd()}/private-skills/${name}/SKILL.md` })) }] });
   } else if (method === "thread/read") {
     if (scenario === "resume-missing") { emit({ id, error: { message: "missing thread" } }); return; }
