@@ -10,9 +10,10 @@ import { runtimeInput, RUNTIME_INPUT_LIMITS, sessionProfile } from "@minu/runtim
 import { finalResponse, normalizeCodexItem, toolName } from "./messages.js";
 import { CodexRpcProcess, CodexRpcResponseError, record, type CodexNotification, type CodexRpcOptions } from "./rpc.js";
 import { readNativeHistory, readNativeCheckpoint, type CodexHistoryCheckpoint, validateNativeResume, validateNativeThreadId } from "./native-resume.js";
+import { CodexNotInstalledError, CodexAuthRequiredError } from "./errors.js";
 import { CodexManagedClient } from "./managed-client.js";
 import { EVENT_LIMITS, safeCodexActivity } from "./event-stream.js";
-import { validateCodexConfig, publicId, reasoning, nativeModels, skillOverrides, discoverNativeLaunch, type NativeModel } from "./native-capabilities.js";
+import { validateCodexConfig, publicId, reasoning, nativeModels, skillOverrides, discoverNativeLaunch, requireCodexAuth, type NativeModel } from "./native-capabilities.js";
 import { codexInputFingerprint, nativeInput } from "./input.js";
 
 type EventPayload<T = AgentEvent> = T extends AgentEvent ? Omit<T, "sessionId" | "timestamp"> : never;
@@ -29,12 +30,18 @@ export class CodexNativeStartupCleanupError extends Error {
   }
 }
 
+const NATIVE_SANDBOX = { "read-only": "readOnly", "workspace-write": "workspaceWrite", "danger-full-access": "dangerFullAccess" } as const;
+
 export interface CodexAgentRuntimeOptions extends CodexRpcOptions {
-  /** Deliberately excludes unrestricted execution; default is read-only. */
-  sandbox?: "read-only" | "workspace-write";
+  /** Default is read-only. "danger-full-access" lets Codex change anything the user account can, without approvals. */
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   turnRetentionLimit?: number;
   /** Owner-private managed storage; defaults to ~/.minu/runtime-codex/managed. */
   managedRoot?: string;
+}
+
+function isCodexSetupError(error: unknown): error is CodexNotInstalledError | CodexAuthRequiredError {
+  return error instanceof CodexNotInstalledError || error instanceof CodexAuthRequiredError;
 }
 
 class EventStream implements AsyncIterableIterator<AgentEvent> {
@@ -129,8 +136,8 @@ export class CodexAgentRuntime implements AgentRuntime {
     this.options = { ...options, ...(options.args ? { args: [...options.args] } : {}) };
     this.retention = options.turnRetentionLimit ?? 1_000;
     if (!Number.isSafeInteger(this.retention) || this.retention < 1) throw new RangeError("turnRetentionLimit must be a positive integer");
-    if (options.sandbox !== undefined && options.sandbox !== "read-only" && options.sandbox !== "workspace-write") {
-      throw new Error("Codex Runtime only supports read-only or workspace-write sandboxing");
+    if (options.sandbox !== undefined && options.sandbox !== "read-only" && options.sandbox !== "workspace-write" && options.sandbox !== "danger-full-access") {
+      throw new Error("Codex Runtime only supports read-only, workspace-write or danger-full-access sandboxing");
     }
     this.managed = new CodexManagedClient(this.options, id => this.sessions.has(id));
   }
@@ -140,9 +147,11 @@ export class CodexAgentRuntime implements AgentRuntime {
     try { cwd = await realpath(resolve(config.cwd ?? process.cwd())); rpc = new CodexRpcProcess(cwd, this.options); }
     catch { throw new Error("Codex launch discovery is unavailable"); }
     let result: RuntimeLaunchCapabilities | undefined;
-    try { await rpc.initialize(); result = await discoverNativeLaunch(rpc, cwd); }
-    catch { /* No guessed defaults or discovery retry. */ }
+    let setup: Error | undefined;
+    try { await rpc.initialize(); await requireCodexAuth(rpc); result = await discoverNativeLaunch(rpc, cwd); }
+    catch (error) { if (isCodexSetupError(error)) setup = error; /* Otherwise no guessed defaults or discovery retry. */ }
     try { await rpc.stop(); } catch { throw new CodexNativeStartupCleanupError(() => rpc.stop()); }
+    if (setup) throw setup;
     if (!result) throw new Error("Codex launch discovery is unavailable");
     return result;
   }
@@ -247,6 +256,7 @@ export class CodexAgentRuntime implements AgentRuntime {
     };
     try {
       await rpc.initialize();
+      await requireCodexAuth(rpc);
       const sandbox = this.options.sandbox ?? "read-only";
       if (threadId) await validateNativeResume(rpc, threadId, cwd);
       const overrides = config.skillIds === undefined ? {} : await skillOverrides(rpc, cwd, config.skillIds);
@@ -268,7 +278,7 @@ export class CodexAgentRuntime implements AgentRuntime {
           throw new Error("Codex did not open the exact idle thread and workspace");
         }
       }
-      if (response.approvalPolicy !== "never" || record(response.sandbox)?.type !== (sandbox === "read-only" ? "readOnly" : "workspaceWrite")) {
+      if (response.approvalPolicy !== "never" || record(response.sandbox)?.type !== NATIVE_SANDBOX[sandbox]) {
         throw new Error("Codex did not apply the requested execution policy");
       }
       if (config.model && (response.model !== config.model.id || response.modelProvider !== config.model.provider)) {

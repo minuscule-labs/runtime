@@ -23,10 +23,10 @@ let steerCount = 0;
 log({ pid: process.pid, args: process.argv.slice(4) });
 if (scenario === "ignore-term" || scenario === "hang-ignore-term") process.on("SIGTERM", () => { log({ signal: "SIGTERM" }); });
 
-function complete(status = "completed", commentaryOnly = false): void {
+function complete(status = "completed", commentaryOnly = false, answer = `Answer ${count}: café 🐈`): void {
   const items = [
     { type: "agentMessage", id: `${nativeId}-commentary`, phase: "commentary", text: "Working privately" },
-    ...commentaryOnly ? [] : [{ type: "agentMessage", id: `${nativeId}-answer`, phase: "final_answer", text: `Answer ${count}: café 🐈` }],
+    ...commentaryOnly ? [] : [{ type: "agentMessage", id: `${nativeId}-answer`, phase: "final_answer", text: answer }],
   ];
   {
     savedTurns.push({ id: nativeId, status, itemsView: "full", items: [
@@ -63,6 +63,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   } else if (method === "skills/list") {
     result({ data: [{ cwd: process.cwd(), errors: [], skills: (scenario === "plugin-skills" ? ["alpha", "pdf:pdf"] : scenario === "malformed-skill" ? ["alpha", "a:b:c"] : ["alpha", "beta"]).map(name => ({ name, description: `Fixture ${name}`, enabled: true,
       path: `${process.cwd()}/private-skills/${name}/SKILL.md` })) }] });
+  } else if (method === "account/read") {
+    if (scenario === "account-unsupported") emit({ id, error: { code: -32601, message: "unknown method /private/path" } });
+    else if (scenario === "signed-out") result({ account: null, requiresOpenaiAuth: true });
+    else if (scenario === "custom-provider") result({ account: null, requiresOpenaiAuth: false });
+    else result({ account: { type: "apiKey" }, requiresOpenaiAuth: true });
   } else if (method === "thread/read") {
     if (scenario === "resume-missing") { emit({ id, error: { message: "missing thread" } }); return; }
     result({ thread: {
@@ -117,7 +122,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     if (scenario === "selection-error") { emit({ id, error: { message: `${process.cwd()}/private-skills/alpha/SKILL.md PRIVATE_SECRET` } }); return; }
     if (method === "thread/start") newThread = true;
     if (!initialized) { emit({ id, error: { message: "missing initialized notification" } }); return; }
-    const mode = params.sandbox === "workspace-write" ? "workspaceWrite" : "readOnly";
+    const mode = scenario === "mismatch-sandbox" ? "readOnly" : params.sandbox === "workspace-write" ? "workspaceWrite"
+      : params.sandbox === "danger-full-access" ? "dangerFullAccess" : "readOnly";
     const response = {
       thread: { id: scenario === "resume-response-id" ? "other-thread" : "native-thread",
         cwd: scenario === "resume-response-cwd" ? `${process.cwd()}/other` : process.cwd(),
@@ -174,7 +180,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         threadId: "native-thread", turnId: nativeId, delta: scenario === "flood" ? "delta" : "x".repeat(200_000),
       });
       complete();
-    } else setTimeout(() => complete(scenario === "failed" ? "failed" : "completed", scenario === "commentary-only"), 20);
+    } else setTimeout(() => complete(scenario === "failed" ? "failed" : "completed", scenario === "commentary-only", scenario === "empty-final" ? "" : undefined), 20);
   } else if (method === "turn/steer") {
     result({ turnId: nativeId });
     if (steeringHistory) {

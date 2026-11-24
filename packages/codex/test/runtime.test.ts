@@ -78,6 +78,26 @@ test("launches an owned Codex session with exact persona/model/reasoning and exe
   assert.equal((await f.runtime.messages(session.id))[0].content, "Review the files");
 });
 
+test("full access starts and natively resumes with danger-full-access and no approvals", async t => {
+  const f = await fixture(t, "normal", { sandbox: "danger-full-access" });
+  await f.start();
+  await f.resume();
+  const calls = await f.log();
+  const launch = calls.find(call => call.method === "thread/start")!.params;
+  assert.equal(launch.sandbox, "danger-full-access"); assert.equal(launch.approvalPolicy, "never");
+  const resume = calls.find(call => call.method === "thread/resume")!.params;
+  assert.equal(resume.sandbox, "danger-full-access"); assert.equal(resume.approvalPolicy, "never");
+  // Discovery never inherits the runtime sandbox.
+  await f.runtime.capabilities({ cwd: f.directory });
+  assert.equal((await f.log()).filter(call => call.method === "thread/start").at(-1)!.params.sandbox, "read-only");
+});
+
+test("full access is refused when the engine reports a different sandbox, on start and resume", async t => {
+  const f = await fixture(t, "mismatch-sandbox", { sandbox: "danger-full-access" });
+  await assert.rejects(f.start(), /Codex did not apply the requested execution policy/);
+  await assert.rejects(f.resume(), /Codex did not apply the requested execution policy/);
+});
+
 test("native resume verifies identity/policy, hydrates paginated history, then accepts new turns", async t => {
   const f = await fixture(t);
   const session = await f.resume({ appendSystemPrompt: "Reviewer", model: { provider: "openai", id: "selected-model" }, reasoningLevel: "high" });
@@ -172,7 +192,8 @@ test("unsupported launch options fail without starting a process", async () => {
   await assert.rejects(runtime.start({ skillIds: ["invalid"] }), /Invalid Codex launch selection/);
   await assert.rejects(runtime.start({ reasoningLevel: "invalid" as "max" }), /Invalid Codex launch selection/);
   assert.throws(() => new CodexAgentRuntime({ turnRetentionLimit: 0 }), /positive integer/);
-  assert.throws(() => new CodexAgentRuntime({ sandbox: "danger-full-access" as "read-only" }), /sandboxing/);
+  assert.throws(() => new CodexAgentRuntime({ sandbox: "unrestricted" as "read-only" }), /sandboxing/);
+  assert.doesNotThrow(() => new CodexAgentRuntime({ sandbox: "danger-full-access" }));
 });
 
 test("turns are idempotent, reject conflicts and busy input, and return defensive copies", async (t) => {
@@ -205,6 +226,17 @@ for (const scenario of ["early-completion", "terminal-response"]) {
     await f.runtime.send(id, "second input");
   });
 }
+
+test("an explicit empty final answer is a completed turn", async (t) => {
+  const f = await fixture(t, "empty-final");
+  const { id } = await f.start();
+  await f.runtime.startTurn(id, "first", "hello");
+  const turn = await settled(f.runtime, id, "first");
+  assert.equal(turn.status, "completed");
+  assert.equal(turn.error, undefined);
+  assert.equal(turn.response?.content, "");
+  assert.equal(await f.runtime.status(id), "idle");
+});
 
 for (const [scenario, message] of [["failed", /native turn failed/], ["commentary-only", /no final assistant/], ["turn-error", /native turn request failed/]] as const) {
   test(`records ${scenario} as a failed turn rather than a successful answer`, async (t) => {

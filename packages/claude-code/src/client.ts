@@ -19,7 +19,7 @@ import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeExpectedModels, 
 import { requireClaudeCodeAuth } from "./probe.js";
 import { claudeCodeVersionSupported } from "./native-history.js";
 import { claudeCodePermissionOptions, resolveClaudeCodePermissions, type ClaudeCodePermissionPolicy, type ClaudeCodePermissions } from "./permissions.js";
-import { claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot, resolveClaudeCodeExecutable } from "./native-config.js";
+import { claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot, resolveClaudeCodeExecutable, ClaudeCodeUnsupportedVersionError } from "./native-config.js";
 
 export interface ClaudeCodeRuntimeOptions {
   /** What sessions may do natively; the library default is "readOnly" so callers opt in to "full". Not an OS sandbox
@@ -395,7 +395,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       state.expectedModels = claudeCodeExpectedModels(config, discovery);
       state.observed.skills = config.skillIds ? [...config.skillIds] : discovery.skills.map(skill => skill.name);
       if (config.reasoningLevel) state.observed.reasoning = config.reasoningLevel; // Verified against the engine at launch.
-      if (native && !claudeCodeVersionSupported(initialized.claude_code_version)) throw new Error("Unsupported persistent Claude Code version");
+      if (native && !claudeCodeVersionSupported(initialized.claude_code_version)) throw new ClaudeCodeUnsupportedVersionError();
       if (native?.engineVersion && String(initialized.claude_code_version).split(".")[0] !== native.engineVersion.split(".")[0]) {
         throw new Error("Persistent Claude Code engine major version changed");
       }

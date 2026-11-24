@@ -8,6 +8,8 @@ import {
   type CodexManagedIdentity, type CodexNativeAllocation,
 } from "./managed-native.js";
 import type { CodexWorkerRuntime } from "./worker-bridge.js";
+import { CodexRpcProcess } from "./rpc.js";
+import { probeNativeImageInput } from "./native-capabilities.js";
 import { CodexEventHub } from "./event-stream.js";
 import { codexInputFingerprint } from "./input.js";
 import { CodexSessionEventLog } from "./session-events.js";
@@ -153,8 +155,28 @@ class PendingCodexWorkerRuntime implements CodexWorkerRuntime {
     }
   }
 
+  private imagesProbe?: Promise<boolean>;
+  private async probeImages(config: CodexManagedManifest["launchConfig"]): Promise<boolean> {
+    const rpc = new CodexRpcProcess(config.cwd, this.options);
+    let images = false, failure: unknown;
+    try { await rpc.initialize(); images = await probeNativeImageInput(rpc, config.cwd, config); }
+    catch (error) { failure = error; }
+    await rpc.stop(); // Unconfirmed exit rejects: never report a capability from a probe that may still be running.
+    if (failure) throw failure;
+    return images;
+  }
+
   async inputCapabilities(id: string): Promise<RuntimeInputCapabilities> {
-    this.address(id); await this.current();
+    this.address(id); const current = await this.current();
+    if (!this.allocation && !this.allocating && current.native.state === "pending" && !this.stopping && !this.retirementSeal && !this.unavailable) {
+      // Before the lazy first turn there is no live model. Answer from a prompt-less probe (never a persistent thread), like
+      // Pi and Claude Code, so an image sent as the first message is not silently dropped by callers that ask first.
+      const probe = this.imagesProbe ??= this.probeImages(current.launchConfig);
+      const images = await probe.catch(() => { if (this.imagesProbe === probe) this.imagesProbe = undefined; return false; }); // A failure is not cached.
+      await this.current();
+      if (this.stopping || this.retirementSeal || this.unavailable) throw new CodexSessionOfflineError("Codex worker is offline");
+      return { version: 1, images };
+    }
     if (this.stopping || this.retirementSeal || this.unavailable || !this.allocation) throw new CodexSessionOfflineError("Codex live model is not available");
     const result = await this.allocation.runtime.inputCapabilities(this.allocation.session.id);
     await this.current();

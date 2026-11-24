@@ -11,6 +11,20 @@ export class ClaudeCodeAuthRequiredError extends Error {
   }
 }
 
+/** Named, fixed-text setup errors (matched by name; no paths or raw output). */
+export class ClaudeCodeNotInstalledError extends Error {
+  constructor() {
+    super("Claude Code is not installed; install `claude`");
+    this.name = "ClaudeCodeNotInstalledError";
+  }
+}
+export class ClaudeCodeUnsupportedVersionError extends Error {
+  constructor() {
+    super("This Claude Code version is not supported; update `claude`");
+    this.name = "ClaudeCodeUnsupportedVersionError";
+  }
+}
+
 /** Break identity or history; always removed from the inherited environment (and refused as overrides). */
 export const CLAUDE_CODE_FORBIDDEN_ENV = Object.freeze(
   ["NODE_OPTIONS", "NODE_PATH", "CLAUDE_CODE_PROJECT_DIR_NAME", "CLAUDE_CODE_RESUME_INTERRUPTED_TURN"]);
@@ -76,5 +90,5 @@ export async function resolveClaudeCodeExecutable(
       if (metadata.isFile()) { await access(candidate, constants.X_OK); return candidate; }
     } catch { /* Not here. */ }
   }
-  throw new Error("Claude Code executable not found: install `claude`, or pass executable (a path, or \"bundled\")");
+  throw new ClaudeCodeNotInstalledError();
 }

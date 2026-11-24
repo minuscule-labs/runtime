@@ -64,10 +64,22 @@ test("unknown server requests are refused, never answered with approval", async 
   assert.equal((await log()).some((frame) => frame.id === "server-request" && frame.result), false);
 });
 
+test("a missing workspace is not reported as a missing install", async () => {
+  const rpc = new CodexRpcProcess("/no-such-minu-codex-workspace", { command: process.execPath });
+  await assert.rejects(rpc.initialize(), (error: Error) => error.name === "Error" && error.message === "Unable to launch Codex app-server");
+  await rpc.stop();
+});
+
 test("spawn failure rejects promptly and stopping is repeatable", async () => {
   const rpc = new CodexRpcProcess(process.cwd(), { command: "/no-such-minu-codex-executable" });
-  await assert.rejects(rpc.initialize(), /launch|input|exited/);
+  await assert.rejects(rpc.initialize(), (error: Error) => error.name === "CodexNotInstalledError" && !error.message.includes("no-such"));
   await rpc.stop();
+  await rpc.stop();
+});
+
+test("a launch failure other than a missing executable stays generic", async () => {
+  const rpc = new CodexRpcProcess(process.cwd(), { command: "/" });
+  await assert.rejects(rpc.initialize(), (error: Error) => error.name === "Error" && /launch|input|exited/.test(error.message));
   await rpc.stop();
 });
 

@@ -422,7 +422,15 @@ const mutations: [string, (f: Awaited<ReturnType<typeof fixture>>) => Record<str
   ["unsupported version (below range)", f => [{ ...f.row(), version: "2.1.299" }], "unsupported_format"],
   ["malformed version", f => [{ ...f.row(), version: "latest" }], "unsupported_format"],
   ["compaction", f => [f.row(), { type: "system", subtype: "compact_boundary", sessionId: f.id }], "unsupported_format"],
-  ["unknown record", f => [f.row(), { type: "future-record", sessionId: f.id }], "unsupported_format"],
+  ["summary", f => [f.row(), { type: "summary", sessionId: f.id, summary: "condensed input" }], "unsupported_format"],
+  ["unknown record with a uuid", f => [f.row(), { type: "future-record", sessionId: f.id, uuid: randomUUID() }], "unsupported_format"],
+  ["unknown record with a parentUuid", f => [f.row(), { type: "future-record", sessionId: f.id, parentUuid: null }], "unsupported_format"],
+  ["unknown record with a message", f => [f.row(), { type: "future-record", sessionId: f.id, message: { role: "user", content: "hidden input" } }], "unsupported_format"],
+  ["unknown record with a role", f => [f.row(), { type: "future-record", sessionId: f.id, role: "user" }], "unsupported_format"],
+  ["unknown record with content", f => [f.row(), { type: "future-record", sessionId: f.id, content: "hidden input" }], "unsupported_format"],
+  ["unknown record for another session", f => [f.row(), { type: "future-record", sessionId: randomUUID() }], "invalid_history"],
+  ["unknown record for another workspace", f => [f.row(), { type: "future-record", sessionId: f.id, cwd: "/not-the-authorized-workspace" }], "invalid_history"],
+  ["unknown record with an unsupported version", f => [f.row(), { type: "future-record", sessionId: f.id, version: "3.0.0" }], "unsupported_format"],
   ["wrong last-prompt leaf", f => [f.row(), { type: "last-prompt", sessionId: f.id, leafUuid: randomUUID() }], "invalid_history"],
   ["compact summary", f => [{ ...f.row(), isCompactSummary: true }], "unsupported_format"],
   ["queued delivery", f => { const row = f.row(); return [row, { ...f.row("attachment", "", row.uuid), attachment: { type: "queued_command", prompt: "hidden input" } }]; }, "unsupported_format"],
@@ -462,7 +470,35 @@ test("rows observed from the installed engine on a real subscription login (2.1.
     const options = { ...f.options, completedInput: { nativeMessageId: user.uuid, fingerprint: createHash("sha256").update("hello").digest("hex") } };
     await f.save([user, ...attachments, title, answer, { type: "last-prompt", sessionId: f.id, leafUuid: answer.uuid }]);
     assert.equal((await inspectClaudeCodeHistory(options)).state, "present");
-    await f.save([user, { ...f.row("attachment", "", user.uuid), attachment: { type: "future_unknown_attachment" } }]);
+  } finally { await f.cleanup(); }
+});
+
+test("invented future non-chain rows and attachment types are tolerated before the terminal row only", async () => {
+  const f = await fixture();
+  try {
+    const user = f.row();
+    const future: Record<string, any> = { ...f.row("attachment", "", user.uuid), attachment: { type: "future_unknown_attachment", anything: [1, 2] } };
+    const answer = f.row("assistant", [{ type: "text", text: "alpha" }], future.uuid); answer.message.stop_reason = "end_turn";
+    const options = { ...f.options, completedInput: { nativeMessageId: user.uuid, fingerprint: createHash("sha256").update("hello").digest("hex") } };
+    const bookkeeping = { type: "future-bookkeeping", sessionId: f.id, cwd: f.cwd, version: "2.1.321", counters: { a: 1 } };
+    const leaf = { type: "last-prompt", sessionId: f.id, leafUuid: answer.uuid };
+    // Structure-only read, and the completed-input read, both accept them.
+    await f.save([user, bookkeeping, future, bookkeeping, answer, leaf]);
+    const plain = await inspectClaudeCodeHistory(f.options);
+    assert.equal(plain.state, "present");
+    if (plain.state === "present") assert.deepEqual(plain.messages.map(m => m.content), ["hello", "alpha"]);
+    assert.equal((await inspectClaudeCodeHistory(options)).state, "present");
+    // An unknown attachment AFTER the terminal row is refused (only prompt_snapshot may follow), and so is a non-attachment chain row.
+    const after: Record<string, any> = { ...f.row("attachment", "", answer.uuid), attachment: { type: "future_unknown_attachment" } };
+    await f.save([user, future, answer, after, { ...leaf, leafUuid: after.uuid }]);
+    await assert.rejects(inspectClaudeCodeHistory(options), rejected("unsupported_format"));
+    const snapshot: Record<string, any> = { ...f.row("attachment", "", answer.uuid), attachment: { type: "prompt_snapshot" } };
+    await f.save([user, future, answer, snapshot, { ...leaf, leafUuid: snapshot.uuid }]);
+    assert.equal((await inspectClaudeCodeHistory(options)).state, "present");
+    // Unknown attachment shapes without a string type, and unknown chain row types, remain refused.
+    await f.save([user, { ...f.row("attachment", "", user.uuid), attachment: {} }]);
+    await assert.rejects(inspectClaudeCodeHistory(f.options), rejected("unsupported_format"));
+    await f.save([user, { ...f.row("future-chain", "x", user.uuid) }]);
     await assert.rejects(inspectClaudeCodeHistory(f.options), rejected("unsupported_format"));
   } finally { await f.cleanup(); }
 });

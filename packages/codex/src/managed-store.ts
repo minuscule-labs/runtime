@@ -60,7 +60,7 @@ interface CodexManagedManifestFields {
   native: CodexNativeBinding;
   worker: CodexWorkerRegistration;
   launchConfig: AgentStartConfig & { cwd: string };
-  sandbox: "read-only" | "workspace-write";
+  sandbox: "read-only" | "workspace-write" | "danger-full-access";
   createdAt: string;
 }
 
@@ -273,7 +273,7 @@ function validate(value: CodexManagedManifest): void {
     || (value.worker.state === "aborted" && native.state !== "pending" && !codexResumeEpoch(value))
     || Object.keys(value).some(key => !["version", "runtime", "revision", "generation", "requiresExplicitResume",
       "id", "ownerId", "native", "worker", "launchConfig", "sandbox", "createdAt", ...(value.version === 5 ? ["processDomain", "history", "previous"] : [])].includes(key))
-    || !["read-only", "workspace-write"].includes(value.sandbox)
+    || !["read-only", "workspace-write", "danger-full-access"].includes(value.sandbox)
     || typeof value.createdAt !== "string" || !Number.isFinite(Date.parse(value.createdAt))
     || !config || typeof config !== "object" || Array.isArray(config)
     || typeof config.cwd !== "string" || !isAbsolute(config.cwd) || resolve(config.cwd) !== config.cwd

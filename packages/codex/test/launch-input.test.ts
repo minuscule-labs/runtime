@@ -58,6 +58,36 @@ test("plugin-qualified skills are discovered and selected", async t => {
   assert.deepEqual(start.params.config.skills.config.map((s: any) => s.enabled), [false, true]);
 });
 
+test("a missing codex executable is a named setup error from capabilities and start, with no path", async t => {
+  const f = await fixture(t), command = join(f.cwd, "no-such-codex");
+  const runtime = new CodexAgentRuntime({ command, requestTimeoutMs: 2000, shutdownTimeoutMs: 100 });
+  for (const attempt of [() => runtime.capabilities({ cwd: f.cwd }), () => runtime.start({ cwd: f.cwd })]) {
+    const error = await attempt().then(() => undefined, caught => caught);
+    assert.equal(error?.name, "CodexNotInstalledError");
+    assert.equal(error.message, "Codex is not installed; install `codex`");
+    assert.equal(error.message.includes(f.cwd), false);
+  }
+});
+
+test("a signed-out codex is a named setup error before discovery or any thread exists", async t => {
+  const f = await fixture(t, "signed-out");
+  const error = await f.runtime.capabilities({ cwd: f.cwd }).then(() => undefined, caught => caught);
+  assert.equal(error?.name, "CodexAuthRequiredError");
+  assert.equal(error.message, "Codex is not logged in; run `codex login`");
+  const started = await f.runtime.start({ cwd: f.cwd }).then(() => undefined, caught => caught);
+  assert.equal(started?.name, "CodexAuthRequiredError");
+  const calls = await f.calls();
+  assert.ok(calls.some(c => c.method === "account/read"));
+  assert.equal(calls.some(c => c.method === "thread/start" || c.method === "model/list"), false);
+  for (const pid of new Set(calls.map(c => c.pid))) await gone(pid);
+});
+
+for (const scenario of ["custom-provider", "account-unsupported"]) test(`${scenario} is never reported as signed out`, async t => {
+  const f = await fixture(t, scenario);
+  assert.equal((await f.runtime.capabilities({ cwd: f.cwd })).defaultModel?.id, "gpt-test");
+  await f.remember(await f.runtime.start({ cwd: f.cwd }));
+});
+
 test("malformed qualified skill names keep discovery unavailable", async t => {
   const f = await fixture(t, "malformed-skill"); await assert.rejects(f.runtime.capabilities({ cwd: f.cwd }), /unavailable/);
 });
@@ -270,9 +300,21 @@ test("managed text keeps the legacy worker request envelope", async t => {
   assert.equal(turns, 2);
 });
 
+for (const scenario of ["normal", "text-only"] as const) test(`managed ${scenario} session answers input capabilities before its first turn without opening a thread`, { timeout: 15000 }, async t => {
+  const f = await fixture(t, scenario === "normal" ? "lifecycle" : "lifecycle-text-only"), s = await f.remember(await f.runtime.startManaged({ cwd: f.cwd, skillIds: [] }, "owner"));
+  assert.deepEqual(await f.runtime.inputCapabilities(s.id), { version: 1, images: scenario === "normal" });
+  const calls = await f.calls();
+  assert.equal(calls.some(c => c.method === "turn/start"), false);
+  assert.ok(calls.filter(c => c.method === "thread/start").every(c => c.params.ephemeral === true && c.params.sandbox === "read-only"));
+  assert.deepEqual((await f.store.read(s.id, "owner"))?.native, { state: "pending" });
+  for (const pid of new Set(calls.map(c => c.pid))) await gone(pid);
+  // The session still opens lazily and normally afterwards.
+  assert.equal((await settled(f.runtime, s.id, await f.runtime.startTurn(s.id, "after", "hello"))).status, "completed");
+});
+
 test("managed lazy image admission, authenticated live queries and cold history retain no pixel projection", { timeout: 15000 }, async t => {
   const f = await fixture(t, "lifecycle"), s = await f.remember(await f.runtime.startManaged({ cwd: f.cwd, skillIds: [] }, "owner"));
-  await assert.rejects(f.runtime.inputCapabilities(s.id)); assert.deepEqual(await f.calls(), []);
+  assert.deepEqual(await f.calls(), []);
   await assert.rejects(f.runtime.startTurn(s.id, "bad", "", [{ ...png, data: "invalid" }]));
   await assert.rejects(f.runtime.startTurn(s.id, "too-many", "", Array.from({ length: 5 }, () => png)));
   assert.deepEqual(await f.calls(), []);

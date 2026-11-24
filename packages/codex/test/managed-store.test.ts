@@ -37,6 +37,15 @@ test("published-worker cleanup denial never acquires the lifecycle lock", async 
   assert.equal(await readFile(f.path, "utf8"), before);
 });
 
+test("every supported sandbox policy round-trips and old manifests read unchanged", async t => {
+  const f = await fixture(t);
+  for (const sandbox of ["read-only", "workspace-write", "danger-full-access"] as const) {
+    const manifest = { ...f.manifest, id: `sandbox-${sandbox}`, sandbox };
+    await f.store.create(manifest);
+    assert.equal((await f.store.read(manifest.id, manifest.ownerId))?.sandbox, sandbox);
+  }
+});
+
 test("pre-ready cleanup rechecks publication under the lock before aborting", async t => {
   const f = await fixture(t);
   const claim = { claimId: "claim-a", pid: 4242 };
@@ -945,7 +954,7 @@ test("rejects unsupported or malformed saved launch policies", async t => {
     { runtime: "pi" }, { version: 1 }, { version: 2 }, { native: { state: "bound", threadId: "../thread" } },
     { native: null }, { native: { state: "bound" } }, { native: { state: "pending", threadId: "hidden" } },
     { native: { state: "creating", threadId: "hidden" } }, { native: { state: "unknown" } },
-    { threadId: "legacy-identity" }, { sandbox: "danger-full-access" },
+    { threadId: "legacy-identity" }, { sandbox: "unrestricted" }, { sandbox: "dangerFullAccess" },
     { revision: -1 }, { revision: 0.5 }, { generation: "../generation" }, { requiresExplicitResume: "yes" },
     { createdAt: "invalid" }, { launchConfig: { cwd: "relative" } },
     { launchConfig: { cwd: f.directory, skillIds: ["invalid"] } },

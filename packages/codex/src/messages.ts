@@ -38,7 +38,9 @@ export function finalResponse(items: Iterable<Record<string, unknown>>): Runtime
   let response: RuntimeMessage | undefined;
   for (const item of items) {
     // Null/missing phase is supported for models that do not classify messages.
-    if (item.type === "agentMessage" && item.phase !== "commentary" && typeof item.text === "string" && item.text.trim()) {
+    // An explicit final answer may be empty when the work itself was the answer.
+    if (item.type === "agentMessage" && item.phase !== "commentary" && typeof item.text === "string"
+      && (item.text.trim() || (item.phase === "final_answer" && !response))) {
       response = { role: "assistant", content: item.text };
     }
   }

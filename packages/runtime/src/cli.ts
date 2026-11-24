@@ -59,17 +59,20 @@ export function createRuntimeProgram(): Command {
     .addOption(new Option("--adapter <adapter>").choices(["pi", "codex", "claude-code"]))
     .option("--owner <owner-id>").option("--managed-root <path>")
     .addOption(new Option("--permissions <mode>", "claude-code tool policy (default full)").choices(["full", "edits", "readOnly"]))
+    .addOption(new Option("--sandbox <mode>", "codex sandbox for new sessions (default read-only); danger-full-access lets Codex change anything your account can, without asking")
+      .choices(["read-only", "workspace-write", "danger-full-access"]))
     .option("--executable <path>", "claude-code executable: a path, or \"bundled\" for the SDK engine (default: installed claude on PATH)");
   const runtimes = new Map<RuntimeAdapterId, AgentRuntime>();
   const select = (reference?: string) => {
-    const options = program.opts<{ adapter?: RuntimeAdapterId; owner?: string; managedRoot?: string; permissions?: "full" | "edits" | "readOnly"; executable?: string }>();
+    const options = program.opts<{ adapter?: RuntimeAdapterId; owner?: string; managedRoot?: string; permissions?: "full" | "edits" | "readOnly"; executable?: string; sandbox?: "read-only" | "workspace-write" | "danger-full-access" }>();
     const { adapter, id } = runtimeReference(reference ?? "", options.adapter);
     if (options.managedRoot && adapter === "pi") throw new Error("--managed-root requires Codex or Claude Code");
     if ((options.permissions || options.executable) && adapter !== "claude-code") throw new Error("--permissions and --executable require Claude Code");
+    if (options.sandbox && adapter !== "codex") throw new Error("--sandbox requires Codex");
     let runtime = runtimes.get(adapter);
     if (!runtime) {
       const managedRoot = options.managedRoot ? canonicalRoot(options.managedRoot) : undefined;
-      runtime = adapter === "codex" ? createRuntime("codex", { managedRoot })
+      runtime = adapter === "codex" ? createRuntime("codex", { managedRoot, ...(options.sandbox ? { sandbox: options.sandbox } : {}) })
         : adapter === "claude-code" ? createRuntime("claude-code", { permissions: options.permissions ?? "full", ...(managedRoot ? { managedRoot } : {}), ...(options.executable ? { executable: options.executable } : {}) })
           : createRuntime("pi");
       runtimes.set(adapter, runtime);

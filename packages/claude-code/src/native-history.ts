@@ -233,7 +233,11 @@ async function parse(bytes: Buffer, options: ClaudeCodeHistoryOptions): Promise<
     if (row.sessionId !== options.nativeSessionId || (row.cwd !== undefined && row.cwd !== options.canonicalCwd)) reject("invalid_history");
     if (row.version !== undefined && !claudeCodeVersionSupported(row.version)) reject("unsupported_format");
     if (!CHAIN.has(row.type as string)) {
-      if (!METADATA.has(row.type as string) || row.uuid !== undefined || row.parentUuid !== undefined) reject("unsupported_format");
+      if (row.uuid !== undefined || row.parentUuid !== undefined) reject("unsupported_format");
+      // A future bookkeeping row type is tolerated only while it is plainly not conversation: no chain identity (checked above),
+      // no message and no role/content. Known types keep their exact handling below; unknown chain types are never tolerated.
+      // "system" (compaction boundaries) and "summary" rows mean history may be incomplete, so they stay refused even without chain identity.
+      if (!METADATA.has(row.type as string) && (row.type === "system" || row.type === "summary" || row.message !== undefined || row.role !== undefined || row.content !== undefined)) reject("unsupported_format");
       if (options.completedInput && row.type === "queue-operation") {
         if (Object.keys(row).some(key => !["type", "operation", "timestamp", "sessionId", "content"].includes(key))
           || typeof row.timestamp !== "string" || !Number.isFinite(Date.parse(row.timestamp))) reject("unsupported_format");
@@ -283,7 +287,9 @@ async function parse(bytes: Buffer, options: ClaudeCodeHistoryOptions): Promise<
         steerRemoved = undefined;
         continue;
       }
-      if (!object(row.attachment) || !ATTACHMENTS.has(row.attachment.type as string)) reject("unsupported_format");
+      if (!object(row.attachment) || typeof row.attachment.type !== "string") reject("unsupported_format");
+      // Unknown attachment types are tolerated only before the terminal row; after it only prompt_snapshot is allowed (below).
+      if (!ATTACHMENTS.has(row.attachment.type as string) && options.completedInput && terminal) reject("unsupported_format");
       if (options.completedInput && terminal) {
         // Pinned text sessions may snapshot the effective prompt AFTER end_turn.
         // Only that non-input bookkeeping can advance the completed leaf.

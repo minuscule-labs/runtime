@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { ChildProcess } from "node:child_process";
 import { runtimeInput, type AgentRuntime, type AgentStartConfig, type ManagedAgentSession, type ManagedSessionSummary,
   type RuntimeImageContent, type RuntimeActivityOptions, type RuntimeLaunchCapabilities } from "@minu/runtime-core";
-import { CLAUDE_CODE_FORBIDDEN_ENV, ClaudeCodeAuthRequiredError, claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
+import { CLAUDE_CODE_FORBIDDEN_ENV, ClaudeCodeAuthRequiredError, ClaudeCodeNotInstalledError, ClaudeCodeUnsupportedVersionError, claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
 import { claudeCodeCapabilities, validateClaudeCodeSelection, verifyClaudeCodeSelection } from "./launch-options.js";
 import { resolveClaudeCodePermissions, type ClaudeCodePermissions } from "./permissions.js";
 import { requireClaudeCodeAuth } from "./probe.js";
@@ -39,8 +39,9 @@ export interface ClaudeCodeManagedRuntimeOptions {
   timeoutMs?: number;
 }
 const unavailable = () => new Error("Claude Code managed operation unavailable");
-/** The only public error that stays distinguishable: callers show a "not logged in" state for it. */
-const publicError = (error: unknown) => error instanceof ClaudeCodeAuthRequiredError ? error : unavailable();
+/** The only public errors that stay distinguishable: callers show a login/install/update state for them. */
+const publicError = (error: unknown) => error instanceof ClaudeCodeAuthRequiredError || error instanceof ClaudeCodeNotInstalledError
+  || error instanceof ClaudeCodeUnsupportedVersionError ? error : unavailable();
 
 /** Durable controller. Native owns its loop/tools/auth and (unless isolated) its configuration. Forced recovery is explicit
  * (forceStopManaged/destroy) and absence-proven; no transcript repair, input replay or durable turn ledger. */
@@ -75,7 +76,9 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
     const entry = await realpath(this.options.workerExecutable ?? fileURLToPath(new URL("./worker-entry.js", import.meta.url)));
     if (!(await lstat(entry)).isFile()) throw unavailable();
     for (const file of [this.options.nodeExecutable, this.nativeOptions.executable]) {
-      if (file !== undefined && file !== "bundled" && !(await lstat(await realpath(file))).isFile()) throw unavailable();
+      if (file === undefined || file === "bundled") continue;
+      try { if (!(await lstat(await realpath(file))).isFile()) throw unavailable(); }
+      catch (error) { throw file === this.nativeOptions.executable && (error as NodeJS.ErrnoException).code === "ENOENT" ? new ClaudeCodeNotInstalledError() : error; }
     }
     await this.root();
     return entry;

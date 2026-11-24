@@ -122,7 +122,12 @@ test("public managed creation saves identity without native launch and reports t
   assert.equal(JSON.stringify(inventory).includes("PRIVATE_PERSONA"), false);
   assert.equal(JSON.stringify(inventory).includes(f.directory), false);
   assert.deepEqual(await f.runtime.listManagedSessions("other-owner"), []);
-  await assert.rejects(f.runtime.inputCapabilities(session.id));
+  // Before the lazy first turn the answer comes from a prompt-less probe: no persistent thread, manifest still pending.
+  const plain = await f.create(); // Engine default model: the fixture catalog only lists its default and a text-only model.
+  assert.deepEqual(await f.runtime.inputCapabilities(plain.id), { version: 1, images: true });
+  assert.deepEqual(await f.runtime.inputCapabilities(session.id), { version: 1, images: false }, "an unlisted selected model is not verified");
+  assert.equal((await f.calls()).some(call => call.method === "turn/start" || (call.method === "thread/start" && call.params.ephemeral !== true)), false);
+  assert.deepEqual(await f.store.read(session.id, session.ownerId), saved);
   assert.deepEqual(await f.runtime.sessionCapabilities(session.id), { version: 1, safeActivityEvents: true,
     interrupt: true, reconnectExisting: true, interactiveAttach: false, openDiagnostic: await diagnosticAvailable(), liveSkillVerification: false });
   const stream = f.runtime.events(session.id);
@@ -566,6 +571,33 @@ test("pending inventory is read-only and resume launches only its never-attempte
   assert.deepEqual(await f.calls(), []);
   await f.runtime.send(session.id, "hello");
   assert.equal((await f.calls()).find(call => call.method === "thread/start")!.params.sandbox, "read-only");
+});
+
+test("full-access managed create saves the sandbox, applies it natively, and resume keeps it", { timeout: 15_000 }, async t => {
+  const f = await fixture(t, "normal", { sandbox: "danger-full-access" });
+  const session = await f.create();
+  assert.equal((await f.store.read(session.id, session.ownerId))!.sandbox, "danger-full-access");
+  await f.runtime.send(session.id, "hello");
+  assert.equal((await f.calls()).find(call => call.method === "thread/start")!.params.sandbox, "danger-full-access");
+});
+
+test("a saved read-only session never widens under a full-access runtime", { timeout: 15_000 }, async t => {
+  const f = await fixture(t, "normal", { sandbox: "danger-full-access" });
+  const identity = { id: "old-readonly", ownerId: "owner-a", generation: "old-generation" };
+  await createPendingCodexSession(f.store, identity, { cwd: f.directory }, "read-only");
+  const session = await f.remember(await f.runtime.resume(identity.id, identity.ownerId));
+  await f.runtime.send(session.id, "hello");
+  assert.equal((await f.calls()).find(call => call.method === "thread/start")!.params.sandbox, "read-only");
+  assert.equal((await f.store.read(identity.id, identity.ownerId))!.sandbox, "read-only");
+});
+
+test("a saved full-access session keeps full access under a default runtime", { timeout: 15_000 }, async t => {
+  const f = await fixture(t);
+  const identity = { id: "saved-full", ownerId: "owner-a", generation: "full-generation" };
+  await createPendingCodexSession(f.store, identity, { cwd: f.directory }, "danger-full-access");
+  const session = await f.remember(await f.runtime.resume(identity.id, identity.ownerId));
+  await f.runtime.send(session.id, "hello");
+  assert.equal((await f.calls()).find(call => call.method === "thread/start")!.params.sandbox, "danger-full-access");
 });
 
 test("wrong-owner resume does not authorize routing or poison later correct-owner resume", { timeout: 15_000 }, async t => {
