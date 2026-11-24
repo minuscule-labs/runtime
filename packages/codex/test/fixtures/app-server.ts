@@ -13,6 +13,7 @@ let pendingInput: unknown = [];
 let newThread = false;
 let openedModel = "gpt-test";
 let modelReads = 0;
+let skillReads = 0;
 function log(value: unknown): void { if (logPath) appendFileSync(logPath, `${JSON.stringify(value)}\n`); }
 function emit(value: unknown): void { process.stdout.write(`${JSON.stringify(value)}\n`); }
 function notification(method: string, params: unknown): void { emit({ method, params }); }
@@ -61,7 +62,8 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       supportedReasoningEfforts: (model === "text-model" ? [] : ["none", "minimal", "low", "medium", "high", "xhigh", "max"]).map(reasoningEffort => ({ reasoningEffort })),
       defaultReasoningEffort: "medium", inputModalities: scenario === "text-only" || model === "text-model" ? ["text"] : ["text", "image"] })), nextCursor: null });
   } else if (method === "skills/list") {
-    result({ data: [{ cwd: process.cwd(), errors: [], skills: (scenario === "plugin-skills" ? ["alpha", "pdf:pdf"] : scenario === "malformed-skill" ? ["alpha", "a:b:c"] : ["alpha", "beta"]).map(name => ({ name, description: `Fixture ${name}`, enabled: true,
+    skillReads += 1;
+    result({ data: [{ cwd: process.cwd(), errors: [], skills: (scenario === "late-skills" ? (skillReads < 3 ? ["alpha"] : ["alpha", "late:late"]) : scenario === "growing-skills" ? Array.from({ length: skillReads }, (_, i) => `skill-${i}`) : scenario === "plugin-skills" ? ["alpha", "pdf:pdf"] : scenario === "malformed-skill" ? ["alpha", "a:b:c"] : ["alpha", "beta"]).map(name => ({ name, description: `Fixture ${name}`, enabled: true,
       path: `${process.cwd()}/private-skills/${name}/SKILL.md` })) }] });
   } else if (method === "account/read") {
     if (scenario === "account-unsupported") emit({ id, error: { code: -32601, message: "unknown method /private/path" } });
