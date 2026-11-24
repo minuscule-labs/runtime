@@ -52,6 +52,8 @@ export async function nativeModels(rpc: CodexRpcProcess): Promise<NativeModel[]>
   }
   throw new Error("Native model catalog exceeds bounds");
 }
+// Plugin skills are reported as "plugin:skill".
+const skillName = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?::[A-Za-z0-9][A-Za-z0-9_-]{0,127})?$/;
 interface NativeSkill { id: string; name: string; description: string; path: string }
 export async function nativeSkills(rpc: CodexRpcProcess, cwd: string): Promise<NativeSkill[]> {
   const response = record(await rpc.request("skills/list", { cwds: [cwd], forceReload: true }));
@@ -62,7 +64,7 @@ export async function nativeSkills(rpc: CodexRpcProcess, cwd: string): Promise<N
   for (const value of entry.skills) {
     const skill = record(value);
     if (!skill || typeof skill.path !== "string" || !isAbsolute(skill.path) || skill.path.length > 4096 || typeof skill.enabled !== "boolean"
-      || typeof skill.name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(skill.name) || typeof skill.description !== "string") throw new Error("Invalid native skill metadata");
+      || typeof skill.name !== "string" || !skillName.test(skill.name) || typeof skill.description !== "string") throw new Error("Invalid native skill metadata");
     const id = `codex-skill-${createHash("sha256").update(skill.path).digest("hex")}`;
     if (skills.some(s => s.id === id)) throw new Error("Duplicate native skill identity");
     // Descriptions are human-authored, not an authority to publish native paths.
