@@ -68,7 +68,9 @@ test("CLI --sandbox is Codex-only and saves the chosen policy for new sessions",
   assert.equal((await store.read(plain,"cli-owner"))?.sandbox,"read-only");
   assert.equal((await store.read(full,"cli-owner"))?.sandbox,"danger-full-access");
   // A later controller without the flag must not change the saved policy.
-  await f.run([...f.scoped,"suspend",`codex:${full}`]);
+  assert.equal(await f.run([...f.scoped,"status",`codex:${full}`]),"idle");
+  // Codex suspend is macOS-only.
+  if(process.platform==="darwin")await f.run([...f.scoped,"suspend",`codex:${full}`]);
   assert.equal((await store.read(full,"cli-owner"))?.sandbox,"danger-full-access");
 });
 
