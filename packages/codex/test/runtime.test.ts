@@ -227,6 +227,17 @@ for (const scenario of ["early-completion", "terminal-response"]) {
   });
 }
 
+test("an explicit empty final answer is a completed turn", async (t) => {
+  const f = await fixture(t, "empty-final");
+  const { id } = await f.start();
+  await f.runtime.startTurn(id, "first", "hello");
+  const turn = await settled(f.runtime, id, "first");
+  assert.equal(turn.status, "completed");
+  assert.equal(turn.error, undefined);
+  assert.equal(turn.response?.content, "");
+  assert.equal(await f.runtime.status(id), "idle");
+});
+
 for (const [scenario, message] of [["failed", /native turn failed/], ["commentary-only", /no final assistant/], ["turn-error", /native turn request failed/]] as const) {
   test(`records ${scenario} as a failed turn rather than a successful answer`, async (t) => {
     const f = await fixture(t, scenario);

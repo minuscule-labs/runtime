@@ -40,7 +40,7 @@ test("real smoke: discovery, full-access start, read, edit, write outside cwd, i
     assert.match((await runtime.messages(id)).at(-1)!.content.toLowerCase(), /alpha/);
     await runtime.send(id, "Change 'alpha' to 'omega' in note.txt using your file editing ability. Do nothing else.");
     assert.equal(await readFile(file, "utf8"), "omega\n");
-    // Full access: a path outside the workspace, which a workspace-write sandbox would refuse.
+    // A path outside the workspace. Codex may treat temp directories as writable in workspace-write, so this alone does not prove full access.
     await runtime.send(id, `Create the file ${target} containing exactly the text: outside. Do nothing else.`);
     assert.equal((await readFile(target, "utf8")).trim(), "outside");
     assert.equal((await runtime.inputCapabilities(id)).images, true);

@@ -23,10 +23,10 @@ let steerCount = 0;
 log({ pid: process.pid, args: process.argv.slice(4) });
 if (scenario === "ignore-term" || scenario === "hang-ignore-term") process.on("SIGTERM", () => { log({ signal: "SIGTERM" }); });
 
-function complete(status = "completed", commentaryOnly = false): void {
+function complete(status = "completed", commentaryOnly = false, answer = `Answer ${count}: café 🐈`): void {
   const items = [
     { type: "agentMessage", id: `${nativeId}-commentary`, phase: "commentary", text: "Working privately" },
-    ...commentaryOnly ? [] : [{ type: "agentMessage", id: `${nativeId}-answer`, phase: "final_answer", text: `Answer ${count}: café 🐈` }],
+    ...commentaryOnly ? [] : [{ type: "agentMessage", id: `${nativeId}-answer`, phase: "final_answer", text: answer }],
   ];
   {
     savedTurns.push({ id: nativeId, status, itemsView: "full", items: [
@@ -180,7 +180,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         threadId: "native-thread", turnId: nativeId, delta: scenario === "flood" ? "delta" : "x".repeat(200_000),
       });
       complete();
-    } else setTimeout(() => complete(scenario === "failed" ? "failed" : "completed", scenario === "commentary-only"), 20);
+    } else setTimeout(() => complete(scenario === "failed" ? "failed" : "completed", scenario === "commentary-only", scenario === "empty-final" ? "" : undefined), 20);
   } else if (method === "turn/steer") {
     result({ turnId: nativeId });
     if (steeringHistory) {
