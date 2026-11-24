@@ -50,6 +50,20 @@ test("explicit launch discovery uses one ephemeral thread, sanitizes identities 
   await gone(calls[0].pid); assert.deepEqual(await f.runtime.listManagedSessions("owner"), []);
 });
 
+test("skills that Codex loads shortly after startup are discovered, selected and deselected", async t => {
+  const f = await fixture(t, "late-skills"), caps = await f.runtime.capabilities({ cwd: f.cwd });
+  assert.deepEqual(caps.skills.map(s => s.name), ["alpha", "late:late"]);
+  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [caps.skills[1].id] }));
+  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [] }));
+  const starts = (await f.calls()).filter(c => c.method === "thread/start" && c.params.ephemeral !== true);
+  assert.deepEqual(starts.map(c => c.params.config.skills.config.map((s: any) => s.enabled)), [[false, true], [false, false]]);
+});
+
+test("a skill list that never settles is bounded", { timeout: 15_000 }, async t => {
+  const f = await fixture(t, "growing-skills");
+  assert.ok((await f.runtime.capabilities({ cwd: f.cwd })).skills.length > 1);
+});
+
 test("plugin-qualified skills are discovered and selected", async t => {
   const f = await fixture(t, "plugin-skills"), caps = await f.runtime.capabilities({ cwd: f.cwd });
   assert.deepEqual(caps.skills.map(s => s.name), ["alpha", "pdf:pdf"]);

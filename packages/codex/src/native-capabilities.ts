@@ -74,15 +74,29 @@ export async function nativeSkills(rpc: CodexRpcProcess, cwd: string): Promise<N
   }
   return skills;
 }
+/** Codex adds plugin skills shortly after startup and reports no completion signal, so read until the list stops changing. Bounded. */
+const SKILL_SETTLE = { intervalMs: 150, quietMs: 600, limitMs: 3_000 };
+async function settledSkills(rpc: CodexRpcProcess, cwd: string): Promise<NativeSkill[]> {
+  const key = (list: NativeSkill[]) => list.map(skill => skill.id).sort().join();
+  let skills = await nativeSkills(rpc, cwd), changedAt = performance.now();
+  const limit = changedAt + SKILL_SETTLE.limitMs;
+  while (performance.now() < limit && performance.now() - changedAt < SKILL_SETTLE.quietMs) {
+    await new Promise(resolve => setTimeout(resolve, SKILL_SETTLE.intervalMs));
+    const next = await nativeSkills(rpc, cwd);
+    if (key(next) !== key(skills)) changedAt = performance.now();
+    skills = next;
+  }
+  return skills;
+}
 export async function skillOverrides(rpc: CodexRpcProcess, cwd: string, ids: string[]): Promise<Record<string, unknown>> {
-  const skills = await nativeSkills(rpc, cwd);
+  const skills = await settledSkills(rpc, cwd);
   if (ids.some(id => !skills.some(s => s.id === id))) throw new Error("Selected native skill is unavailable");
   return { skills: { config: skills.map(skill => ({ path: skill.path, enabled: ids.includes(skill.id) })) } };
 }
 
 /** The caller owns this temporary RPC and must confirm shutdown before returning. */
-export async function discoverNativeLaunch(rpc: CodexRpcProcess, cwd: string): Promise<RuntimeLaunchCapabilities> {
-  const models = await nativeModels(rpc), skills = await nativeSkills(rpc, cwd);
+export async function discoverNativeLaunch(rpc: CodexRpcProcess, cwd: string, readSkills = settledSkills): Promise<RuntimeLaunchCapabilities> {
+  const models = await nativeModels(rpc), skills = await readSkills(rpc, cwd);
   const response = record(await rpc.request("thread/start", { cwd, ephemeral: true, sandbox: "read-only", approvalPolicy: "never" }));
   const thread = record(response?.thread);
   if (!response || !thread || typeof thread.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(thread.id) || thread.ephemeral !== true || thread.path !== null || thread.cwd !== cwd || response.cwd !== cwd
@@ -110,6 +124,6 @@ export async function requireCodexAuth(rpc: CodexRpcProcess): Promise<void> {
  * ephemeral read-only thread. The caller owns confirmed shutdown; unknown or failed means not verified (false). */
 export async function probeNativeImageInput(rpc: CodexRpcProcess, cwd: string, config: AgentStartConfig): Promise<boolean> {
   const models = await nativeModels(rpc);
-  const id = config.model?.id ?? (await discoverNativeLaunch(rpc, cwd)).defaultModel?.id;
+  const id = config.model?.id ?? (await discoverNativeLaunch(rpc, cwd, nativeSkills)).defaultModel?.id;
   return models.find(model => model.id === id)?.images === true;
 }
