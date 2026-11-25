@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, realpath, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -67,6 +68,29 @@ test("a skill list that never settles is bounded", { timeout: 15_000 }, async t 
 test("plugin-qualified skills are discovered and selected", async t => {
   const f = await fixture(t, "plugin-skills"), caps = await f.runtime.capabilities({ cwd: f.cwd });
   assert.deepEqual(caps.skills.map(s => s.name), ["alpha", "pdf:pdf"]);
+  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [caps.skills[1].id] }));
+  const start = (await f.calls()).filter(c => c.method === "thread/start").at(-1);
+  assert.deepEqual(start.params.config.skills.config.map((s: any) => s.enabled), [false, true]);
+});
+
+test("plugin skill identities survive a plugin update, and earlier path identities still resolve", async t => {
+  const f = await fixture(t, "versioned-plugin"), before = await f.runtime.capabilities({ cwd: f.cwd });
+  const pathId = (path: string) => `codex-skill-${createHash("sha256").update(join(f.cwd, path)).digest("hex")}`;
+  const enabled = async () => { const start = (await f.calls()).filter(c => c.method === "thread/start").at(-1); return start.params.config.skills.config.map((s: any) => s.enabled); };
+  assert.equal(before.skills[2].id, pathId("private-skills/alpha/SKILL.md"), "a skill without a plugin keeps its path identity");
+  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [pathId("plugins/pdf/1.0.0/pdf/SKILL.md")] }));
+  assert.deepEqual(await enabled(), [true, false, false]);
+  await writeFile(join(f.cwd, "plugin-updated"), "");
+  const after = await f.runtime.capabilities({ cwd: f.cwd });
+  assert.deepEqual(after.skills, before.skills); assert.equal(new Set(after.skills.map(s => s.id)).size, 3);
+  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [before.skills[0].id] }));
+  assert.deepEqual(await enabled(), [true, false, false]);
+  await assert.rejects(f.runtime.start({ cwd: f.cwd, skillIds: [pathId("plugins/pdf/1.0.0/pdf/SKILL.md")] }), /Selected native skill is unavailable/);
+});
+
+test("skills sharing a plugin and name stay individually selectable", async t => {
+  const f = await fixture(t, "ambiguous-plugin"), caps = await f.runtime.capabilities({ cwd: f.cwd });
+  assert.equal(new Set(caps.skills.map(s => s.id)).size, 2);
   await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [caps.skills[1].id] }));
   const start = (await f.calls()).filter(c => c.method === "thread/start").at(-1);
   assert.deepEqual(start.params.config.skills.config.map((s: any) => s.enabled), [false, true]);

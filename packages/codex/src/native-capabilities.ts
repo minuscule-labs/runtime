@@ -55,7 +55,8 @@ export async function nativeModels(rpc: CodexRpcProcess): Promise<NativeModel[]>
 }
 // Plugin skills are reported as "plugin:skill".
 const skillName = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?::[A-Za-z0-9][A-Za-z0-9_-]{0,127})?$/;
-interface NativeSkill { id: string; name: string; description: string; path: string }
+interface NativeSkill { id: string; pathId: string; name: string; description: string; path: string }
+const skillId = (identity: string) => `codex-skill-${createHash("sha256").update(identity).digest("hex")}`;
 export async function nativeSkills(rpc: CodexRpcProcess, cwd: string): Promise<NativeSkill[]> {
   const response = record(await rpc.request("skills/list", { cwds: [cwd], forceReload: true }));
   if (!response || !Array.isArray(response.data) || response.data.length !== 1) throw new Error("Invalid native skill catalog");
@@ -66,18 +67,21 @@ export async function nativeSkills(rpc: CodexRpcProcess, cwd: string): Promise<N
     const skill = record(value);
     if (!skill || typeof skill.path !== "string" || !isAbsolute(skill.path) || skill.path.length > 4096 || typeof skill.enabled !== "boolean"
       || typeof skill.name !== "string" || !skillName.test(skill.name) || typeof skill.description !== "string") throw new Error("Invalid native skill metadata");
-    const id = `codex-skill-${createHash("sha256").update(skill.path).digest("hex")}`;
-    if (skills.some(s => s.id === id)) throw new Error("Duplicate native skill identity");
+    const pathId = skillId(skill.path);
+    if (skills.some(s => s.pathId === pathId)) throw new Error("Duplicate native skill identity");
     // Descriptions are human-authored, not an authority to publish native paths.
     const description = skill.description.length <= 1024 && !/[\\/\r\n\x00-\x1f]|(?:api[_-]?key|bearer\s|sk-[A-Za-z0-9])/i.test(skill.description) ? skill.description : "";
-    skills.push({ id, name: skill.name, description, path: skill.path });
+    // Plugin paths contain the plugin version, so an update would change a path identity. The array form cannot equal a path.
+    const id = typeof skill.pluginId === "string" && skill.pluginId && skill.pluginId.length <= 256 ? skillId(JSON.stringify(["plugin", skill.pluginId, skill.name])) : pathId;
+    skills.push({ id, pathId, name: skill.name, description, path: skill.path });
   }
-  return skills;
+  // Skills that share a plugin and name stay individually selectable by path.
+  return skills.map(skill => skills.filter(other => other.id === skill.id).length > 1 ? { ...skill, id: skill.pathId } : skill);
 }
 /** Codex adds plugin skills shortly after startup and reports no completion signal, so read until the list stops changing. Bounded. */
 const SKILL_SETTLE = { intervalMs: 150, quietMs: 600, limitMs: 3_000 };
 async function settledSkills(rpc: CodexRpcProcess, cwd: string): Promise<NativeSkill[]> {
-  const key = (list: NativeSkill[]) => list.map(skill => skill.id).sort().join();
+  const key = (list: NativeSkill[]) => list.map(skill => skill.path).sort().join("\0");
   let skills = await nativeSkills(rpc, cwd), changedAt = performance.now();
   const limit = changedAt + SKILL_SETTLE.limitMs;
   while (performance.now() < limit && performance.now() - changedAt < SKILL_SETTLE.quietMs) {
@@ -90,8 +94,9 @@ async function settledSkills(rpc: CodexRpcProcess, cwd: string): Promise<NativeS
 }
 export async function skillOverrides(rpc: CodexRpcProcess, cwd: string, ids: string[]): Promise<Record<string, unknown>> {
   const skills = await settledSkills(rpc, cwd);
-  if (ids.some(id => !skills.some(s => s.id === id))) throw new Error("Selected native skill is unavailable");
-  return { skills: { config: skills.map(skill => ({ path: skill.path, enabled: ids.includes(skill.id) })) } };
+  // Selections saved before plugin identities existed hold path identities.
+  if (ids.some(id => !skills.some(s => s.id === id || s.pathId === id))) throw new Error("Selected native skill is unavailable");
+  return { skills: { config: skills.map(skill => ({ path: skill.path, enabled: ids.includes(skill.id) || ids.includes(skill.pathId) })) } };
 }
 
 /** The caller owns this temporary RPC and must confirm shutdown before returning. */
