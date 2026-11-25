@@ -121,7 +121,8 @@ Select skills using discovered `skillIds`; `[]` disables all discovered skills,
 including builtins, through per-thread native config. Omission preserves harness
 defaults. IDs are hashes, not paths: of the plugin ID and skill name for plugin skills,
 so they survive plugin updates, and of the path otherwise (also for an engine that
-reports no plugin ID, or skills sharing both). Earlier path IDs still resolve; unknown IDs fail. Codex gives no signal that
+reports no plugin ID). Versions of a plugin skill listed together share one ID. Earlier path
+IDs still resolve at launch but are not listed; unknown IDs fail. Codex gives no signal that
 plugin skills have finished loading, so a missing ID cannot be told apart from a late one,
 and only listed skills can be turned off. The selection is resolved again on native
 allocation/resume without changing shared native configuration.

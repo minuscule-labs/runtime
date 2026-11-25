@@ -208,16 +208,10 @@ test("Claude Code runs through the shared CLI like Codex: owner-scoped managed s
 });
 
 test("start refuses a Pi skill that is not reported, before any session exists",async t=>{
-  const fake=join(await realpath(await mkdtemp(join(tmpdir(),"runtime-cli-pi-"))),"pi.mjs"),saved=process.env.PI_COMMAND;
-  await writeFile(fake,`#!${process.execPath}
-import { createInterface } from "node:readline";
-createInterface({ input: process.stdin }).on("line", line => { const request = JSON.parse(line);
-  const data = { get_available_models: { models: [] }, get_commands: { commands: [{ name: "skill:reviewer", source: "skill", sourceInfo: { path: "/skills/reviewer/SKILL.md" } }] },
-    get_state: { thinkingLevel: "medium", sessionId: "fake", isStreaming: false } }[request.type];
-  console.log(JSON.stringify({ id: request.id, type: "response", command: request.type, success: true, data })); }).on("close", () => process.exit(0));
-`);await chmod(fake,0o755);process.env.PI_COMMAND=fake;
-  t.after(()=>{if(saved===undefined)delete process.env.PI_COMMAND;else process.env.PI_COMMAND=saved;});
-  const f=await fixture(t);
-  assert.match(await f.run(["start","--cwd",f.directory,"--skill","reviewer"],false),/Unknown skill: reviewer/);
-  assert.match(await f.run(["sessions"]),/No online Pi sessions/);
+  const starts: unknown[]=[];t.mock.method(console,"log",()=>{});
+  t.mock.method(PiAgentRuntime.prototype,"capabilities",async()=>({models:[],reasoningLevels:[],skills:[{id:"skill:reviewer",name:"reviewer",description:""}]}));
+  t.mock.method(PiAgentRuntime.prototype,"start",async(config: Parameters<PiAgentRuntime["start"]>[0])=>{starts.push(config);return{id:"pi",runtime:"pi",ownership:"owned",cwd:"/workspace"};});
+  const run=(...skill:string[])=>createRuntimeProgram().parseAsync([process.execPath,"minu-runtime","start","--cwd","/workspace","--skill",...skill]);
+  await assert.rejects(run("skill:reviewer","reviewer"),/Unknown skill: reviewer$/);assert.deepEqual(starts,[]);
+  await run("skill:reviewer");assert.deepEqual(starts,[{cwd:"/workspace",skillIds:["skill:reviewer"]}]);
 });

@@ -71,17 +71,16 @@ export async function nativeSkills(rpc: CodexRpcProcess, cwd: string): Promise<N
     if (skills.some(s => s.pathId === pathId)) throw new Error("Duplicate native skill identity");
     // Descriptions are human-authored, not an authority to publish native paths.
     const description = skill.description.length <= 1024 && !/[\\/\r\n\x00-\x1f]|(?:api[_-]?key|bearer\s|sk-[A-Za-z0-9])/i.test(skill.description) ? skill.description : "";
-    // Plugin paths contain the plugin version, so an update would change a path identity. The array form cannot equal a path.
+    // Plugin paths contain the plugin version, so an update would change a path identity. Versions listed together are one skill. The array form cannot equal a path.
     const id = typeof skill.pluginId === "string" && skill.pluginId && skill.pluginId.length <= 256 ? skillId(JSON.stringify(["plugin", skill.pluginId, skill.name])) : pathId;
     skills.push({ id, pathId, name: skill.name, description, path: skill.path });
   }
-  // Skills that share a plugin and name stay individually selectable by path.
-  return skills.map(skill => skills.filter(other => other.id === skill.id).length > 1 ? { ...skill, id: skill.pathId } : skill);
+  return skills;
 }
 /** Codex adds plugin skills shortly after startup and reports no completion signal, so read until the list stops changing. Bounded. */
 const SKILL_SETTLE = { intervalMs: 150, quietMs: 600, limitMs: 3_000 };
 async function settledSkills(rpc: CodexRpcProcess, cwd: string): Promise<NativeSkill[]> {
-  const key = (list: NativeSkill[]) => list.map(skill => skill.path).sort().join("\0");
+  const key = (list: NativeSkill[]) => list.map(skill => `${skill.id} ${skill.path}`).sort().join("\0");
   let skills = await nativeSkills(rpc, cwd), changedAt = performance.now();
   const limit = changedAt + SKILL_SETTLE.limitMs;
   while (performance.now() < limit && performance.now() - changedAt < SKILL_SETTLE.quietMs) {
@@ -112,7 +111,7 @@ export async function discoverNativeLaunch(rpc: CodexRpcProcess, cwd: string, re
   const level = reasoning(response.reasoningEffort) ?? (response.reasoningEffort === null ? selected?.defaultLevel : undefined);
   return { models: models.map(model => ({ provider: response.modelProvider as string, id: model.id, name: model.id, reasoning: model.levels.some(level => level !== "off") })),
     reasoningLevels: CODEX_REASONING.filter(level => models.some(model => model.levels.includes(level))),
-    skills: skills.map(({ id, name, description }) => ({ id, name, description })),
+    skills: [...new Map(skills.map(({ id, name, description }) => [id, { id, name, description }])).values()],
     defaultModel: { provider: response.modelProvider, id: response.model }, ...(level ? { defaultReasoningLevel: level } : {}) };
 }
 
