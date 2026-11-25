@@ -1,4 +1,5 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { RUNTIME_INPUT_LIMITS } from "@minu/runtime-core";
 
@@ -63,6 +64,13 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       defaultReasoningEffort: "medium", inputModalities: scenario === "text-only" || model === "text-model" ? ["text"] : ["text", "image"] })), nextCursor: null });
   } else if (method === "skills/list") {
     skillReads += 1;
+    if (scenario === "versioned-plugin" || scenario === "late-plugin-id") {
+      const plugin = (version: string, name = "pdf:pdf") => ({ name, pluginId: "pdf@market", description: "Fixture", enabled: true, path: `${process.cwd()}/plugins/pdf/${version}/${name.split(":")[1]}/SKILL.md` });
+      const version = existsSync(join(process.cwd(), "plugin-updated")) ? "2.0.0" : "1.0.0";
+      const skills = scenario === "late-plugin-id" ? [{ ...plugin(version), pluginId: skillReads < 3 ? null : "pdf@market" }]
+        : [...(existsSync(join(process.cwd(), "plugin-updating")) ? [plugin("0.9.0")] : []), plugin(version), plugin(version, "pdf:fill"), { name: "alpha", pluginId: null, description: "Fixture", enabled: true, path: `${process.cwd()}/private-skills/alpha/SKILL.md` }];
+      return result({ data: [{ cwd: process.cwd(), errors: [], skills }] });
+    }
     result({ data: [{ cwd: process.cwd(), errors: [], skills: (scenario === "late-skills" ? (skillReads < 3 ? ["alpha"] : ["alpha", "late:late"]) : scenario === "growing-skills" ? Array.from({ length: skillReads }, (_, i) => `skill-${i}`) : scenario === "plugin-skills" ? ["alpha", "pdf:pdf"] : scenario === "malformed-skill" ? ["alpha", "a:b:c"] : ["alpha", "beta"]).map(name => ({ name, description: `Fixture ${name}`, enabled: true,
       path: `${process.cwd()}/private-skills/${name}/SKILL.md` })) }] });
   } else if (method === "account/read") {

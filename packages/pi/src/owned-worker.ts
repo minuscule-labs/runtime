@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { AgentReasoningLevel, AgentStatus, RuntimeImageContent } from "@minu/runtime-core";
 import { normalizePiMessages } from "./messages.js";
@@ -206,6 +206,13 @@ async function shutdown(exitCode = 0): Promise<void> {
   process.exit(exitCode);
 }
 
+/** The launcher polls for this file, so it must never be visible half-written. */
+async function writeReady(result: { sessionId?: string; runtimeSessionId?: string; error?: string }): Promise<void> {
+  const temporary = `${readyFile}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(result)}\n`, { mode: 0o600 });
+  await rename(temporary, readyFile);
+}
+
 async function main(): Promise<void> {
   await mkdir(dirname(readyFile), { recursive: true });
   if (runtimeSessionId && runtimeOwnerId) {
@@ -297,7 +304,7 @@ async function main(): Promise<void> {
       sessionId,
     );
   }
-  await writeFile(readyFile, `${JSON.stringify({ sessionId, runtimeSessionId })}\n`, { mode: 0o600 });
+  await writeReady({ sessionId, runtimeSessionId });
 }
 
 process.on("SIGINT", () => void shutdown(130));
@@ -305,8 +312,6 @@ process.on("SIGTERM", () => void shutdown(143));
 
 main().catch(async (error) => {
   await log(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`).catch(() => {});
-  await writeFile(readyFile, `${JSON.stringify({ error: error instanceof Error ? error.message : String(error) })}\n`).catch(
-    () => {},
-  );
+  await writeReady({ error: error instanceof Error ? error.message : String(error) }).catch(() => {});
   await shutdown(1);
 });

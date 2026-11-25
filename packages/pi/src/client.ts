@@ -108,17 +108,25 @@ interface DiscoveredPiSkill extends RuntimeSkillCapability {
   path: string;
 }
 
-async function discoverSkills(rpc: PiRpcProcess): Promise<DiscoveredPiSkill[]> {
+async function discoverSkills(rpc: PiRpcProcess, selected: string[] = []): Promise<DiscoveredPiSkill[]> {
   const available = (await rpc.request("get_commands")) as { commands?: unknown[] };
+  // A selection must not be emptied by an answer that cannot be read.
+  if (selected.length && !Array.isArray(available?.commands)) throw new Error("Pi skill discovery is unavailable");
   const seen = new Set<string>();
   return (available.commands ?? []).flatMap((value) => {
     if (!value || typeof value !== "object") return [];
     const command = value as Record<string, unknown>;
     const sourceInfo = command.sourceInfo;
-    if (command.source !== "skill" || typeof command.name !== "string"
+    if (command.source !== "skill") return [];
+    if (typeof command.name !== "string"
       || !sourceInfo || typeof sourceInfo !== "object"
-      || typeof (sourceInfo as Record<string, unknown>).path !== "string"
-      || seen.has(command.name)) return [];
+      || typeof (sourceInfo as Record<string, unknown>).path !== "string") {
+      if (selected.length && (typeof command.name !== "string" || selected.includes(command.name))) {
+        throw new Error("Pi skill discovery is unavailable");
+      }
+      return [];
+    }
+    if (seen.has(command.name)) return [];
     seen.add(command.name);
     return [{
       id: command.name,
@@ -241,13 +249,9 @@ export class PiAgentRuntime implements AgentRuntime {
     if (config.skillIds !== undefined) {
       const discovery = new PiRpcProcess(cwd, () => {});
       try {
-        const skills = await discoverSkills(discovery);
+        const skills = await discoverSkills(discovery, config.skillIds);
         const byId = new Map(skills.map((skill) => [skill.id, skill.path]));
-        skillPaths = config.skillIds.map((id) => {
-          const path = byId.get(id);
-          if (!path) throw new Error(`Pi skill is not available: ${id}`);
-          return path;
-        });
+        skillPaths = config.skillIds.flatMap((id) => byId.get(id) ?? []);
       } finally {
         await discovery.stop();
       }
@@ -347,7 +351,7 @@ export class PiAgentRuntime implements AgentRuntime {
     } finally {
       cancelled = true;
       if (!started) await terminateChild(child);
-      await Promise.all([rm(readyFile, { force: true }), rm(promptFile, { force: true })]);
+      await Promise.all([readyFile, `${readyFile}.tmp`, promptFile].map((path) => rm(path, { force: true })));
     }
   }
 

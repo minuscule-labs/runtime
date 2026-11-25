@@ -119,8 +119,13 @@ still returned, with unknown reasoning defaults omitted.
 
 Select skills using discovered `skillIds`; `[]` disables all discovered skills,
 including builtins, through per-thread native config. Omission preserves harness
-defaults. IDs are path hashes, not paths; unknown IDs fail. The selection is resolved
-again on native allocation/resume without changing shared native configuration.
+defaults. IDs are hashes, not paths: of the plugin ID and skill name for plugin skills,
+so they survive plugin updates, and of the path otherwise (also for an engine that
+reports no plugin ID). Versions of a plugin skill listed together share one ID. Earlier path
+IDs still resolve at launch but are not listed; unknown IDs fail. Codex gives no signal that
+plugin skills have finished loading, so a missing ID cannot be told apart from a late one,
+and only listed skills can be turned off. The selection is resolved again on native
+allocation/resume without changing shared native configuration.
 
 `send`/`startTurn` accept Core image objects: PNG/JPEG/GIF/WebP with canonical base64,
 at most four images, 10 MiB each and 20 MiB combined. Ordered MIME/pixels participate
@@ -521,7 +526,9 @@ const session = await runtime.start({
 });
 ```
 
-Omitting `skillIds` preserves the harness's default skill behavior. Supplying an empty array explicitly disables discovered skills for adapters that support selection. The Pi adapter discovers skills from its available-command RPC response, keeps native paths private, revalidates selected ids before launch, and starts the owned process with only those skills. Skill changes require a new session.
+Omitting `skillIds` preserves the harness's default skill behavior. Supplying an empty array explicitly disables discovered skills for adapters that support selection. The Pi adapter discovers skills from its available-command RPC response, keeps native paths private, resolves selected ids again before launch and resume, and starts the owned process with only those skills. Skill changes require a new session.
+
+With Pi, a selected skill that has been deleted or renamed is left out instead of stopping the start or resume. Codex and Claude Code still refuse, because a skill that loads late looks the same as a missing one. The remaining selection still applies, an empty remainder means no skills, and the stored selection is not rewritten, so a restored skill returns on the next resume. Compare the selection with `capabilities()` to report what is missing. Malformed ids are still rejected.
 
 Owned Pi workers inherit their host's environment. Authorized API workflows can use existing shell tools; credentials must reach the actual host process, not only an interactive terminal. Runtime does not provision secrets or treat Skills as credential grants.
 

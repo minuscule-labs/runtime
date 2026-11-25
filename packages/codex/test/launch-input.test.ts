@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, realpath, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -70,6 +71,36 @@ test("plugin-qualified skills are discovered and selected", async t => {
   await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [caps.skills[1].id] }));
   const start = (await f.calls()).filter(c => c.method === "thread/start").at(-1);
   assert.deepEqual(start.params.config.skills.config.map((s: any) => s.enabled), [false, true]);
+});
+
+test("plugin skill identities survive a plugin update, and earlier path identities still resolve", async t => {
+  const f = await fixture(t, "versioned-plugin"), before = await f.runtime.capabilities({ cwd: f.cwd });
+  const pathId = (path: string) => `codex-skill-${createHash("sha256").update(join(f.cwd, path)).digest("hex")}`;
+  const enabled = async () => { const start = (await f.calls()).filter(c => c.method === "thread/start").at(-1); return start.params.config.skills.config.map((s: any) => s.enabled); };
+  assert.equal(before.skills[2].id, pathId("private-skills/alpha/SKILL.md"), "a skill without a plugin keeps its path identity");
+  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [pathId("plugins/pdf/1.0.0/pdf/SKILL.md")] }));
+  assert.deepEqual(await enabled(), [true, false, false]);
+  await writeFile(join(f.cwd, "plugin-updated"), "");
+  const after = await f.runtime.capabilities({ cwd: f.cwd });
+  assert.deepEqual(after.skills, before.skills); assert.equal(new Set(after.skills.map(s => s.id)).size, 3);
+  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [before.skills[0].id] }));
+  assert.deepEqual(await enabled(), [true, false, false]);
+  await assert.rejects(f.runtime.start({ cwd: f.cwd, skillIds: [pathId("plugins/pdf/1.0.0/pdf/SKILL.md")] }), /Selected native skill is unavailable/);
+});
+
+test("plugin versions listed together are one skill, selected and deselected as one", async t => {
+  const f = await fixture(t, "versioned-plugin"), before = await f.runtime.capabilities({ cwd: f.cwd });
+  await writeFile(join(f.cwd, "plugin-updating"), "");
+  assert.deepEqual((await f.runtime.capabilities({ cwd: f.cwd })).skills, before.skills);
+  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [before.skills[0].id] }));
+  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [before.skills[1].id] }));
+  const starts = (await f.calls()).filter(c => c.method === "thread/start" && c.params.ephemeral !== true);
+  assert.deepEqual(starts.map(c => c.params.config.skills.config.map((s: any) => s.enabled)), [[true, true, false, false], [false, false, true, false]]);
+});
+
+test("a plugin identity reported after its path is waited for", async t => {
+  const late = await fixture(t, "late-plugin-id"), known = await fixture(t, "versioned-plugin");
+  assert.equal((await late.runtime.capabilities({ cwd: late.cwd })).skills[0].id, (await known.runtime.capabilities({ cwd: known.cwd })).skills[0].id);
 });
 
 test("a missing codex executable is a named setup error from capabilities and start, with no path", async t => {

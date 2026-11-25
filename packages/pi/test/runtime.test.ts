@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { appendFile, chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { once } from "node:events";
+import { appendFile, chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import type { AgentEvent, AgentStatus, RuntimeMessage } from "@minu/runtime-core";
 import { PiAgentRuntime } from "../src/client.js";
 import { BoundedDiagnosticLog } from "../src/diagnostic.js";
@@ -576,6 +578,34 @@ test("failed Runtime startup terminates its worker", { timeout: 10_000 }, async 
   }
 });
 
+test("the owned worker replaces its ready file instead of writing it in place", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "minu-runtime-ready-file-"));
+  const readyFile = join(directory, "ready.json");
+  const fakePi = join(directory, "fake-pi.mjs");
+  await writeFile(readyFile, "");
+  await writeFile(fakePi, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const { id, type } = JSON.parse(line);
+  console.log(JSON.stringify({ id, type: "response", command: type, success: false, error: "fixture failure" }));
+});
+`);
+  await chmod(fakePi, 0o755);
+  try {
+    const { ino } = await stat(readyFile);
+    const child = spawn(process.execPath, [
+      fileURLToPath(new URL("../src/owned-worker.js", import.meta.url)), "--cwd", directory,
+      "--ready-file", readyFile, "--log-file", join(directory, "worker.log"),
+    ], { stdio: "ignore", env: { ...process.env, PI_COMMAND: fakePi, MINU_RUNTIME_DIR: join(directory, "registry") } });
+    await once(child, "exit");
+    assert.match(JSON.parse(await readFile(readyFile, "utf8")).error, /fixture failure/);
+    assert.notEqual((await stat(readyFile)).ino, ino);
+    assert.deepEqual((await readdir(directory)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("Runtime startup reports a worker that exits before readiness", async () => {
   const directory = await mkdtemp(join(tmpdir(), "minu-runtime-early-exit-"));
   const worker = join(directory, "worker.mjs");
@@ -970,7 +1000,7 @@ process.stdin.on("data", (chunk) => {
     save();
     const respond = (data) => console.log(JSON.stringify({ id: request.id, type: "response", command: request.type, success: true, data }));
     if (request.type === "get_available_models") respond({ models: [{ provider: "openai", id: "gpt-test", reasoning: true }] });
-    else if (request.type === "get_commands") respond({ commands: [{ name: "skill:reviewer", description: "Review changes", source: "skill", sourceInfo: { path: "/skills/reviewer/SKILL.md", source: "auto", scope: "user" } }] });
+    else if (request.type === "get_commands") respond(process.env.PI_TEST_MALFORMED_COMMANDS === "entry" ? { commands: [{ name: "skill:reviewer", source: "skill" }] } : process.env.PI_TEST_MALFORMED_COMMANDS ? {} : { commands: [{ name: "skill:reviewer", description: "Review changes", source: "skill", sourceInfo: { path: "/skills/reviewer/SKILL.md", source: "auto", scope: "user" } }] });
     else if (request.type === "get_available_thinking_levels") respond({ levels: ["off", "medium", "high"] });
     else if (request.type === "set_model" || request.type === "set_thinking_level") respond(undefined);
     else if (request.type === "get_state") respond({ model: { provider: "openai", id: "gpt-test", input: ["text", "image"] }, thinkingLevel: "medium", sessionId: "fake-owned-session", isStreaming: false });
@@ -1003,16 +1033,32 @@ process.on("SIGTERM", () => process.exit(0));
       defaultModel: { provider: "openai", id: "gpt-test" },
       defaultReasoningLevel: "medium",
     });
+    process.env.PI_TEST_MALFORMED_COMMANDS = "1";
     await assert.rejects(
-      runtime.start({ cwd: directory, skillIds: ["skill:missing"] }),
-      /Pi skill is not available: skill:missing/,
+      runtime.start({ cwd: directory, skillIds: ["skill:reviewer"] }),
+      /Pi skill discovery is unavailable/,
+      "an answer without a skill list never counts as every skill being deleted",
     );
+    process.env.PI_TEST_MALFORMED_COMMANDS = "entry";
+    await assert.rejects(
+      runtime.start({ cwd: directory, skillIds: ["skill:reviewer"] }),
+      /Pi skill discovery is unavailable/,
+      "a selected skill that cannot be read never counts as deleted",
+    );
+    delete process.env.PI_TEST_MALFORMED_COMMANDS;
+    const missingSkill = await runtime.start({ cwd: directory, skillIds: ["skill:missing"] });
+    sessionId = missingSkill.id;
+    const missingLaunch = JSON.parse(await readFile(argsFile, "utf8")) as { args: string[] };
+    assert.ok(missingLaunch.args.includes("--no-skills"), "a missing skill never restores the harness defaults");
+    assert.ok(!missingLaunch.args.includes("--skill"));
+    await runtime.stop(missingSkill.id);
+    sessionId = undefined;
     const session = await runtime.start({
       cwd: directory,
       appendSystemPrompt: "You are the reviewer persona.",
       model: { provider: "openai", id: "gpt-test" },
       reasoningLevel: "high",
-      skillIds: ["skill:reviewer"],
+      skillIds: ["skill:missing", "skill:reviewer"],
     });
     sessionId = session.id;
     assert.equal(session.ownership, "owned");
@@ -1039,6 +1085,7 @@ process.on("SIGTERM", () => process.exit(0));
     assert.ok(!JSON.stringify(launch).includes("fixture-only-api-key"));
     assert.ok(launch.args.includes("--no-skills"));
     const skillIndex = launch.args.indexOf("--skill");
+    assert.equal(launch.args.filter((value) => value === "--skill").length, 1);
     assert.equal(launch.args[skillIndex + 1], "/skills/reviewer/SKILL.md");
     assert.deepEqual(
       launch.requests.slice(0, 5).map(({ type, provider, modelId, level }) => ({ type, provider, modelId, level })),
@@ -1097,6 +1144,7 @@ process.on("SIGTERM", () => process.exit(0));
     await rm(directory, { recursive: true, force: true });
     delete process.env.MINU_RUNTIME_DIR;
     delete process.env.PI_COMMAND;
+    delete process.env.PI_TEST_MALFORMED_COMMANDS;
     delete process.env.PI_ARGS_FILE;
     delete process.env.PI_TEST_API_CREDENTIAL;
   }

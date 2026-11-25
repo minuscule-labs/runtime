@@ -206,3 +206,12 @@ test("Claude Code runs through the shared CLI like Codex: owner-scoped managed s
   assert.match(await run(["--adapter","pi","--permissions","full","sessions"],false),/require Claude Code/);
   assert.match(await run([...scoped,"start","--cwd",cwd],false,{MINU_CLAUDE_FIXTURE_ACCOUNT:"none"}),/not logged in/);
 });
+
+test("start refuses a Pi skill that is not reported, before any session exists",async t=>{
+  const starts: unknown[]=[];t.mock.method(console,"log",()=>{});
+  t.mock.method(PiAgentRuntime.prototype,"capabilities",async()=>({models:[],reasoningLevels:[],skills:[{id:"skill:reviewer",name:"reviewer",description:""}]}));
+  t.mock.method(PiAgentRuntime.prototype,"start",async(config: Parameters<PiAgentRuntime["start"]>[0])=>{starts.push(config);return{id:"pi",runtime:"pi",ownership:"owned",cwd:"/workspace"};});
+  const run=(...skill:string[])=>createRuntimeProgram().parseAsync([process.execPath,"minu-runtime","start","--cwd","/workspace","--skill",...skill]);
+  await assert.rejects(run("skill:reviewer","reviewer"),/Unknown skill: reviewer$/);assert.deepEqual(starts,[]);
+  await run("skill:reviewer");assert.deepEqual(starts,[{cwd:"/workspace",skillIds:["skill:reviewer"]}]);
+});
