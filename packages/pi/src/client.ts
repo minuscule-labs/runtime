@@ -243,11 +243,7 @@ export class PiAgentRuntime implements AgentRuntime {
       try {
         const skills = await discoverSkills(discovery);
         const byId = new Map(skills.map((skill) => [skill.id, skill.path]));
-        skillPaths = config.skillIds.map((id) => {
-          const path = byId.get(id);
-          if (!path) throw new Error(`Pi skill is not available: ${id}`);
-          return path;
-        });
+        skillPaths = config.skillIds.flatMap((id) => byId.get(id) ?? []);
       } finally {
         await discovery.stop();
       }

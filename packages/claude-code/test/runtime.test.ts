@@ -310,7 +310,7 @@ test("model, reasoning and skills are validated against discovery and passed to 
 test("unsupported selections are refused after discovery with the engine confirmed gone and no session created", async t => {
   const { dir, runtime, pid } = await selection(t);
   for (const config of [{ model: { provider: "anthropic", id: "nonexistent" } }, { reasoningLevel: "xhigh" as const },
-    { reasoningLevel: "minimal" as const }, { model: { provider: "anthropic", id: "haiku" }, reasoningLevel: "low" as const }, { skillIds: ["compact"] }, { skillIds: ["missing"] }]) {
+    { reasoningLevel: "minimal" as const }, { model: { provider: "anthropic", id: "haiku" }, reasoningLevel: "low" as const }, { skillIds: ["compact"] }]) {
     await assert.rejects(runtime.start(config), /Unsupported|Unknown/);
     const started = Number(await readFile(pid, "utf8")); assert.throws(() => process.kill(started, 0), { code: "ESRCH" });
   }

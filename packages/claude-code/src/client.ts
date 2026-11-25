@@ -14,7 +14,7 @@ import {
   type RuntimeIntegrationSnapshot, type RuntimeLaunchCapabilities, type RuntimeSessionCapabilities, type RuntimeSessionEvents, type RuntimeSessionProfile,
 } from "@minu/runtime-core";
 import { Queue } from "./queue.js";
-import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeExpectedModels, claudeCodeSelectionOptions, claudeCodeSkillOptions, claudeCodeSupportsImages,
+import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeExpectedModels, claudeCodeSelectedSkills, claudeCodeSelectionOptions, claudeCodeSkillOptions, claudeCodeSupportsImages,
   validateClaudeCodeSelection, verifyClaudeCodeSelection } from "./launch-options.js";
 import { requireClaudeCodeAuth } from "./probe.js";
 import { claudeCodeVersionSupported } from "./native-history.js";
@@ -393,7 +393,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       verifyClaudeCodeSelection(config, discovery);
       state.images = claudeCodeSupportsImages(config, discovery);
       state.expectedModels = claudeCodeExpectedModels(config, discovery);
-      state.observed.skills = config.skillIds ? [...config.skillIds] : discovery.skills.map(skill => skill.name);
+      state.observed.skills = claudeCodeSelectedSkills(config, discovery);
       if (config.reasoningLevel) state.observed.reasoning = config.reasoningLevel; // Verified against the engine at launch.
       if (native && !claudeCodeVersionSupported(initialized.claude_code_version)) throw new ClaudeCodeUnsupportedVersionError();
       if (native?.engineVersion && String(initialized.claude_code_version).split(".")[0] !== native.engineVersion.split(".")[0]) {

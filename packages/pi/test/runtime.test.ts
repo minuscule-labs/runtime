@@ -1003,16 +1003,19 @@ process.on("SIGTERM", () => process.exit(0));
       defaultModel: { provider: "openai", id: "gpt-test" },
       defaultReasoningLevel: "medium",
     });
-    await assert.rejects(
-      runtime.start({ cwd: directory, skillIds: ["skill:missing"] }),
-      /Pi skill is not available: skill:missing/,
-    );
+    const missingSkill = await runtime.start({ cwd: directory, skillIds: ["skill:missing"] });
+    sessionId = missingSkill.id;
+    const missingLaunch = JSON.parse(await readFile(argsFile, "utf8")) as { args: string[] };
+    assert.ok(missingLaunch.args.includes("--no-skills"), "a missing skill never restores the harness defaults");
+    assert.ok(!missingLaunch.args.includes("--skill"));
+    await runtime.stop(missingSkill.id);
+    sessionId = undefined;
     const session = await runtime.start({
       cwd: directory,
       appendSystemPrompt: "You are the reviewer persona.",
       model: { provider: "openai", id: "gpt-test" },
       reasoningLevel: "high",
-      skillIds: ["skill:reviewer"],
+      skillIds: ["skill:missing", "skill:reviewer"],
     });
     sessionId = session.id;
     assert.equal(session.ownership, "owned");
@@ -1039,6 +1042,7 @@ process.on("SIGTERM", () => process.exit(0));
     assert.ok(!JSON.stringify(launch).includes("fixture-only-api-key"));
     assert.ok(launch.args.includes("--no-skills"));
     const skillIndex = launch.args.indexOf("--skill");
+    assert.equal(launch.args.filter((value) => value === "--skill").length, 1);
     assert.equal(launch.args[skillIndex + 1], "/skills/reviewer/SKILL.md");
     assert.deepEqual(
       launch.requests.slice(0, 5).map(({ type, provider, modelId, level }) => ({ type, provider, modelId, level })),

@@ -150,7 +150,7 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       // BEFORE any manifest or worker exists.
       const probe = await requireClaudeCodeAuth({ cwd, executable: this.nativeOptions.executable, env: claudeCodeNativeEnvironment(this.nativeOptions.env),
         startupTimeoutMs: this.nativeOptions.startupTimeoutMs, shutdownTimeoutMs: this.nativeOptions.shutdownTimeoutMs, isolate: this.options.isolateConfiguration });
-      // Unsupported model/effort/skills are refused, never silently replaced, and before any manifest exists.
+      // Unsupported model/effort/builtin commands are refused, never silently replaced, and before any manifest exists.
       verifyClaudeCodeSelection(config, probe);
       const policy = resolveClaudeCodePermissions(this.options.permissions);
       await this.store.create({ version: 5, runtime: "claude-code", id, ownerId, revision: 0, generation, requiresExplicitResume: false,

@@ -427,10 +427,25 @@ test("managed launch selections are validated, persisted in launchConfig and re-
   await resumed.send(session.id, "second"); await resumed.stop(session.id); await resumed.destroy(session.id, "owner");
 });
 
+test("a selected skill that disappears is left out on start and resume, and the stored selection is kept", async t => {
+  const f = await fixture(t, { MINU_CLAUDE_FIXTURE_MODELS: MODELS, MINU_CLAUDE_FIXTURE_COMMANDS: COMMANDS });
+  const skills = async (runtime: typeof f.runtime, id: string) => (await runtime.inspectSessionProfile!(id, "owner"))!.skills;
+  const runtime = f.controller(), session = await runtime.startManaged({ cwd: f.cwd, skillIds: ["missing", "review"] }, "owner");
+  await runtime.send(session.id, "first");
+  assert.deepEqual(await skills(runtime, session.id), { status: "verified", commandIds: ["review"], complete: true });
+  await runtime.stop(session.id);
+  f.options.nativeOptions!.env!.MINU_CLAUDE_FIXTURE_COMMANDS = JSON.stringify([]);
+  const resumed = f.controller(); await resumed.resume(session.id, "owner", { allowStopped: true });
+  await resumed.send(session.id, "second");
+  assert.deepEqual(await skills(resumed, session.id), { status: "verified", commandIds: [], complete: true });
+  assert.deepEqual((await f.read(session.id))!.launchConfig.skillIds, ["missing", "review"]);
+  await resumed.stop(session.id); await resumed.destroy(session.id, "owner");
+});
+
 test("managed unsupported selections are refused before any manifest or worker exists", async t => {
   const f = await fixture(t, { MINU_CLAUDE_FIXTURE_MODELS: MODELS, MINU_CLAUDE_FIXTURE_COMMANDS: COMMANDS });
   for (const config of [{ model: { provider: "anthropic", id: "gone" } }, { model: { provider: "x", id: "sonnet" } }, { reasoningLevel: "xhigh" as const },
-    { reasoningLevel: "minimal" as const }, { skillIds: ["compact"] }, { skillIds: ["missing"] }, { skillIds: ["review", "review"] }]) {
+    { reasoningLevel: "minimal" as const }, { skillIds: ["compact"] }, { skillIds: ["review", "review"] }]) {
     await assert.rejects(f.runtime.startManaged({ cwd: f.cwd, ...config } as never, "owner"), /unavailable/);
   }
   assert.deepEqual(await f.runtime.listManagedSessions("owner"), []);

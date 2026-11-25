@@ -90,7 +90,6 @@ async function settledSkills(rpc: CodexRpcProcess, cwd: string): Promise<NativeS
 }
 export async function skillOverrides(rpc: CodexRpcProcess, cwd: string, ids: string[]): Promise<Record<string, unknown>> {
   const skills = await settledSkills(rpc, cwd);
-  if (ids.some(id => !skills.some(s => s.id === id))) throw new Error("Selected native skill is unavailable");
   return { skills: { config: skills.map(skill => ({ path: skill.path, enabled: ids.includes(skill.id) })) } };
 }
 

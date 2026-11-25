@@ -53,7 +53,8 @@ export interface AgentStartConfig {
   model?: AgentModelSelection;
   /** Select an adapter-supported reasoning level for the new session. */
   reasoningLevel?: AgentReasoningLevel;
-  /** Restrict the session to these adapter-discovered skills. Omit to preserve harness defaults. */
+  /** Restrict the session to these adapter-discovered skills. Omit to preserve harness defaults.
+   * An id the adapter no longer discovers is left out; it never enables anything else. */
   skillIds?: string[];
 }
 
