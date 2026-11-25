@@ -206,3 +206,9 @@ test("Claude Code runs through the shared CLI like Codex: owner-scoped managed s
   assert.match(await run(["--adapter","pi","--permissions","full","sessions"],false),/require Claude Code/);
   assert.match(await run([...scoped,"start","--cwd",cwd],false,{MINU_CLAUDE_FIXTURE_ACCOUNT:"none"}),/not logged in/);
 });
+
+test("start refuses a skill the adapter does not report, before any session exists",async t=>{
+  const f=await fixture(t);
+  await assert.rejects(f.run([...f.scoped,"start","--cwd",f.directory,"--skill","reviewer"]),/Unknown skill: reviewer/);
+  assert.equal((await f.run([...f.scoped,"sessions"])).trim(),"");
+});

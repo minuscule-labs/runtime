@@ -7,7 +7,7 @@ import type { ChildProcess } from "node:child_process";
 import { runtimeInput, type AgentRuntime, type AgentStartConfig, type ManagedAgentSession, type ManagedSessionSummary,
   type RuntimeImageContent, type RuntimeActivityOptions, type RuntimeLaunchCapabilities } from "@minu/runtime-core";
 import { CLAUDE_CODE_FORBIDDEN_ENV, ClaudeCodeAuthRequiredError, ClaudeCodeNotInstalledError, ClaudeCodeUnsupportedVersionError, claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot } from "./native-config.js";
-import { claudeCodeCapabilities, validateClaudeCodeSelection, verifyClaudeCodeSelection } from "./launch-options.js";
+import { claudeCodeCapabilities, validateClaudeCodeSelection, verifyClaudeCodeSelection, withoutMissingSkills } from "./launch-options.js";
 import { resolveClaudeCodePermissions, type ClaudeCodePermissions } from "./permissions.js";
 import { requireClaudeCodeAuth } from "./probe.js";
 import { ClaudeCodeManagedStore, type ClaudeCodeManagedManifest } from "./managed-store.js";
@@ -150,8 +150,9 @@ export class ClaudeCodeManagedRuntime implements AgentRuntime {
       // BEFORE any manifest or worker exists.
       const probe = await requireClaudeCodeAuth({ cwd, executable: this.nativeOptions.executable, env: claudeCodeNativeEnvironment(this.nativeOptions.env),
         startupTimeoutMs: this.nativeOptions.startupTimeoutMs, shutdownTimeoutMs: this.nativeOptions.shutdownTimeoutMs, isolate: this.options.isolateConfiguration });
-      // Unsupported model/effort/builtin commands are refused, never silently replaced, and before any manifest exists.
-      verifyClaudeCodeSelection(config, probe);
+      // Unsupported model/effort is refused, never silently replaced, and before any manifest exists. Missing skills are left
+      // out at each launch; the stored selection keeps them so a restored skill returns.
+      verifyClaudeCodeSelection(withoutMissingSkills(config, probe), probe);
       const policy = resolveClaudeCodePermissions(this.options.permissions);
       await this.store.create({ version: 5, runtime: "claude-code", id, ownerId, revision: 0, generation, requiresExplicitResume: false,
         native: { state: "pending" }, worker: { state: "none" }, lastDispatch: { state: "none" }, launchConfig: { ...config, cwd },

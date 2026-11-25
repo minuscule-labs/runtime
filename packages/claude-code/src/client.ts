@@ -14,9 +14,9 @@ import {
   type RuntimeIntegrationSnapshot, type RuntimeLaunchCapabilities, type RuntimeSessionCapabilities, type RuntimeSessionEvents, type RuntimeSessionProfile,
 } from "@minu/runtime-core";
 import { Queue } from "./queue.js";
-import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeExpectedModels, claudeCodeSelectedSkills, claudeCodeSelectionOptions, claudeCodeSkillOptions, claudeCodeSupportsImages,
-  validateClaudeCodeSelection, verifyClaudeCodeSelection } from "./launch-options.js";
-import { requireClaudeCodeAuth } from "./probe.js";
+import { claudeCodeCapabilities, claudeCodeDiscovery, claudeCodeExpectedModels, claudeCodeSelectionOptions, claudeCodeSkillOptions, claudeCodeSupportsImages,
+  validateClaudeCodeSelection, verifyClaudeCodeSelection, withoutMissingSkills } from "./launch-options.js";
+import { probeClaudeCode, requireClaudeCodeAuth } from "./probe.js";
 import { claudeCodeVersionSupported } from "./native-history.js";
 import { claudeCodePermissionOptions, resolveClaudeCodePermissions, type ClaudeCodePermissionPolicy, type ClaudeCodePermissions } from "./permissions.js";
 import { claudeCodeNativeEnvironment, resolveClaudeCodeConfigRoot, resolveClaudeCodeExecutable, ClaudeCodeUnsupportedVersionError } from "./native-config.js";
@@ -329,6 +329,11 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
     }
     const policy = resolveClaudeCodePermissions(this.options.permissions);
     const executable = await resolveClaudeCodeExecutable(this.options.executable, launchEnv ?? process.env);
+    if (config.skillIds?.length) {
+      config = withoutMissingSkills(config, await probeClaudeCode({ cwd, executable,
+        env: Object.fromEntries(Object.entries(launchEnv ?? process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)),
+        startupTimeoutMs: this.startupMs, shutdownTimeoutMs: this.shutdownMs, isolate: this.options.isolateConfiguration, signal: native?.signal }));
+    }
     const id = native?.runtimeSessionId ?? randomUUID();
     if (this.sessions.has(id) || this.starting.has(id)) throw new Error("Claude Code Runtime identity is already in use");
     this.starting.add(id);
@@ -393,7 +398,7 @@ export class ClaudeCodeAgentRuntime implements AgentRuntime {
       verifyClaudeCodeSelection(config, discovery);
       state.images = claudeCodeSupportsImages(config, discovery);
       state.expectedModels = claudeCodeExpectedModels(config, discovery);
-      state.observed.skills = claudeCodeSelectedSkills(config, discovery);
+      state.observed.skills = config.skillIds ? [...config.skillIds] : discovery.skills.map(skill => skill.name);
       if (config.reasoningLevel) state.observed.reasoning = config.reasoningLevel; // Verified against the engine at launch.
       if (native && !claudeCodeVersionSupported(initialized.claude_code_version)) throw new ClaudeCodeUnsupportedVersionError();
       if (native?.engineVersion && String(initialized.claude_code_version).split(".")[0] !== native.engineVersion.split(".")[0]) {

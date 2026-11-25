@@ -6,7 +6,7 @@ const EFFORT = ["low", "medium", "high", "xhigh", "max"] as const;
 type Effort = typeof EFFORT[number];
 
 /** What the native engine reported at initialization (never user-supplied). */
-export interface ClaudeCodeDiscovery { models: ModelInfo[]; skills: SlashCommand[]; builtins: string[] }
+export interface ClaudeCodeDiscovery { models: ModelInfo[]; skills: SlashCommand[] }
 
 function find(models: ModelInfo[], id: string): ModelInfo | undefined {
   return models.find(model => model.value === id || model.resolvedModel === id);
@@ -58,21 +58,24 @@ export function claudeCodeSkillOptions(config: AgentStartConfig): Pick<Options, 
   return config.skillIds === undefined ? {} : { skills: [...config.skillIds] };
 }
 
-/** Checks the selections against what THIS engine reports. Unsupported models, levels and builtin commands throw; a skill
- * the engine no longer reports is left out (see `claudeCodeSelectedSkills`), which only narrows the session. */
+/** The selection without skills the engine no longer reports, so a missing name is never sent to it. Only narrows. */
+export function withoutMissingSkills(config: AgentStartConfig, discovery: Pick<ClaudeCodeDiscovery, "skills">): AgentStartConfig {
+  if (!config.skillIds) return config;
+  const known = new Set(discovery.skills.map(skill => skill.name));
+  return { ...config, skillIds: config.skillIds.filter(id => known.has(id)) };
+}
+
+/** Checks the selections against what THIS engine reports. Never downgrades silently: anything unsupported throws. */
 export function verifyClaudeCodeSelection(config: AgentStartConfig, discovery: ClaudeCodeDiscovery): void {
   validateClaudeCodeSelection(config);
   const row = config.model ? find(discovery.models, config.model.id) : defaultRow(discovery.models);
   if (config.model && !row) throw new Error("Unsupported Claude Code model selection");
   const level = config.reasoningLevel;
   if (level !== undefined && level !== "off" && !efforts(row).includes(level as Effort)) throw new Error("Unsupported Claude Code reasoning level");
-  if (config.skillIds?.some(id => discovery.builtins.includes(id))) throw new Error("Unknown Claude Code skill");
-}
-
-/** The skills this session can use: the selected ones the engine reports, or all of them without a selection. */
-export function claudeCodeSelectedSkills(config: AgentStartConfig, discovery: ClaudeCodeDiscovery): string[] {
-  const known = discovery.skills.map(skill => skill.name);
-  return config.skillIds ? config.skillIds.filter(id => known.includes(id)) : known;
+  if (config.skillIds) {
+    const known = new Set(discovery.skills.map(skill => skill.name));
+    if (config.skillIds.some(id => !known.has(id))) throw new Error("Unknown Claude Code skill");
+  }
 }
 
 /** Vision support of the selected (or default) model. The engine reports no per-model flag; every Claude model it lists
@@ -83,9 +86,8 @@ export function claudeCodeSupportsImages(config: AgentStartConfig, discovery: Cl
 
 /** From the initialize answer. Skills are the non-builtin commands (user/project/plugin/MCP defined). */
 export function claudeCodeDiscovery(init: { models?: ModelInfo[]; commands?: SlashCommand[] }): ClaudeCodeDiscovery {
-  const commands = Array.isArray(init.commands) ? init.commands.filter(command => !!command) : [];
-  return { models: Array.isArray(init.models) ? init.models : [], skills: commands.filter(command => command.builtin !== true),
-    builtins: commands.filter(command => command.builtin === true).map(command => command.name) };
+  return { models: Array.isArray(init.models) ? init.models : [],
+    skills: Array.isArray(init.commands) ? init.commands.filter(command => command && command.builtin !== true) : [] };
 }
 
 /** Model ids the engine may report in system/init for a requested selection, or undefined when it cannot be checked (an alias

@@ -3,7 +3,6 @@ import { existsSync } from "node:fs";
 import { query, type ModelInfo, type SDKUserMessage, type SlashCommand } from "@anthropic-ai/claude-agent-sdk";
 import { ClaudeCodeAuthRequiredError, ClaudeCodeNotInstalledError, ClaudeCodeUnsupportedVersionError, claudeCodeAccountStatus, resolveClaudeCodeExecutable } from "./native-config.js";
 import { claudeCodeVersionSupported } from "./native-history.js";
-import { claudeCodeDiscovery } from "./launch-options.js";
 
 export interface ClaudeCodeProbeOptions {
   cwd: string;
@@ -25,7 +24,6 @@ export interface ClaudeCodeProbe {
   models: ModelInfo[];
   /** User/project/plugin-defined commands, i.e. skills. Claude Code's own builtin commands are excluded. */
   skills: SlashCommand[];
-  builtins: string[];
 }
 export type { ModelInfo, SlashCommand };
 
@@ -81,7 +79,8 @@ export async function probeClaudeCode(options: ClaudeCodeProbeOptions): Promise<
     result = {
       authenticated: status.authenticated, ...(status.accountType ? { accountType: status.accountType } : {}),
       ...(typeof init.claude_code_version === "string" ? { version: init.claude_code_version } : {}),
-      ...claudeCodeDiscovery(init),
+      models: Array.isArray(init.models) ? init.models : [],
+      skills: Array.isArray(init.commands) ? init.commands.filter(command => command && command.builtin !== true) : [],
     };
   } catch (error) { failure = error; }
   finally { options.signal?.removeEventListener("abort", cancel); }

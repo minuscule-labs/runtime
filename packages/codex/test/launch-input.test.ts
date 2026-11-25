@@ -190,16 +190,9 @@ test("discovery provider privacy filtering is separate from explicit selection",
   assert.equal((await f.calls()).filter(call => call.method === "thread/start").length, 1);
 });
 
-test("a selected skill that is no longer discovered is left out and never widens the selection", async t => {
-  const f = await fixture(t), caps = await f.runtime.capabilities({ cwd: f.cwd }), gone = `codex-skill-${"a".repeat(64)}`;
-  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [gone, caps.skills[1].id] }));
-  await f.remember(await f.runtime.start({ cwd: f.cwd, skillIds: [gone] }));
-  const starts = (await f.calls()).filter(c => c.method === "thread/start" && c.params.ephemeral !== true);
-  assert.deepEqual(starts.map(c => c.params.config.skills.config.map((s: any) => s.enabled)), [[false, true], [false, false]]);
-});
-
-test("unsupported model reasoning fails before user input", async t => {
+test("unknown skill and unsupported model reasoning fail before user input", async t => {
   const f = await fixture(t);
+  await assert.rejects(f.runtime.start({ cwd: f.cwd, skillIds: [`codex-skill-${"a".repeat(64)}`] }));
   await assert.rejects(f.runtime.start({ cwd: f.cwd, model: { provider: "openai", id: "text-model" }, reasoningLevel: "high" }));
   const session = await f.remember(await f.runtime.start({ cwd: f.cwd, reasoningLevel: "max" })); assert.equal(await f.runtime.status(session.id), "idle");
   assert.equal((await f.calls()).some(c => c.method === "turn/start"), false);
