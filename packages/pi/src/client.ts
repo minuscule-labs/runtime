@@ -345,7 +345,7 @@ export class PiAgentRuntime implements AgentRuntime {
     } finally {
       cancelled = true;
       if (!started) await terminateChild(child);
-      await Promise.all([rm(readyFile, { force: true }), rm(promptFile, { force: true })]);
+      await Promise.all([readyFile, `${readyFile}.tmp`, promptFile].map((path) => rm(path, { force: true })));
     }
   }
 

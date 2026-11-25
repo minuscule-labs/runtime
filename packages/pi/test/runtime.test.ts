@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { appendFile, chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { once } from "node:events";
+import { appendFile, chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import type { AgentEvent, AgentStatus, RuntimeMessage } from "@minu/runtime-core";
 import { PiAgentRuntime } from "../src/client.js";
 import { BoundedDiagnosticLog } from "../src/diagnostic.js";
@@ -573,6 +575,34 @@ test("failed Runtime startup terminates its worker", { timeout: 10_000 }, async 
     await rm(directory, { recursive: true, force: true });
     delete process.env.MINU_RUNTIME_DIR;
     delete process.env.WORKER_PID_FILE;
+  }
+});
+
+test("the owned worker replaces its ready file instead of writing it in place", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "minu-runtime-ready-file-"));
+  const readyFile = join(directory, "ready.json");
+  const fakePi = join(directory, "fake-pi.mjs");
+  await writeFile(readyFile, "");
+  await writeFile(fakePi, `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const { id, type } = JSON.parse(line);
+  console.log(JSON.stringify({ id, type: "response", command: type, success: false, error: "fixture failure" }));
+});
+`);
+  await chmod(fakePi, 0o755);
+  try {
+    const { ino } = await stat(readyFile);
+    const child = spawn(process.execPath, [
+      fileURLToPath(new URL("../src/owned-worker.js", import.meta.url)), "--cwd", directory,
+      "--ready-file", readyFile, "--log-file", join(directory, "worker.log"),
+    ], { stdio: "ignore", env: { ...process.env, PI_COMMAND: fakePi, MINU_RUNTIME_DIR: join(directory, "registry") } });
+    await once(child, "exit");
+    assert.match(JSON.parse(await readFile(readyFile, "utf8")).error, /fixture failure/);
+    assert.notEqual((await stat(readyFile)).ino, ino);
+    assert.deepEqual((await readdir(directory)).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
