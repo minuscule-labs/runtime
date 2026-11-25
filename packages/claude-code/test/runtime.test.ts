@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import type { AgentTurn, RuntimeActivityEvent } from "@minu/runtime-core";
 import { ClaudeCodeAgentRuntime, type ClaudeCodeRuntimeOptions } from "../src/index.js";
-import { claudeCodeDiscovery, withoutMissingSkills } from "../src/launch-options.js";
 
 const fixture = fileURLToPath(new URL("./fixtures/claude.js", import.meta.url));
 const pause = () => new Promise<void>((resolve) => setTimeout(resolve, 10));
@@ -308,32 +307,12 @@ test("model, reasoning and skills are validated against discovery and passed to 
   await runtime.stop(plain.id);
 });
 
-test("only skills the engine reports are sent to it: missing, builtin and alias names are left out", async t => {
-  const { dir, runtime, flag } = await selection(t);
-  const allowed = async () => (await flag("--allowedTools"))?.includes("Skill(") ? "present" : "absent";
-  const rules = async () => JSON.stringify((await readFile(join(dir, "argv"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as { argv: string[]; probe: boolean }).filter(entry => !entry.probe).at(-1)!.argv);
-  const session = await runtime.start({ cwd: dir, skillIds: ["missing", "compact", "review"] });
-  assert.ok((await rules()).includes("Skill(review)"));
-  for (const name of ["missing", "compact"]) assert.ok(!(await rules()).includes(`Skill(${name})`), name);
-  await runtime.stop(session.id);
-  const none = await runtime.start({ cwd: dir, skillIds: ["missing"] });
-  assert.ok(!(await rules()).includes("Skill(")); assert.equal(await allowed(), "absent");
-  await runtime.stop(none.id);
-});
-
 test("unsupported selections are refused after discovery with the engine confirmed gone and no session created", async t => {
   const { dir, runtime, pid } = await selection(t);
   for (const config of [{ model: { provider: "anthropic", id: "nonexistent" } }, { reasoningLevel: "xhigh" as const },
-    { reasoningLevel: "minimal" as const }, { model: { provider: "anthropic", id: "haiku" }, reasoningLevel: "low" as const }, { model: { provider: "anthropic", id: "haiku" }, reasoningLevel: "low" as const, skillIds: ["review"] }]) {
+    { reasoningLevel: "minimal" as const }, { model: { provider: "anthropic", id: "haiku" }, reasoningLevel: "low" as const }, { skillIds: ["compact"] }, { skillIds: ["missing"] }]) {
     await assert.rejects(runtime.start(config), /Unsupported|Unknown/);
     const started = Number(await readFile(pid, "utf8")); assert.throws(() => process.kill(started, 0), { code: "ESRCH" });
   }
   await assert.rejects(runtime.start({ model: { provider: "openai", id: "gpt" }, cwd: dir }), /Unsupported/);
-});
-
-test("a user skill that shares a name with a builtin command stays selectable", () => {
-  const discovery = claudeCodeDiscovery({ models: [], commands: [{ name: "review", description: "", argumentHint: "" }, { name: "review", description: "", argumentHint: "", builtin: true }] });
-  assert.deepEqual(withoutMissingSkills({ skillIds: ["review", "gone"] }, discovery).skillIds, ["review"]);
-  assert.deepEqual(withoutMissingSkills({ skillIds: ["gone"] }, discovery).skillIds, [], "an empty remainder stays an explicit empty selection");
-  assert.equal(withoutMissingSkills({}, discovery).skillIds, undefined);
 });

@@ -119,9 +119,10 @@ still returned, with unknown reasoning defaults omitted.
 
 Select skills using discovered `skillIds`; `[]` disables all discovered skills,
 including builtins, through per-thread native config. Omission preserves harness
-defaults. IDs are path hashes, not paths; unknown IDs fail. Codex gives no signal that plugin skills
-have finished loading, so a missing ID cannot be told apart from a late one, and only
-listed skills can be turned off. The selection is resolved again on native allocation/resume without changing shared native configuration.
+defaults. IDs are path hashes, not paths; unknown IDs fail. Codex gives no signal that
+plugin skills have finished loading, so a missing ID cannot be told apart from a late one,
+and only listed skills can be turned off. The selection is resolved again on native
+allocation/resume without changing shared native configuration.
 
 `send`/`startTurn` accept Core image objects: PNG/JPEG/GIF/WebP with canonical base64,
 at most four images, 10 MiB each and 20 MiB combined. Ordered MIME/pixels participate
@@ -337,8 +338,8 @@ OS sandbox or a filesystem boundary, and stop does not undo tool side effects.
 **Launch options and input.** `capabilities({ cwd })` runs a short-lived prompt-less
 query (confirmed exit) and returns models, reasoning levels (`off` plus the engine's
 effort levels) and skills. `model` (`{ provider: "anthropic", id }`), `reasoningLevel`
-and `skillIds` are validated against it; unsupported models and levels are rejected,
-never downgraded, only skills the engine reports are sent to it, and a session whose engine reports a different model than requested fails
+and `skillIds` are validated against it; unsupported choices are rejected, never
+downgraded, and a session whose engine reports a different model than requested fails
 closed. Images are sent as SDK image blocks when the model is discovered; `steer`
 queues a message into the running turn. History projects images as `[image]`.
 
@@ -524,7 +525,7 @@ const session = await runtime.start({
 
 Omitting `skillIds` preserves the harness's default skill behavior. Supplying an empty array explicitly disables discovered skills for adapters that support selection. The Pi adapter discovers skills from its available-command RPC response, keeps native paths private, resolves selected ids again before launch and resume, and starts the owned process with only those skills. Skill changes require a new session.
 
-With Pi and Claude Code, a selected skill that has been deleted or renamed is left out instead of stopping the start or resume. Codex still refuses, because a skill that loads late looks the same as a missing one. The remaining selection still applies, an empty remainder means no skills, and the stored selection is not rewritten, so a restored skill returns on the next resume. Compare the selection with `capabilities()` to report what is missing. Malformed ids are still rejected.
+With Pi, a selected skill that has been deleted or renamed is left out instead of stopping the start or resume. Codex and Claude Code still refuse, because a skill that loads late looks the same as a missing one. The remaining selection still applies, an empty remainder means no skills, and the stored selection is not rewritten, so a restored skill returns on the next resume. Compare the selection with `capabilities()` to report what is missing. Malformed ids are still rejected.
 
 Owned Pi workers inherit their host's environment. Authorized API workflows can use existing shell tools; credentials must reach the actual host process, not only an interactive terminal. Runtime does not provision secrets or treat Skills as credential grants.
 

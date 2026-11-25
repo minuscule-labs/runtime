@@ -58,13 +58,6 @@ export function claudeCodeSkillOptions(config: AgentStartConfig): Pick<Options, 
   return config.skillIds === undefined ? {} : { skills: [...config.skillIds] };
 }
 
-/** The selection without skills the engine no longer reports, so a missing name is never sent to it. Only narrows. */
-export function withoutMissingSkills(config: AgentStartConfig, discovery: Pick<ClaudeCodeDiscovery, "skills">): AgentStartConfig {
-  if (!config.skillIds) return config;
-  const known = new Set(discovery.skills.map(skill => skill.name));
-  return { ...config, skillIds: config.skillIds.filter(id => known.has(id)) };
-}
-
 /** Checks the selections against what THIS engine reports. Never downgrades silently: anything unsupported throws. */
 export function verifyClaudeCodeSelection(config: AgentStartConfig, discovery: ClaudeCodeDiscovery): void {
   validateClaudeCodeSelection(config);

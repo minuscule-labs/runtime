@@ -207,8 +207,17 @@ test("Claude Code runs through the shared CLI like Codex: owner-scoped managed s
   assert.match(await run([...scoped,"start","--cwd",cwd],false,{MINU_CLAUDE_FIXTURE_ACCOUNT:"none"}),/not logged in/);
 });
 
-test("start refuses a skill the adapter does not report, before any session exists",async t=>{
+test("start refuses a Pi skill that is not reported, before any session exists",async t=>{
+  const fake=join(await realpath(await mkdtemp(join(tmpdir(),"runtime-cli-pi-"))),"pi.mjs"),saved=process.env.PI_COMMAND;
+  await writeFile(fake,`#!${process.execPath}
+import { createInterface } from "node:readline";
+createInterface({ input: process.stdin }).on("line", line => { const request = JSON.parse(line);
+  const data = { get_available_models: { models: [] }, get_commands: { commands: [{ name: "skill:reviewer", source: "skill", sourceInfo: { path: "/skills/reviewer/SKILL.md" } }] },
+    get_state: { thinkingLevel: "medium", sessionId: "fake", isStreaming: false } }[request.type];
+  console.log(JSON.stringify({ id: request.id, type: "response", command: request.type, success: true, data })); }).on("close", () => process.exit(0));
+`);await chmod(fake,0o755);process.env.PI_COMMAND=fake;
+  t.after(()=>{if(saved===undefined)delete process.env.PI_COMMAND;else process.env.PI_COMMAND=saved;});
   const f=await fixture(t);
-  await assert.rejects(f.run([...f.scoped,"start","--cwd",f.directory,"--skill","reviewer"]),/Unknown skill: reviewer/);
-  assert.equal((await f.run([...f.scoped,"sessions"])).trim(),"");
+  assert.match(await f.run(["start","--cwd",f.directory,"--skill","reviewer"],false),/Unknown skill: reviewer/);
+  assert.match(await f.run(["sessions"]),/No online Pi sessions/);
 });

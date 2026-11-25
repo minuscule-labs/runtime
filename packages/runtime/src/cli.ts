@@ -104,7 +104,7 @@ export function createRuntimeProgram(): Command {
     .option("--skill <id...>").addOption(new Option("--no-skills").conflicts("skill"))
     .action(async options => {
       const value = select(); const launch = config(options);
-      if (launch.skillIds?.length) { // Starting leaves out missing skills; an explicit request for one is a mistake.
+      if (value.adapter === "pi" && launch.skillIds?.length) { // Pi starts without missing skills; an explicit request for one is a mistake.
         const known = (await value.runtime.capabilities!({ cwd: launch.cwd })).skills.map(({ id }) => id);
         const unknown = launch.skillIds.filter(id => !known.includes(id));
         if (unknown.length) throw new Error(`Unknown skill: ${unknown.join(", ")}`);

@@ -970,7 +970,7 @@ process.stdin.on("data", (chunk) => {
     save();
     const respond = (data) => console.log(JSON.stringify({ id: request.id, type: "response", command: request.type, success: true, data }));
     if (request.type === "get_available_models") respond({ models: [{ provider: "openai", id: "gpt-test", reasoning: true }] });
-    else if (request.type === "get_commands") respond({ commands: [{ name: "skill:reviewer", description: "Review changes", source: "skill", sourceInfo: { path: "/skills/reviewer/SKILL.md", source: "auto", scope: "user" } }] });
+    else if (request.type === "get_commands") respond(process.env.PI_TEST_MALFORMED_COMMANDS ? {} : { commands: [{ name: "skill:reviewer", description: "Review changes", source: "skill", sourceInfo: { path: "/skills/reviewer/SKILL.md", source: "auto", scope: "user" } }] });
     else if (request.type === "get_available_thinking_levels") respond({ levels: ["off", "medium", "high"] });
     else if (request.type === "set_model" || request.type === "set_thinking_level") respond(undefined);
     else if (request.type === "get_state") respond({ model: { provider: "openai", id: "gpt-test", input: ["text", "image"] }, thinkingLevel: "medium", sessionId: "fake-owned-session", isStreaming: false });
@@ -1003,6 +1003,13 @@ process.on("SIGTERM", () => process.exit(0));
       defaultModel: { provider: "openai", id: "gpt-test" },
       defaultReasoningLevel: "medium",
     });
+    process.env.PI_TEST_MALFORMED_COMMANDS = "1";
+    await assert.rejects(
+      runtime.start({ cwd: directory, skillIds: ["skill:reviewer"] }),
+      /Pi skill discovery is unavailable/,
+      "an answer without a skill list never counts as every skill being deleted",
+    );
+    delete process.env.PI_TEST_MALFORMED_COMMANDS;
     const missingSkill = await runtime.start({ cwd: directory, skillIds: ["skill:missing"] });
     sessionId = missingSkill.id;
     const missingLaunch = JSON.parse(await readFile(argsFile, "utf8")) as { args: string[] };
@@ -1101,6 +1108,7 @@ process.on("SIGTERM", () => process.exit(0));
     await rm(directory, { recursive: true, force: true });
     delete process.env.MINU_RUNTIME_DIR;
     delete process.env.PI_COMMAND;
+    delete process.env.PI_TEST_MALFORMED_COMMANDS;
     delete process.env.PI_ARGS_FILE;
     delete process.env.PI_TEST_API_CREDENTIAL;
   }

@@ -108,8 +108,10 @@ interface DiscoveredPiSkill extends RuntimeSkillCapability {
   path: string;
 }
 
-async function discoverSkills(rpc: PiRpcProcess): Promise<DiscoveredPiSkill[]> {
+async function discoverSkills(rpc: PiRpcProcess, required = false): Promise<DiscoveredPiSkill[]> {
   const available = (await rpc.request("get_commands")) as { commands?: unknown[] };
+  // A selection must not be emptied by an answer that is not a skill list.
+  if (required && !Array.isArray(available?.commands)) throw new Error("Pi skill discovery is unavailable");
   const seen = new Set<string>();
   return (available.commands ?? []).flatMap((value) => {
     if (!value || typeof value !== "object") return [];
@@ -241,7 +243,7 @@ export class PiAgentRuntime implements AgentRuntime {
     if (config.skillIds !== undefined) {
       const discovery = new PiRpcProcess(cwd, () => {});
       try {
-        const skills = await discoverSkills(discovery);
+        const skills = await discoverSkills(discovery, config.skillIds.length > 0);
         const byId = new Map(skills.map((skill) => [skill.id, skill.path]));
         skillPaths = config.skillIds.flatMap((id) => byId.get(id) ?? []);
       } finally {
