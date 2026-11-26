@@ -96,6 +96,52 @@ test("an unresponsive bridge is stopped through its isolated verified process gr
   } finally { await f.close(); }
 });
 
+test("transient EPERM while a killed worker group exits waits for ESRCH instead of failing the stop", { skip: process.platform === "win32", timeout: 40_000 }, async (t) => {
+  const f = await fixture();
+  try {
+    const stuck = await f.start();
+    const registration = (await readRegistration(stuck.id))!;
+    process.kill(registration.pid, "SIGSTOP");
+    // macOS can report EPERM for a group whose members are still exiting.
+    const realKill = process.kill.bind(process);
+    let killed = false, uncertain = 0;
+    t.mock.method(process, "kill", (pid: number, signal?: string | number) => {
+      if (pid === -registration.pid && signal === "SIGKILL") killed = true;
+      if (pid === -registration.pid && signal === 0 && killed && uncertain < 3) {
+        uncertain += 1;
+        throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+      }
+      return realKill(pid, signal);
+    });
+    await f.runtime.forceStopManaged(stuck.id, f.owner);
+    t.mock.restoreAll();
+    assert.equal(uncertain, 3);
+    assert.equal(processGroupExists(registration.pid), false);
+    assert.equal((await f.runtime.listManagedSessions(f.owner)).find(session => session.id === stuck.id)?.state, "suspended");
+  } finally { t.mock.restoreAll(); await f.close(); }
+});
+
+test("an isolated worker group that cannot be inspected is never signalled", { skip: process.platform === "win32" }, async (t) => {
+  const f = await fixture();
+  try {
+    const session = await f.start();
+    const manifest = (await readManagedSessionManifest(session.id, f.owner))!;
+    const group = manifest.workerProcessGroup!;
+    const realKill = process.kill.bind(process);
+    const sent: (string | number | undefined)[] = [];
+    t.mock.method(process, "kill", (pid: number, signal?: string | number) => {
+      if (pid !== -group) return realKill(pid, signal);
+      sent.push(signal);
+      throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+    });
+    const workerPath = process.env.MINU_RECOVERY_RUNTIME_MODULE
+      ? join(process.env.MINU_RECOVERY_RUNTIME_MODULE, "..", "owned-worker.js")
+      : fileURLToPath(new URL("../src/owned-worker.js", import.meta.url));
+    await assert.rejects(terminateManagedWorker(manifest, await realpath(workerPath)), /could not be inspected/);
+    assert.deepEqual(sent, [0]);
+  } finally { t.mock.restoreAll(); await f.close(); }
+});
+
 test("legacy workers can be stopped without ever signalling their shared process group", { skip: process.platform === "win32" }, async () => {
   const f = await fixture();
   try {

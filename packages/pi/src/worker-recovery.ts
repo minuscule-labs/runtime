@@ -1,16 +1,14 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { processGroupAbsent } from "@minu/runtime-core";
 import { managedWorkerProcessExists, type ManagedSessionManifest } from "./managed-sessions.js";
 
 const execute = promisify(execFile);
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** Only ESRCH proves a group gone; EPERM (seen on macOS while members exit) counts as still present. */
 export function processGroupExists(pid: number): boolean {
-  try { process.kill(-pid, 0); return true; }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
-    throw error;
-  }
+  return processGroupAbsent(pid) !== "absent";
 }
 
 /** Never signal a bare persisted PID: it may have been reused by an unrelated process. */
@@ -20,7 +18,11 @@ export async function terminateManagedWorker(manifest: ManagedSessionManifest, w
     throw new Error("Runtime worker shutdown could not be confirmed; process recovery is unavailable");
   }
   const isolated = manifest.workerProcessGroup === pid;
-  if (isolated && !processGroupExists(pid)) return;
+  if (isolated) {
+    const state = processGroupAbsent(pid);
+    if (state === "absent") return;
+    if (state === "unproven") throw new Error("Runtime worker process group could not be inspected; no process was signalled");
+  }
   const { stdout } = await execute("ps", ["-ww", "-p", String(pid), "-o", "pgid=", "-o", "args="], { timeout: 2_000 });
   const match = stdout.trim().match(/^(\d+)\s+(.+)$/);
   const command = match?.[2] ?? "";
@@ -57,8 +59,14 @@ export async function terminateManagedWorker(manifest: ManagedSessionManifest, w
     try { process.kill(-pid, signal); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
     const deadline = Date.now() + 5_000;
-    while (processGroupExists(pid) && Date.now() < deadline) await delay(50);
-    if (!processGroupExists(pid)) return;
+    let state = processGroupAbsent(pid);
+    while (state !== "absent" && Date.now() < deadline) {
+      await delay(50);
+      state = processGroupAbsent(pid);
+    }
+    if (state === "absent") return;
+    // Do not escalate to another signal when the group remains uninspectable.
+    if (state === "unproven") throw new Error("Runtime worker process group exit could not be proven; session remains fenced");
   }
   throw new Error("Runtime worker process group did not exit; session remains fenced");
 }
